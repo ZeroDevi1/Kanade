@@ -25,6 +25,25 @@ RETRIES = 5
 BACKOFF = 2.0
 
 
+class _RedirectHandler(urllib.request.HTTPRedirectHandler):
+    """补上 308 重定向：Python 3.11 之前的 urllib 不跟随 308，而 Hugging Face 的 resolve 地址会返回 308
+    （CosyVoice 引擎用 Python 3.10）。308 与 307 一样保留方法与请求头（包括续传用的 Range）。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return super().redirect_request(req, fp, 307 if code == 308 else code, msg, headers, newurl)
+
+    def http_error_308(self, req, fp, code, msg, headers):
+        return self.http_error_302(req, fp, code, msg, headers)
+
+
+_opener = urllib.request.build_opener(_RedirectHandler)
+
+
+def urlopen(req: urllib.request.Request | str, timeout: float = TIMEOUT):
+    """与 urllib.request.urlopen 相同，但在所有 Python 版本上都跟随 308 重定向。"""
+    return _opener.open(req, timeout=timeout)
+
+
 def mirror(url: str) -> str:
     """按环境变量把下载地址改写到镜像。"""
     hf = os.environ.get("KANADE_HF_ENDPOINT", "").strip().rstrip("/")
@@ -72,7 +91,7 @@ def _fetch_once(url: str, dst: Path, on_bytes: Callable[[int, int], None] | None
     if have:
         headers["Range"] = f"bytes={have}-"
     try:
-        resp = urllib.request.urlopen(urllib.request.Request(mirror(url), headers=headers), timeout=TIMEOUT)
+        resp = urlopen(urllib.request.Request(mirror(url), headers=headers), timeout=TIMEOUT)
     except urllib.error.HTTPError as exc:
         if exc.code == 416 and size and have == size:
             os.replace(part, dst)  # 上次已下载完整但未改名

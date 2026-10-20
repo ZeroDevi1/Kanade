@@ -28,12 +28,13 @@ environments = [
 [tool.uv.sources]
 # editable：SDK 版本号不变时 uv sync 不会重装非 editable 的 path 依赖，改为直接引用释放出的源码。
 kanade-engine-sdk = { path = "../sdk", editable = true }
-# Windows 用 PyTorch 官方 CUDA 12.6 构建：兼容 RTX 20/30/40 与较旧驱动。RTX 50（Blackwell）需改为 cu128 / cu130 索引。
-torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'win32'" }]
+# Windows 用 PyTorch 官方 CUDA 13.0 构建：torch 2.14.1 在 cu128 索引没有 Windows wheel，cu126 不支持 RTX 50（Blackwell）。
+# cu130 支持 RTX 20（Turing）及之后的显卡，要求 NVIDIA 驱动 580 及以上。
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
 
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [build-system]

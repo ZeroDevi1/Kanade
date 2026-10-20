@@ -245,7 +245,7 @@ func (a *app) timbreConvert(c *ui.Context, tk *fluent.Tokens) {
 		if !a.timbreModelSelect(c) {
 			return
 		}
-		a.audioPicker(c, "输入人声", &s.input)
+		a.audioPicker(c, "输入人声", &s.input, directAudioExts)
 		ui.Text(c, "整首歌请先用「分轨」得到干净主唱，或直接用「翻唱」。").FontSize(12).TextColor(c.Theme().TextMuted)
 		a.timbreParams(c)
 		_, active := a.jobStatusPeek(s.job)
@@ -285,7 +285,7 @@ func (a *app) timbreCover(c *ui.Context, tk *fluent.Tokens) {
 		if !a.timbreModelSelect(c) {
 			return
 		}
-		a.audioPicker(c, "歌曲", &s.song)
+		a.audioPicker(c, "歌曲", &s.song, anyAudioExts())
 		a.timbreParams(c)
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 			ui.Checkbox(c, &s.backing, "混入原曲和声")

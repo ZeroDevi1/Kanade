@@ -2,8 +2,9 @@
 
 - cosyvoice.sft_prepare {name, dataset_dir, list?, base_model_dir, dev_ratio?, asr_model?, instruct?}
   读取 .list 文本（缺文本时可用 Whisper 转写）→ wetext 归一化 → campplus 提取说话人向量 → 写 parquet 与 data.list。
-- cosyvoice.sft_train {name, base_model_dir, part (llm|flow|both), epochs, lr?, num_workers?}
-  需要 NVIDIA CUDA。依次训练所选部分 → val_best 平均 checkpoint → 组装模型目录（含 spk2info.pt）。
+- cosyvoice.sft_train {name, base_model_dir, part (llm|flow|both), epochs, lr?, num_workers?, llm_layers?}
+  需要 NVIDIA CUDA。llm_layers > 0 时 LLM 只训练 Qwen 顶部这么多层（8 GB 显存用 12，见 sft_launch._install_freeze_hook）；
+  0 或缺省为全量训练，约需 12 GB 以上显存。依次训练所选部分 → val_best 平均 checkpoint → 组装模型目录（含 spk2info.pt）。
 
 工作目录：<models>/cosyvoice/_sft/<name>/{data/train, data/dev, exp, tensorboard}。
 产出模型：<models>/cosyvoice/<name>-SFT/，与基础模型同版本，Cantus 中以「预训练音色」模式使用，音色名即 name。
@@ -220,9 +221,10 @@ def _kill_tree(pid: int) -> None:
 _EPOCH_CKPT = re.compile(r"epoch_(\d+)_whole\.pt$")
 
 
-def _run(job: Job, args: list[str], lo: float, hi: float, label: str, epochs: int = 0, exp_dir: Path | None = None) -> None:
-    """运行 sft_launch 子进程；训练阶段按 exp_dir 中已保存的 epoch_N_whole.pt 计算进度。"""
-    env = dict(os.environ)
+def _run(job: Job, args: list[str], lo: float, hi: float, label: str, epochs: int = 0, exp_dir: Path | None = None,
+         extra_env: dict[str, str] | None = None) -> None:
+    """运行 sft_launch 子进程；训练阶段按 exp_dir 中已保存的 epoch_N_whole.pt 计算进度。extra_env 追加到子进程环境。"""
+    env = dict(os.environ, **(extra_env or {}))
     vendor = Path(__file__).resolve().parents[2] / "vendor"
     env["PYTHONPATH"] = os.pathsep.join([str(vendor), str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH", "")])
     env.update({"RANK": "0", "LOCAL_RANK": "0", "WORLD_SIZE": "1", "LOCAL_WORLD_SIZE": "1",
@@ -274,6 +276,10 @@ def run_train(job: Job) -> None:
     epochs = int(p.get("epochs") or 30)
     lr = float(p.get("lr") or 1e-5)
     workers = int(p.get("num_workers") or 4)
+    llm_layers = int(p.get("llm_layers") or 0)
+
+    # 训练时在线提取语音 token 需要批量版 tokenizer，推理下载按 _SKIP 跳过了它（约 1 GB），这里按需补下。
+    dl.ensure_files(job, base, ["speech_tokenizer_v3.batch.onnx"])
 
     template = (Path(__file__).parent / "configs" / "cosyvoice3_sft.yaml").read_text(encoding="utf-8")
     cfg = wd / "cosyvoice3_sft.yaml"
@@ -291,10 +297,15 @@ def run_train(job: Job) -> None:
                    "--model", part, "--checkpoint", str(base / f"{part}.pt"), "--model_dir", str(exp),
                    "--tensorboard_dir", str(wd / "tensorboard" / part), "--ddp.dist_backend", backend,
                    "--num_workers", str(workers), "--prefetch", "2", "--use_amp"],
-             i * span, (i + 0.95) * span, f"训练 {part}", epochs, exp)
+             i * span, (i + 0.95) * span, f"训练 {part}", epochs, exp, {"KANADE_SFT_LLM_LAYERS": str(llm_layers)})
         # 取验证损失最好的若干 checkpoint 平均：llm 3 个、flow 5 个（VoiceLab 文档第 7 步）。
+        # 轮数少于该数量时取全部：average_model.py 断言实际取到的个数等于 --num（只统计 epoch_*_whole.yaml，见其 --val_best）。
+        saved = len(list(exp.glob("epoch_*_whole.yaml")))
+        num = min(3 if part == "llm" else 5, saved)
+        if num == 0:
+            raise RuntimeError(f"{part} 训练没有产出 checkpoint")
         _run(job, ["average_model.py", "--dst_model", str(exp / f"{part}_avg.pt"), "--src_path", str(exp),
-                   "--num", "3" if part == "llm" else "5", "--val_best"], (i + 0.95) * span, (i + 1) * span, f"平均 {part} checkpoint")
+                   "--num", str(num), "--val_best"], (i + 0.95) * span, (i + 1) * span, f"平均 {part} checkpoint")
 
     job.progress(0.92, "组装模型目录")
     out = assemble(base, name, wd)

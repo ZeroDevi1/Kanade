@@ -176,6 +176,8 @@ func (a *app) doctorCard(c *ui.Context, tk *fluent.Tokens) {
 				ui.Text(c, e.Spec.Title).Width(180).SingleLine()
 				id := s.doctor[e.Spec.Name]
 				switch j, _ := a.be.cond.Job(id); {
+				case e.State == conductor.EngineMissing && e.Outdated:
+					ui.Text(c, "需要更新环境").FontSize(12).TextColor(t.TextMuted)
 				case e.State == conductor.EngineMissing || e.State == conductor.EngineFailed:
 					ui.Text(c, "未安装").FontSize(12).TextColor(t.TextMuted)
 				case id == "":
@@ -204,11 +206,15 @@ func (a *app) engineRow(c *ui.Context, tk *fluent.Tokens, e conductor.Engine) {
 				ui.Text(c, e.Spec.Title+"（"+e.Spec.Name+"）").FontWeight(600)
 				ui.Text(c, e.Spec.Description+" Python "+e.Spec.Python).FontSize(12).TextColor(t.TextMuted)
 			})
-			ui.Text(c, engineStateLabel[e.State]).FontSize(12).TextColor(t.TextMuted)
+			label, action := engineStateLabel[e.State], "安装环境"
+			if e.State == conductor.EngineMissing && e.Outdated {
+				label, action = "需要更新", "更新环境"
+			}
+			ui.Text(c, label).FontSize(12).TextColor(t.TextMuted)
 			if e.State == conductor.EngineInstalling {
 				ui.Spinner(c)
 			}
-			if (e.State == conductor.EngineMissing || e.State == conductor.EngineFailed) && ui.Button(c, "安装环境").Clicked() {
+			if (e.State == conductor.EngineMissing || e.State == conductor.EngineFailed) && ui.Button(c, action).Clicked() {
 				a.be.cond.Install(e.Spec.Name)
 			}
 			if len(e.Log) > 0 {

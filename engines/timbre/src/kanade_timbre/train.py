@@ -94,12 +94,25 @@ def run_script(job: Job, args: list[str], lo: float, hi: float, label: str, on_l
         if on_line:
             frac = on_line(line)
             if frac is not None and not canceled.is_set():
-                job.progress(lo + (hi - lo) * frac, label + "：" + line[-120:])
+                job.progress(lo + (hi - lo) * frac, label + "：" + _status_text(line))
     code = proc.wait()
     if canceled.is_set():
         raise Cancelled()
     if code != 0:
         raise RuntimeError(f"{label}失败（退出码 {code}）：" + " / ".join(tail[-3:]))
+
+
+def _status_text(line: str) -> str:
+    """去掉同一输出行里 tqdm 进度条的残留，返回适合界面显示的部分（最多 120 字符）。
+
+    tqdm 以 \\r 刷新且不换行，训练脚本的「<名称> | epoch=N | …」紧跟在进度条的「…s/it]」之后输出，
+    按行读取时两者在同一行。
+    """
+    text = line.split("\r")[-1]
+    i = text.find(" | epoch=")
+    if i > 0:
+        text = text[text.rfind("]", 0, i) + 1:]
+    return text.strip()[-120:]
 
 
 def _kill_tree(pid: int) -> None:
@@ -164,7 +177,9 @@ def run_train(job: Job) -> None:
     # 数据缓存到 GPU、清除旧训练、声码器、梯度检查点。
     run_script(job, [str(vendor / "train.py"), name, str(save_every), str(epochs), pg, pd, "0", str(batch), str(sr),
                      "True", "True", "False", "False", "HiFi-GAN", "False"], 0.20, 0.97, "训练", epoch_progress)
-    run_script(job, [str(vendor / "process" / "extract_index.py"), str(exp_dir), "Auto"], 0.97, 0.995, "生成索引")
+    # 经 faiss_compat 启动：模型名含中文时 faiss 原生的 write_index 无法写入（见 faiss_compat 说明）。
+    run_script(job, ["-m", "kanade_timbre.faiss_compat", str(vendor / "process" / "extract_index.py"), str(exp_dir), "Auto"],
+               0.97, 0.995, "生成索引")
 
     weights = latest_weights(exp_dir, name)
     if weights is None:

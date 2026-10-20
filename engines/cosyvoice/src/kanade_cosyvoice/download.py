@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from kanade_engine import Job
-from kanade_engine.download import fetch, mirror
+from kanade_engine.download import fetch, mirror, urlopen
 
 # 推理用不到的文件：JIT/TensorRT 导出、批量版 tokenizer、RL 版 LLM 权重、flow 缓存、文档图片。
 _SKIP = re.compile(r"(\.zip$|estimator.*\.onnx$|\.batch\.onnx$|llm\.rl\.pt$|flow\.cache\.pt$|^asset/|\.md$|\.png$|\.jpg$|^\.gitattributes$)")
@@ -37,7 +37,7 @@ class RemoteFile:
 
 def _get_json(url: str):
     req = urllib.request.Request(mirror(url), headers={"User-Agent": "Kanade"})
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+    with urlopen(req, timeout=_TIMEOUT) as resp:
         return json.load(resp)
 
 
@@ -72,6 +72,30 @@ def download(job: Job, source: str, repo: str, model_dir: Path, wetext_dir: Path
     ensure_wetext(job, wetext_dir)
     fetch_repo(job, source, repo, model_dir, None)
     job.progress(1, "下载完成")
+
+
+def ensure_files(job: Job, model_dir: Path, names: list[str]) -> None:
+    """补下载 model_dir 中缺少的 names（例如推理下载时按 _SKIP 跳过、训练才需要的文件）。
+
+    下载源与仓库取自 COMPLETE_MARKER；模型不是由 Kanade 下载的（没有标记）时抛出 FileNotFoundError。
+    补下的文件不写回标记中的文件清单，标记只描述推理所需的集合。
+    """
+    missing = [n for n in names if not (model_dir / n).is_file()]
+    if not missing:
+        return
+    try:
+        meta = json.loads((model_dir / COMPLETE_MARKER).read_text(encoding="utf-8"))
+        source, repo = meta["source"], meta["repo"]
+    except (OSError, KeyError, ValueError) as exc:
+        raise FileNotFoundError(f"{model_dir} 缺少 {', '.join(missing)}，且无法确定下载源，请手动放入") from exc
+    files = list_files(source, repo, lambda p: p in missing)
+    if len(files) != len(missing):
+        raise FileNotFoundError(f"{repo} 中找不到 {', '.join(missing)}")
+    for f in files:
+        def report(n: int, total: int, f=f) -> None:
+            job.progress(job.fraction, f"下载训练所需的 {f.path}（{n / 1e6:.0f} / {total / 1e6:.0f} MB）")
+
+        fetch(f.url, model_dir / f.path, report, f.size)
 
 
 def ensure_wetext(job: Job, wetext_dir: Path) -> None:

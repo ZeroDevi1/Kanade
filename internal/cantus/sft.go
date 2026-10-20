@@ -25,6 +25,16 @@ var SFTParts = []struct{ Key, Title string }{
 	{"both", "LLM + Flow"},
 }
 
+// SFTLLMScopes 是 LLM 的训练范围：Layers 为只训练的 Qwen 顶部层数，0 表示全量。
+// 全量 fp32 Adam 需要约 10 GB 显存加激活（实测见 docs/windows-test-plan.md）；顶部 12 层可在 8 GB 显卡上训练。
+var SFTLLMScopes = []struct {
+	Layers int
+	Title  string
+}{
+	{12, "顶部 12 层（8 GB 显存）"},
+	{0, "全部层（12 GB 以上显存）"},
+}
+
 var sftNameRE = regexp.MustCompile(`^[\p{Han}\w-]+$`)
 
 // SFTPrepareParams 返回 cosyvoice.sft_prepare 的任务参数。asr 为 ASRModels 中的一项。
@@ -53,8 +63,8 @@ func SFTPrepared(l paths.Layout, name string) bool {
 	return err == nil
 }
 
-// SFTTrainParams 返回 cosyvoice.sft_train 的任务参数。
-func SFTTrainParams(l paths.Layout, name, part string, epochs int) (map[string]any, error) {
+// SFTTrainParams 返回 cosyvoice.sft_train 的任务参数。llmLayers 取自 SFTLLMScopes（0 为全量训练）。
+func SFTTrainParams(l paths.Layout, name, part string, epochs, llmLayers int) (map[string]any, error) {
 	name = strings.TrimSpace(name)
 	if !SFTPrepared(l, name) {
 		return nil, errors.New("请先完成数据准备")
@@ -65,5 +75,8 @@ func SFTTrainParams(l paths.Layout, name, part string, epochs int) (map[string]a
 	if epochs < 1 || epochs > 1000 {
 		return nil, errors.New("轮数须在 1–1000 之间")
 	}
-	return map[string]any{"name": name, "base_model_dir": SFTBase().Dir(l), "part": part, "epochs": epochs}, nil
+	if llmLayers < 0 {
+		return nil, errors.New("LLM 训练层数不能为负")
+	}
+	return map[string]any{"name": name, "base_model_dir": SFTBase().Dir(l), "part": part, "epochs": epochs, "llm_layers": llmLayers}, nil
 }

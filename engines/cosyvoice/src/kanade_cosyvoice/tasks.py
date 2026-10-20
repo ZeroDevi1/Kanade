@@ -289,9 +289,12 @@ def instruct(job: Job) -> None:
         synthesize(job, model, text, tf, lambda: model.inference_instruct(
             text, spk_id, instr, stream=False, speed=speed, text_frontend=tf))
         return
-    wav, _, spk = speaker(job, model, fam, p)
+    # 不传已注册的 zero_shot_spk_id：上游 frontend_zero_shot 在给定 spk_id 时整体取用 spk2info 中缓存的输入，
+    # 其中 prompt_text 是参考音频的文本，instruct 文本被忽略；frontend_instruct2 又删掉了参考语音 token，
+    # 结果模型会把参考文本也念出来。直接用参考音频提取特征，每次多花一点提取时间。
+    wav, _, _ = speaker(job, model, fam, p)
     synthesize(job, model, text, tf, lambda: model.inference_instruct2(
-        text, instr, wav, zero_shot_spk_id=spk, stream=False, speed=speed, text_frontend=tf))
+        text, instr, wav, zero_shot_spk_id="", stream=False, speed=speed, text_frontend=tf))
 
 
 def vc(job: Job) -> None:

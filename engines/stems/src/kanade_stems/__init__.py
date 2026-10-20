@@ -2,8 +2,9 @@
 
 任务：
 
-- stems.chain    {input, steps?, output_dir?}：人声净化链（与 VoiceLab 的 MSST 链一致），
-                 依次产出伴奏、干声、去和声干声 / 和声、去混响、降噪，文件名后缀见 chain.STEPS。
+- stems.chain    {input, steps?, models?, output_dir?}：人声净化链（与 VoiceLab 的 MSST 链一致），
+                 依次产出伴奏、干声、去和声干声 / 和声、去混响、降噪，文件名后缀见 chain.STEPS；
+                 models 按步骤 ID 覆盖默认模型（{"vocals": "<模型文件名>"}）。
 - stems.separate {input, model, single_stem?, output_dir?}：用任意 audio-separator 支持的模型分离。
 - stems.download {models}：预下载模型并上报进度。
 

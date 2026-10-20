@@ -2,54 +2,87 @@
 
 用法：python -m kanade_cosyvoice.sft_launch <train.py 的参数...>
 
-上游在模块顶层 import deepspeed，但 deepspeed 只在 Linux 上可安装；torch_ddp 引擎只用到其
-add_config_arguments（注册命令行参数）。这里在导入前注入占位模块：其余入口一旦被调用就明确报错，
-不会悄悄改变训练行为。分布式环境变量由调用方（sft.py）设置，免去 torchrun。
+上游在模块顶层 import deepspeed，但 deepspeed 只在 Linux 上可安装，这里在导入前提供占位包（_stubs/deepspeed）。
+分布式环境变量由调用方（sft.py）设置，免去 torchrun。
 """
 
 from __future__ import annotations
 
-import argparse
+import os
 import runpy
 import sys
-import types
 from pathlib import Path
 
 VENDOR = Path(__file__).resolve().parents[2] / "vendor"
 
 
 def _install_deepspeed_stub() -> None:
+    """没有真正的 deepspeed 时，把占位包所在目录（_stubs，见其 __init__ 说明）加到 sys.path 末尾。"""
     try:
         import deepspeed  # noqa: F401
         return
     except ImportError:
         pass
+    sys.path.append(str(Path(__file__).resolve().parent / "_stubs"))
 
-    def unavailable(*_args, **_kwargs):
-        raise RuntimeError("deepspeed 不可用：Kanade 的 SFT 训练只支持 --train_engine torch_ddp")
 
-    def add_config_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-        group = parser.add_argument_group("DeepSpeed（不可用，仅为兼容上游参数解析）")
-        group.add_argument("--deepspeed", action="store_true", default=False)
-        group.add_argument("--deepspeed_config", type=str, default=None)
-        return parser
+def _install_freeze_hook() -> None:
+    """环境变量 KANADE_SFT_LLM_LAYERS=N（N > 0）时，训练 LLM 只更新 Qwen 顶部 N 层、末层 norm、
+    speech_embedding 与 llm_decoder，其余参数冻结。
 
-    ds = types.ModuleType("deepspeed")
-    ds.add_config_arguments = add_config_arguments
-    ds.init_distributed = unavailable
-    ds.initialize = unavailable
-    runtime = types.ModuleType("deepspeed.runtime")
-    zero = types.ModuleType("deepspeed.runtime.zero")
-    stage = types.ModuleType("deepspeed.runtime.zero.stage_1_and_2")
-    stage.estimate_zero2_model_states_mem_needs_all_live = unavailable
-    ds.runtime, runtime.zero, zero.stage_1_and_2 = runtime, zero, stage
-    sys.modules.update({"deepspeed": ds, "deepspeed.runtime": runtime, "deepspeed.runtime.zero": zero,
-                        "deepspeed.runtime.zero.stage_1_and_2": stage})
+    CosyVoice 3 的 LLM 有约 6.4 亿参数，fp32 全量 Adam（权重 + 梯度 + 两份动量）约需 10 GB 显存，8 GB 显卡放不下；
+    冻结的参数没有梯度、Adam 也不为其分配状态。冻结发生在 train.py 加载 checkpoint 之后、建优化器之前：
+    train.py 以 `from cosyvoice.utils.train_utils import wrap_cuda_model` 导入，这里在 runpy 执行前替换模块属性即可生效。
+    文本 embedding 与 lm_head 在说话人 SFT 中不需要更新（输出走 llm_decoder），因此总是冻结。
+    """
+    layers = int(os.environ.get("KANADE_SFT_LLM_LAYERS") or 0)
+    if layers <= 0:
+        return
+    from cosyvoice.utils import train_utils
+
+    original = train_utils.wrap_cuda_model
+
+    def wrap_cuda_model(args, model):
+        if args.model == "llm":
+            blocks = model.llm.model.model.layers
+            keep = {f"llm.model.model.layers.{i}." for i in range(max(len(blocks) - layers, 0), len(blocks))}
+            trainable = 0
+            for name, p in model.named_parameters():
+                p.requires_grad = (not name.startswith("llm.model.")) or name.startswith("llm.model.model.norm.") \
+                    or any(name.startswith(k) for k in keep)
+                trainable += p.numel() if p.requires_grad else 0
+            total = sum(p.numel() for p in model.parameters())
+            print(f"[kanade] 只训练 LLM 顶部 {layers}/{len(blocks)} 层：可训练参数 {trainable / 1e6:.0f}M / {total / 1e6:.0f}M", flush=True)
+        return original(args, model)
+
+    train_utils.wrap_cuda_model = wrap_cuda_model
+
+
+def _install_join_patch() -> None:
+    """单进程训练时跳过 cosyvoice_join 的跨进程 barrier。
+
+    上游实现读取 group_join.options._timeout，torch 2.7 的 ProcessGroup 已没有 options 属性（上游按 torch 2.3 编写），
+    每个 batch 都会抛 AttributeError。该 barrier 只用于多卡间检测负载不均，world_size 为 1 时恒返回 False 即与上游语义一致。
+    executor.py 以 from-import 取得该函数，须在 runpy 执行 train.py（首次导入 executor）之前替换。
+    """
+    from cosyvoice.utils import train_utils
+
+    original = train_utils.cosyvoice_join
+
+    def cosyvoice_join(group_join, info_dict):
+        if int(os.environ.get("WORLD_SIZE", 1)) == 1:
+            return False
+        return original(group_join, info_dict)
+
+    train_utils.cosyvoice_join = cosyvoice_join
 
 
 def main() -> None:
     sys.path[:0] = [str(VENDOR)]
     _install_deepspeed_stub()
+    if sys.argv[1] == "train.py":
+        _install_freeze_hook()
+        _install_join_patch()
     script = VENDOR / "cosyvoice" / "bin" / sys.argv[1]
     sys.argv = [str(script), *sys.argv[2:]]
     runpy.run_path(str(script), run_name="__main__")

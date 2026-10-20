@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -65,7 +66,10 @@ const (
 type Engine struct {
 	Spec  Spec
 	State EngineState
-	Err   string
+	// Outdated 表示 State 为 EngineMissing 时虚拟环境已存在、只是源码已更新（例如应用升级后），
+	// 安装只做增量 uv sync；界面据此显示「需要更新」而不是「未安装」。
+	Outdated bool
+	Err      string
 	// Log 是最近的安装日志（最多 logLimit 行），用于界面显示；完整的 worker 日志在 Logs 目录。
 	Log []string
 }
@@ -73,10 +77,11 @@ type Engine struct {
 const logLimit = 200
 
 type engineEntry struct {
-	spec  Spec
-	state EngineState
-	err   string
-	log   []string
+	spec     Spec
+	state    EngineState
+	outdated bool
+	err      string
+	log      []string
 }
 
 // Conductor 是推理后端的唯一入口。
@@ -122,11 +127,13 @@ func New(l paths.Layout, src fs.FS, onChange func()) (*Conductor, error) {
 		wake: make(chan struct{}, 1), ctx: ctx, stop: stop, done: make(chan struct{}),
 	}
 	for _, s := range specs {
-		st := EngineMissing
+		e := &engineEntry{spec: s, state: EngineMissing}
 		if Ready(src, l, s.Name) {
-			st = EngineReady
+			e.state = EngineReady
+		} else if _, err := os.Stat(VenvPython(l, s.Name)); err == nil {
+			e.outdated = true
 		}
-		c.engines[s.Name] = &engineEntry{spec: s, state: st}
+		c.engines[s.Name] = e
 		c.order = append(c.order, s.Name)
 	}
 	c.uv = FindUV(l)
@@ -188,7 +195,7 @@ func (c *Conductor) Engines() []Engine {
 	out := make([]Engine, 0, len(c.order))
 	for _, name := range c.order {
 		e := c.engines[name]
-		out = append(out, Engine{Spec: e.spec, State: e.state, Err: e.err, Log: append([]string(nil), e.log...)})
+		out = append(out, Engine{Spec: e.spec, State: e.state, Outdated: e.outdated, Err: e.err, Log: append([]string(nil), e.log...)})
 	}
 	return out
 }
@@ -491,7 +498,7 @@ func (c *Conductor) install(ctx context.Context, name string) error {
 	if err != nil {
 		e.state, e.err = EngineFailed, err.Error()
 	} else {
-		e.state = EngineReady
+		e.state, e.outdated = EngineReady, false
 	}
 	c.mu.Unlock()
 	c.onChange()

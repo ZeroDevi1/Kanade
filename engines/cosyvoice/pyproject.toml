@@ -9,8 +9,10 @@ requires-python = "==3.10.*"
 # Matcha 的 utils 需要 gdown、wget，因此这些训练向的包也必须保留。
 dependencies = [
     "kanade-engine-sdk",
-    "torch==2.3.1",
-    "torchaudio==2.3.1",
+    # 上游锁定 torch 2.3.1，但其 CUDA 构建不含 sm_120，RTX 50（Blackwell）无法使用；2.7.1 是首个有 cu128 构建的版本，
+    # 且 torchaudio 仍保留 load / compliance.kaldi 等旧接口（2.9 起迁往 torchcodec）。
+    "torch==2.7.1",
+    "torchaudio==2.7.1",
     "numpy==1.26.4",
     "conformer==0.3.2",
     "diffusers==0.29.0",
@@ -56,13 +58,13 @@ build-constraint-dependencies = ["setuptools<81"]
 [tool.uv.sources]
 # editable：SDK 版本号不变时 uv sync 不会重装非 editable 的 path 依赖，改为直接引用释放出的源码。
 kanade-engine-sdk = { path = "../sdk", editable = true }
-# Windows 用 PyTorch 官方 CUDA 12.1 构建（与上游 requirements 的 cu121 一致）；macOS 用 PyPI 的 CPU/MPS 构建。
-torch = [{ index = "pytorch-cu121", marker = "sys_platform == 'win32'" }]
-torchaudio = [{ index = "pytorch-cu121", marker = "sys_platform == 'win32'" }]
+# Windows 用 PyTorch 官方 CUDA 12.8 构建（支持 RTX 20 至 RTX 50 系列，要求驱动 570 及以上）；macOS 用 PyPI 的 CPU/MPS 构建。
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32'" }]
+torchaudio = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32'" }]
 
 [[tool.uv.index]]
-name = "pytorch-cu121"
-url = "https://download.pytorch.org/whl/cu121"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [build-system]

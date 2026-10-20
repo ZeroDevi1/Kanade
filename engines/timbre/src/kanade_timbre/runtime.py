@@ -42,6 +42,9 @@ def setup() -> None:
     os.environ["APPLIO_CODE_ROOT"] = str(VENDOR)
     os.chdir(ROOT)
     sys.path.insert(0, str(VENDOR))
+    from . import faiss_compat
+
+    faiss_compat.install()
 
 
 def subprocess_env() -> dict[str, str]:

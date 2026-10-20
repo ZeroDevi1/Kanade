@@ -6,11 +6,55 @@ import json
 import os
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 PROTOCOL_VERSION = 1
+
+
+def _request_lines() -> Iterator[str]:
+    """逐行产出 stdin 上的请求，直到 stdin 关闭。
+
+    Windows 上不能让主线程阻塞在 stdin 的同步 ReadFile 上：管道有未完成的同步读时，其他线程对同一句柄的
+    GetFileType 会一直阻塞，而静态链接 CRT 的扩展模块（numpy、torch 等的 .pyd）加载时恰好对标准句柄调用它，
+    结果任务线程卡死在 import。因此 Windows 上先用 PeekNamedPipe 轮询，有数据时才读取，管道上不会挂着阻塞读。
+    stdin 不是管道（例如在控制台里手动调试）时 PeekNamedPipe 失败，退回普通的逐行读取。
+    """
+    if sys.platform != "win32":
+        yield from sys.stdin
+        return
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    peek = ctypes.windll.kernel32.PeekNamedPipe
+    peek.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+                     ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    peek.restype = wintypes.BOOL
+    fd = sys.stdin.fileno()
+    handle = msvcrt.get_osfhandle(fd)
+    avail = wintypes.DWORD()
+    if not peek(handle, None, 0, None, ctypes.byref(avail), None):
+        yield from sys.stdin
+        return
+
+    buf = b""
+    while True:
+        if not peek(handle, None, 0, None, ctypes.byref(avail), None):
+            break  # 写端关闭（ERROR_BROKEN_PIPE）：等同于 EOF
+        if avail.value == 0:
+            # 50 ms 轮询间隔只影响请求（run / cancel）的响应延迟，空闲时开销可忽略。
+            time.sleep(0.05)
+            continue
+        buf += os.read(fd, avail.value)
+        *lines, buf = buf.split(b"\n")
+        for line in lines:
+            yield line.decode("utf-8", errors="replace")
+    if buf:
+        yield buf.decode("utf-8", errors="replace")
 
 
 class Cancelled(Exception):
@@ -134,7 +178,7 @@ def serve(engine: str, version: str, handlers: Mapping[str, Handler]) -> None:
             traceback.print_exc(file=sys.stderr)
             channel.send("error", job.id, {"message": f"{type(exc).__name__}: {exc}"})
 
-    for raw in sys.stdin:
+    for raw in _request_lines():
         raw = raw.strip()
         if not raw:
             continue

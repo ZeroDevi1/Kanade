@@ -93,7 +93,7 @@ func (a *app) stemsRunCard(c *ui.Context, tk *fluent.Tokens) {
 	t := c.Theme()
 	s := &a.stems
 	card(c, tk, "处理", func() {
-		a.audioPicker(c, "输入音频", &s.input)
+		a.audioPicker(c, "输入音频", &s.input, anyAudioExts())
 		ui.Text(c, "步骤（勾选后会自动补上前置步骤）").FontSize(12).TextColor(t.TextMuted)
 		ui.Row(c).Gap(16).Children(func() {
 			for _, st := range stems.Steps {

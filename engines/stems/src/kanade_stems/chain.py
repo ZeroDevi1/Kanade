@@ -92,11 +92,45 @@ def _output_dir(job: Job, src: Path) -> Path:
     return Path(custom) if custom else job.output_dir / f"{job.id}-{src.stem}"
 
 
+# stem 名的角色归一：各模型对伴奏的叫法不同（inst_v1e 为 other，BS-Roformer 为 Instrumental）。
+_STEM_ROLE = {"instrumental": "other", "no_vocals": "other", "no vocals": "other", "inst": "other"}
+
+
+def _role(stem_name: str) -> str:
+    n = stem_name.lower()
+    return _STEM_ROLE.get(n, n)
+
+
+def _override_names(step: Step, model: str, sep, stem: str) -> dict[str, str]:
+    """返回覆盖模型的 custom_output_names：把模型的 stem 按角色对应到 step.outputs 的输出键。
+
+    模型缺少该步所需的角色时抛出 ValueError（例如在「去混响」步骤用了人声分离模型）。
+    """
+    inst = sep.model_instance
+    # 多 stem 模型（如 BS-Roformer-SW 的 6 个 stem）的完整列表在配置的 training.instruments 中，
+    # primary / secondary 只覆盖前两个。
+    model_stems = list((inst.model_data.get("training") or {}).get("instruments") or [])
+    model_stems += [s for s in (inst.primary_stem_name, inst.secondary_stem_name) if s and s not in model_stems]
+    names = {}
+    for key, out in step.outputs.items():
+        hit = next((s for s in model_stems if _role(s) == _role(key)), None)
+        if hit is None:
+            raise ValueError(f"{step.title}需要 {key} 输出，但 {model} 只输出 {model_stems}")
+        names[hit] = f"{stem}_{out}"
+    return names
+
+
 def run_chain(job: Job) -> None:
     src = Path(job.params.get("input") or "")
     if not src.is_file():
         raise ValueError(f"输入文件不存在：{src}")
     steps = resolve_steps(job.params.get("steps"))
+    # models 可按步骤 ID 覆盖默认模型（例如 {"vocals": "model_bs_roformer_ep_317_sdr_12.9755.ckpt"}）；
+    # 输出键与文件后缀不变，覆盖模型的 stem 按角色对应到该步的输出（见 _override_names）。
+    overrides = job.params.get("models") or {}
+    unknown = [k for k in overrides if k not in _BY_ID]
+    if unknown:
+        raise ValueError(f"未知步骤：{unknown}")
     out_dir = _output_dir(job, src)
     patch_downloader(job)
 
@@ -105,13 +139,24 @@ def run_chain(job: Job) -> None:
     stem = src.stem
     for i, step in enumerate(steps):
         base = i / len(steps)
-        job.progress(base + 0.01, f"[{i + 1}/{len(steps)}] {step.title}：加载模型 {step.model}")
-        single = next(iter(step.outputs)) if len(step.outputs) == 1 else None
-        sep = _separator(out_dir, step.overlap, single)
-        sep.load_model(model_filename=step.model)
+        model = overrides.get(step.id) or step.model
+        job.progress(base + 0.01, f"[{i + 1}/{len(steps)}] {step.title}：加载模型 {model}")
+        if model == step.model:
+            single = next(iter(step.outputs)) if len(step.outputs) == 1 else None
+            sep = _separator(out_dir, step.overlap, single)
+            sep.load_model(model_filename=model)
+            names = {k: f"{stem}_{v}" for k, v in step.outputs.items()}
+        else:
+            # 覆盖模型的 stem 名事先未知，先输出全部 stem，按角色改名后删掉不需要的。
+            sep = _separator(out_dir, step.overlap, None)
+            sep.load_model(model_filename=model)
+            names = _override_names(step, model, sep, stem)
         job.progress(base + 0.02, f"[{i + 1}/{len(steps)}] {step.title}：分离中")
-        names = {k: f"{stem}_{v}" for k, v in step.outputs.items()}
-        sep.separate(str(files[step.source]), custom_output_names=names)
+        produced = sep.separate(str(files[step.source]), custom_output_names=names)
+        for name in produced:
+            path = Path(name) if Path(name).is_absolute() else out_dir / name
+            if path.stem not in names.values():
+                path.unlink(missing_ok=True)
         for key in step.outputs.values():
             path = out_dir / f"{stem}_{key}.wav"
             if not path.is_file() or path.stat().st_size == 0:

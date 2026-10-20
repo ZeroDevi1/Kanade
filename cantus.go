@@ -45,7 +45,7 @@ type cantusState struct {
 	models []cantus.Model
 
 	// SFT 训练。
-	sftName, sftDataset, sftASR, sftPart, sftEpochs string
+	sftName, sftDataset, sftASR, sftPart, sftEpochs, sftScope string
 	sftSummary                                      *dataset.Summary
 	sftPrepareJob, sftTrainJob                      string
 	sftScanned                                      string // 已为其刷新过模型列表的训练任务
@@ -60,7 +60,8 @@ type cantusState struct {
 func newCantusState() cantusState {
 	return cantusState{speed: 1, textFrontend: true, voice: voiceFromFile, spkID: cantus.SFTSpeakers[0],
 		source: sourceTitles[0], speakersStale: true, downloads: map[string]string{}, models: cantus.Models,
-		sftASR: cantus.ASRModels[0], sftPart: cantus.SFTParts[0].Title, sftEpochs: "30"}
+		sftASR: cantus.ASRModels[0], sftPart: cantus.SFTParts[0].Title, sftEpochs: "30",
+		sftScope: cantus.SFTLLMScopes[0].Title}
 }
 
 func (s *cantusState) model() cantus.Model {
@@ -215,7 +216,7 @@ func (a *app) cantusInputCard(c *ui.Context, tk *fluent.Tokens) {
 			a.cantusVoice(c, tk, mode)
 		}
 		if mode == cantus.ModeVC {
-			a.audioPicker(c, "源音频", &s.sourceWav)
+			a.audioPicker(c, "源音频", &s.sourceWav, directAudioExts)
 		}
 		if mode == cantus.ModeInstruct {
 			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
@@ -284,7 +285,7 @@ func (a *app) cantusVoice(c *ui.Context, tk *fluent.Tokens, mode cantus.Mode) {
 		}
 		return
 	}
-	a.audioPicker(c, "参考音频", &s.promptWav)
+	a.audioPicker(c, "参考音频", &s.promptWav, directAudioExts)
 	if mode == cantus.ModeZeroShot || mode == cantus.ModeInstruct {
 		ui.TextInput(c, &s.promptText).Label("参考音频的文本").Placeholder("参考音频里说的话，零样本克隆必填")
 	}
@@ -303,8 +304,22 @@ func (a *app) cantusVoice(c *ui.Context, tk *fluent.Tokens, mode cantus.Mode) {
 	}
 }
 
+// directAudioExts 是 CosyVoice 与 RVC 推理直接读取（soundfile）时支持的格式，与 tasks.check_audio 的提示一致。
+var directAudioExts = []string{"wav", "flac", "mp3", "ogg"}
+
+// anyAudioExts 返回经分轨引擎 ffmpeg 预转换后可用的全部格式（不带点、已排序），与 dataset.AudioExts 一致。
+func anyAudioExts() []string {
+	exts := make([]string, 0, len(dataset.AudioExts))
+	for e := range dataset.AudioExts {
+		exts = append(exts, e[1:])
+	}
+	slices.Sort(exts)
+	return exts
+}
+
 // audioPicker 显示已选文件并提供选择按钮；对话框在后台 goroutine 中打开，选择结果经 post 写回 *path。
-func (a *app) audioPicker(c *ui.Context, label string, path *string) {
+// exts 是对话框筛选的扩展名（directAudioExts 或 anyAudioExts()）。
+func (a *app) audioPicker(c *ui.Context, label string, path *string, exts []string) {
 	t := c.Theme()
 	ui.Row(c.Key("pick-" + label)).Gap(8).AlignItems(ui.Center).Children(func() {
 		ui.Text(c, label).FontSize(12).Width(64)
@@ -318,7 +333,7 @@ func (a *app) audioPicker(c *ui.Context, label string, path *string) {
 			go func() {
 				files, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
 					Parent: win, Title: "选择" + label,
-					Filters: []mygo.FileFilter{{Name: "音频", Extensions: []string{"wav", "flac", "mp3", "ogg"}}},
+					Filters: []mygo.FileFilter{{Name: "音频", Extensions: exts}},
 				})
 				if err != nil || len(files) == 0 {
 					return
@@ -507,6 +522,11 @@ func (a *app) cantusSFTCard(c *ui.Context, tk *fluent.Tokens) {
 				parts[i] = p.Title
 			}
 			ui.Select(c, &s.sftPart, parts).Label("训练部分").Width(200)
+			scopes := make([]string, len(cantus.SFTLLMScopes))
+			for i, sc := range cantus.SFTLLMScopes {
+				scopes[i] = sc.Title
+			}
+			ui.Select(c, &s.sftScope, scopes).Label("LLM 训练范围").Width(220)
 			ui.TextInput(c, &s.sftEpochs).Label("轮数").Width(80)
 			_, training := a.jobStatusPeek(s.sftTrainJob)
 			if ui.PrimaryButton(c, "2. 开始训练").Disabled(training).Clicked() {
@@ -516,10 +536,16 @@ func (a *app) cantusSFTCard(c *ui.Context, tk *fluent.Tokens) {
 						part = p.Key
 					}
 				}
+				layers := cantus.SFTLLMScopes[0].Layers
+				for _, sc := range cantus.SFTLLMScopes {
+					if sc.Title == s.sftScope {
+						layers = sc.Layers
+					}
+				}
 				epochs, err := strconv.Atoi(s.sftEpochs)
 				var params map[string]any
 				if err == nil {
-					params, err = cantus.SFTTrainParams(l, s.sftName, part, epochs)
+					params, err = cantus.SFTTrainParams(l, s.sftName, part, epochs, layers)
 				} else {
 					err = fmt.Errorf("轮数须为整数")
 				}
