@@ -1,0 +1,67 @@
+[project]
+name = "kanade-cosyvoice"
+version = "0.1.0"
+description = "Kanade 的 CosyVoice 推理引擎（Cantus）：零样本克隆、跨语种、预训练音色、自然语言控制、声音转换"
+requires-python = "==3.10.*"
+# 版本与上游 requirements.txt（vendor/VENDOR.md 记录的提交）保持一致，只保留推理路径实际导入的包；
+# WebUI、TensorRT、vLLM、分布式训练相关依赖（gradio、fastapi、tensorrt、deepspeed 等）不安装。
+# 注意模型 yaml 经 hyperpyyaml 引用 cosyvoice.dataset.processor，后者在导入时需要 pyarrow、pyworld、whisper，
+# Matcha 的 utils 需要 gdown、wget，因此这些训练向的包也必须保留。
+dependencies = [
+    "kanade-engine-sdk",
+    "torch==2.3.1",
+    "torchaudio==2.3.1",
+    "numpy==1.26.4",
+    "conformer==0.3.2",
+    "diffusers==0.29.0",
+    "hydra-core==1.3.2",
+    "HyperPyYAML==1.2.3",
+    "inflect==7.3.1",
+    "librosa==0.10.2",
+    "lightning==2.2.4",
+    "matplotlib==3.7.5",
+    "modelscope==1.20.0",
+    "omegaconf==2.3.0",
+    "onnxruntime==1.18.0",
+    "openai-whisper==20231117",
+    "soundfile==0.12.1",
+    "transformers==4.51.3",
+    "x-transformers==2.11.24",
+    "wetext==0.0.4",
+    "rich==13.7.1",
+    "pyarrow==18.1.0",
+    # pyworld 在 Windows 有 cp310 wheel；macOS 需本地编译（Xcode 命令行工具）。
+    "pyworld==0.3.4",
+    "gdown==5.1.0",
+    "wget==3.2",
+    # lightning 2.2.4（Matcha-TTS 导入）在 import 时使用 pkg_resources，新版 setuptools 已移除该模块。
+    "setuptools<81",
+]
+
+[tool.uv]
+# 只为实际发布的两个平台解析：Windows x64（CUDA 推理）与 macOS arm64（界面开发与 CPU 冒烟测试）。
+environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+# openai-whisper 20231117 只有源码包，其 setup.py 导入 pkg_resources，新版 setuptools 已移除该模块。
+build-constraint-dependencies = ["setuptools<81"]
+
+[tool.uv.sources]
+kanade-engine-sdk = { path = "../sdk" }
+# Windows 用 PyTorch 官方 CUDA 12.1 构建（与上游 requirements 的 cu121 一致）；macOS 用 PyPI 的 CPU/MPS 构建。
+torch = [{ index = "pytorch-cu121", marker = "sys_platform == 'win32'" }]
+torchaudio = [{ index = "pytorch-cu121", marker = "sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kanade_cosyvoice"]

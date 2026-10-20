@@ -9,4 +9,5 @@ import "embed"
 
 //go:embed sdk/pyproject.toml all:sdk/src
 //go:embed dev-mock/engine.json dev-mock/pyproject.toml dev-mock/uv.lock all:dev-mock/src
+//go:embed cosyvoice/engine.json cosyvoice/pyproject.toml cosyvoice/uv.lock all:cosyvoice/src all:cosyvoice/vendor
 var FS embed.FS

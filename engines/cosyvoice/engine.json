@@ -1,0 +1,15 @@
+{
+  "name": "cosyvoice",
+  "title": "CosyVoice 语音生成",
+  "description": "零样本克隆、跨语种、预训练音色、自然语言控制与声音转换。",
+  "python": "3.10",
+  "module": "kanade_cosyvoice",
+  "tasks": [
+    "cosyvoice.download",
+    "cosyvoice.zero_shot",
+    "cosyvoice.cross_lingual",
+    "cosyvoice.sft",
+    "cosyvoice.instruct",
+    "cosyvoice.vc"
+  ]
+}

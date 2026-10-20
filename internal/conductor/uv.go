@@ -177,6 +177,8 @@ func Env(l paths.Layout) []string {
 		"PYTHONUTF8=1",
 		"PYTHONIOENCODING=utf-8",
 		"PYTHONUNBUFFERED=1",
+		// 引擎据此把模型与第三方库缓存（modelscope、huggingface）放到数据根目录。
+		"KANADE_MODELS_DIR="+l.Models,
 	)
 }
 

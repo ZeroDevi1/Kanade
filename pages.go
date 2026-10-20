@@ -13,7 +13,7 @@ func (a *app) page(c *ui.Context, tk *fluent.Tokens) {
 		case "lab":
 			a.labPage(c, tk)
 		case "cantus":
-			placeholder(c, tk, "语音生成", "Cantus · CosyVoice 零样本克隆与指令合成。")
+			a.cantusPage(c, tk)
 		case "timbre":
 			placeholder(c, tk, "音色转换", "Timbre · RVC 歌曲与纯人声音色转换。")
 		case "stems":

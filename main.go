@@ -25,10 +25,11 @@ type app struct {
 
 	lab      labState
 	settings settingsState
+	cantus   cantusState
 }
 
 func newApp() *app {
-	return &app{current: "lab", post: func(fn func()) { fn() }}
+	return &app{current: "cantus", post: func(fn func()) { fn() }, cantus: newCantusState()}
 }
 
 func main() {

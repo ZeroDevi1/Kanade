@@ -24,6 +24,9 @@ func TestSimulatedJob(t *testing.T) {
 	updates := make(chan func(), 256)
 	a.post = func(fn func()) { updates <- fn }
 	tt := ui.NewTester(a.view, 1200, 780)
+	if err := tt.Click("M0 验证"); err != nil {
+		t.Fatal(err)
+	}
 	if err := tt.Click("开始模拟任务"); err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +43,7 @@ func TestSimulatedJob(t *testing.T) {
 func TestPagesWithoutBackend(t *testing.T) {
 	a := newApp()
 	tt := ui.NewTester(a.view, 1200, 780)
-	for _, page := range []string{"任务", "设置"} {
+	for _, page := range []string{"语音生成", "任务", "设置"} {
 		if err := tt.Click(page); err != nil {
 			t.Fatal(err)
 		}
