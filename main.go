@@ -1,5 +1,5 @@
-// Kanade 是音频生成、人声转换与音乐分析的桌面聚合工具。当前为 M0 技术验证原型：
-// 验证 Fluent 风格外壳（隐藏标题栏、Mica、导航栏）、波形绘制与后台任务进度刷新。
+// Kanade 是音频生成、人声转换与音乐分析的桌面聚合工具：Go + MyGo Native UI 外壳，
+// 经 Conductor 驱动 uv 管理的 Python 推理引擎。
 package main
 
 import (
@@ -17,10 +17,14 @@ type app struct {
 	// win 在窗口创建后赋值，用于运行时切换材质；测试中为 nil。
 	win *mygo.Window
 
+	// be 在窗口创建后由 startBackend 赋值；测试中为零值（cond 为 nil），页面显示后端不可用。
+	be backend
+
 	current      string // 当前页面，取 navItem.id
 	navCollapsed bool
 
-	lab labState
+	lab      labState
+	settings settingsState
 }
 
 func newApp() *app {
@@ -52,6 +56,17 @@ func main() {
 		}
 		a.win = mygo.NewWindow(opts)
 		a.post = a.win.Update
+		// Conductor 的状态变化来自后台 goroutine：经 Update 回到 UI 线程重建视图（视图读取的是快照）。
+		a.be = startBackend(func() { a.post(func() {}) })
+		if a.be.err != nil {
+			log.Printf("后端启动失败：%v", a.be.err)
+		}
+	})
+	// 退出时关闭 worker，释放显存；App.Exit 不触发此钩子。
+	mygo.App.OnQuit(func() {
+		if a.be.cond != nil {
+			a.be.cond.Shutdown(shutdownGrace)
+		}
 	})
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)

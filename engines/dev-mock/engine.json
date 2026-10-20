@@ -1,0 +1,8 @@
+{
+  "name": "dev-mock",
+  "title": "开发模拟引擎",
+  "description": "不依赖模型与 GPU，生成测试音频并模拟进度。",
+  "python": "3.12",
+  "module": "kanade_dev_mock",
+  "tasks": ["mock.tts"]
+}

@@ -20,8 +20,10 @@ func (a *app) page(c *ui.Context, tk *fluent.Tokens) {
 			placeholder(c, tk, "分轨", "Stems · MDX / Demucs / BS-RoFormer 源分离。")
 		case "score":
 			placeholder(c, tk, "音乐分析", "Score · 调号、拍号、BPM、和弦与情绪识别。")
+		case "tasks":
+			a.tasksPage(c, tk)
 		case "settings":
-			placeholder(c, tk, "设置", "数据根目录、uv 与推理引擎、模型镜像源。")
+			a.settingsPage(c, tk)
 		default:
 			placeholder(c, tk, "主页", "最近项目与任务队列。")
 		}

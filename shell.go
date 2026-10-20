@@ -30,6 +30,7 @@ var (
 		{"score", "音乐分析", iconScore},
 	}
 	navFooter = []navItem{
+		{"tasks", "任务", iconTasks},
 		{"lab", "M0 验证", iconLab},
 		{"settings", "设置", iconSettings},
 	}

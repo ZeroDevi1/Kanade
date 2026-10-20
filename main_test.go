@@ -35,3 +35,17 @@ func TestSimulatedJob(t *testing.T) {
 		t.Errorf("progress %v, texts %q", a.lab.jobProgress, tt.Texts())
 	}
 }
+
+// 后端未启动时，依赖 Conductor 的页面显示原因而不是崩溃。
+func TestPagesWithoutBackend(t *testing.T) {
+	a := newApp()
+	tt := ui.NewTester(a.view, 1200, 780)
+	for _, page := range []string{"任务", "设置"} {
+		if err := tt.Click(page); err != nil {
+			t.Fatal(err)
+		}
+		if !tt.HasText("推理后端未启动。") {
+			t.Errorf("%s: texts %q", page, tt.Texts())
+		}
+	}
+}

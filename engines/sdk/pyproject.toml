@@ -1,0 +1,13 @@
+[project]
+name = "kanade-engine-sdk"
+version = "0.1.0"
+description = "Kanade 推理引擎与 Conductor 之间的 stdio 协议实现"
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kanade_engine"]

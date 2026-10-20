@@ -11,6 +11,7 @@ import (
 	"github.com/egoist/mygo/audio"
 	"github.com/egoist/mygo/ui"
 
+	"kanade/internal/conductor"
 	"kanade/internal/ui/fluent"
 	"kanade/internal/ui/waveform"
 )
@@ -38,6 +39,14 @@ type labState struct {
 	jobStatus   string
 
 	material mygo.Vibrancy
+
+	// mockText 是提交给 dev-mock 的文本；mockJob 是最近提交的任务 ID（空表示未提交）。
+	mockText string
+	mockJob  string
+	// loadedArtifact 是已载入波形的输出文件；loading 为 true 时正在后台解码。
+	loadedArtifact string
+	loading        bool
+	loadErr        string
 }
 
 // playback 把 audio.Player 适配为波形控件的 Playback。Player 的方法可在任意 goroutine 调用。
@@ -175,11 +184,15 @@ func (a *app) labPage(c *ui.Context, tk *fluent.Tokens) {
 		waveform.Show(c, &l.waveHandle, l.peaks, pb).Height(120).Background(tk.Card).
 			Border(1, tk.CardStroke).Radius(fluent.OverlayRadius)
 		if l.peaks != nil {
-			ui.Textf(c, "%d 采样 · %d 个峰值桶 · 合成 %s · 峰值计算 %s · 设置 MYGO_FRAME_STATS=1 运行可在日志查看帧耗时",
-				l.peaks.Frames, len(l.peaks.Min), l.genCost.Round(time.Millisecond), l.peakCost.Round(time.Millisecond)).
-				FontSize(12).TextColor(t.TextMuted)
+			stats := fmt.Sprintf("%d 帧 · %d 个峰值桶", l.peaks.Frames, len(l.peaks.Min))
+			if l.genCost > 0 { // 只有本地合成的测试音频记录了耗时；任务输出为 0
+				stats += fmt.Sprintf(" · 合成 %s · 峰值计算 %s", l.genCost.Round(time.Millisecond), l.peakCost.Round(time.Millisecond))
+			}
+			ui.Text(c, stats+" · 设置 MYGO_FRAME_STATS=1 运行可在日志查看帧耗时").FontSize(12).TextColor(t.TextMuted)
 		}
 	})
+
+	card(c, tk, "Conductor 链路（dev-mock 引擎）", func() { a.mockCard(c) })
 
 	card(c, tk, "后台任务进度", func() {
 		l := &a.lab
@@ -219,6 +232,78 @@ func (a *app) labPage(c *ui.Context, tk *fluent.Tokens) {
 			}
 		})
 	})
+}
+
+// mockCard 提交 dev-mock 合成任务并跟踪其进度；完成后把输出 WAV 载入上方波形。
+// 首次提交会安装引擎环境（释放源码、uv sync，首次需联网下载 Python），耗时较长。
+func (a *app) mockCard(c *ui.Context) {
+	t := c.Theme()
+	l := &a.lab
+	if a.be.cond == nil {
+		ui.Text(c, "推理后端未启动，见「设置」页。").TextColor(t.TextMuted)
+		return
+	}
+	var job conductor.Job
+	active := false
+	if l.mockJob != "" {
+		job, _ = a.be.cond.Job(l.mockJob)
+		active = !job.State.Finished()
+	}
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.TextInput(c, &l.mockText).Placeholder("要合成的文本，默认 Kanade").Label("文本").Width(320)
+		if ui.PrimaryButton(c, "提交合成任务").Disabled(active).Clicked() {
+			id, err := a.be.cond.Submit("dev-mock", "mock.tts", map[string]any{"text": l.mockText})
+			l.mockJob, l.loadErr = id, ""
+			if err != nil {
+				l.loadErr = err.Error()
+			}
+		}
+		if active && ui.Button(c, "取消").Clicked() {
+			a.be.cond.Cancel(l.mockJob)
+		}
+	})
+	if l.mockJob == "" {
+		return
+	}
+	status := fmt.Sprintf("%s · %s", jobStateLabel[job.State], job.ID)
+	if job.Message != "" && active {
+		status += " · " + job.Message
+	}
+	ui.Text(c, status).FontSize(12).TextColor(t.TextMuted)
+	if active {
+		ui.Progress(c, job.Progress)
+	}
+	if job.Err != "" {
+		ui.Text(c, job.Err).FontSize(12).TextColor(t.Danger).Selectable()
+	}
+	if l.loadErr != "" {
+		ui.Text(c, l.loadErr).FontSize(12).TextColor(t.Danger)
+	}
+	// 任务完成后载入一次输出；loading 与 loadedArtifact 保证视图多次重建时只启动一次解码。
+	if job.State == conductor.JobDone && len(job.Artifacts) > 0 && job.Artifacts[0] != l.loadedArtifact && !l.loading {
+		a.loadArtifact(job.Artifacts[0])
+	}
+}
+
+// loadArtifact 在后台解码音频文件，完成后替换波形与播放器。
+func (a *app) loadArtifact(path string) {
+	a.lab.loading = true
+	go func() {
+		la, err := loadAudio(path)
+		a.post(func() {
+			l := &a.lab
+			l.loading, l.loadedArtifact = false, path
+			if err != nil {
+				l.loadErr = err.Error()
+				return
+			}
+			if l.player != nil {
+				l.player.Stop()
+			}
+			l.peaks, l.player = &la.peaks, la.player
+			l.genCost, l.peakCost = 0, 0
+		})
+	}()
 }
 
 // clock 把时长格式化为 m:ss.d。
