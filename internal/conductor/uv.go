@@ -74,13 +74,18 @@ func FindUV(l paths.Layout) *UV {
 //
 // 当前平台不在 uvChecksums 中、下载失败、校验不符或压缩包内缺少 uv 时返回错误，且不改动 l.UVDir。
 // 压缩包约 20 MB，全部读入内存后再校验，校验通过前不写任何文件。
-func DownloadUV(ctx context.Context, l paths.Layout) (*UV, error) {
+// githubMirror 非空时作为前缀加在 GitHub 下载地址前（与引擎的 KANADE_GITHUB_MIRROR 相同）。
+func DownloadUV(ctx context.Context, l paths.Layout, githubMirror string) (*UV, error) {
 	key := runtime.GOOS + "/" + runtime.GOARCH
 	pkg, ok := uvChecksums[key]
 	if !ok {
 		return nil, fmt.Errorf("uv %s 没有 %s 的发布包", UVVersion, key)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uvReleaseBase+UVVersion+"/"+pkg.asset, nil)
+	url := uvReleaseBase + UVVersion + "/" + pkg.asset
+	if githubMirror != "" && strings.HasPrefix(url, "https://github.com/") {
+		url = strings.TrimRight(githubMirror, "/") + "/" + url
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -167,8 +172,9 @@ func fromTarGz(data []byte, name string) ([]byte, error) {
 
 // Env 返回运行 uv 及引擎 Python 时使用的环境变量：把缓存、Python 运行时固定到数据根目录，
 // 并强制 UTF-8，避免 Windows 中文用户名路径与非 UTF-8 控制台编码导致的解码错误。
-func Env(l paths.Layout) []string {
-	return append(os.Environ(),
+// extra 追加在最后（同名变量以后者为准），用于设置页的下载镜像等选项。
+func Env(l paths.Layout, extra ...string) []string {
+	env := append(os.Environ(),
 		"UV_CACHE_DIR="+l.UVCache,
 		"UV_PYTHON_INSTALL_DIR="+l.PythonDir,
 		// 只用 uv 管理的 Python，避免不同机器上系统 Python 版本不一致。
@@ -180,6 +186,7 @@ func Env(l paths.Layout) []string {
 		// 引擎据此把模型与第三方库缓存（modelscope、huggingface）放到数据根目录。
 		"KANADE_MODELS_DIR="+l.Models,
 	)
+	return append(env, extra...)
 }
 
 // Version 运行 uv --version 并返回其输出（去掉首尾空白）。

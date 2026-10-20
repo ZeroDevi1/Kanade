@@ -1,0 +1,44 @@
+[project]
+name = "kanade-stems"
+version = "0.1.0"
+description = "Kanade 的分轨引擎（Stems）：基于 python-audio-separator 的人声净化链与单模型分离"
+requires-python = "==3.12.*"
+dependencies = [
+    "kanade-engine-sdk",
+    # audio-separator 是 MIT 许可的 pip 包，直接依赖即可，无需 vendor。
+    # （MSST-WebUI 为 AGPL-3.0，不能随应用分发，因此不采用。）
+    "audio-separator==0.47.1",
+    "torch==2.14.1",
+    # librosa 1.0 去掉了 audioread 依赖并有 API 变化，而 audio-separator 仍直接 import audioread、按 0.x 的 API 编写。
+    "librosa==0.11.0",
+    "audioread==3.1.0",
+    # 解码 MP3 / M4A 等格式需要 ffmpeg；用 imageio-ffmpeg 自带的静态二进制，不依赖系统安装。
+    "imageio-ffmpeg==0.6.0",
+    # audio-separator 的 ONNX 模型（MDX / VR）需要 onnxruntime；本引擎默认链只用 Roformer（PyTorch），
+    # 但单模型分离允许选择 ONNX 模型。Windows 上 CUDA 加速 ONNX 留待按需改为 onnxruntime-gpu。
+    "onnxruntime==1.31.0",
+]
+
+[tool.uv]
+environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[tool.uv.sources]
+# editable：SDK 版本号不变时 uv sync 不会重装非 editable 的 path 依赖，改为直接引用释放出的源码。
+kanade-engine-sdk = { path = "../sdk", editable = true }
+# Windows 用 PyTorch 官方 CUDA 12.6 构建：兼容 RTX 20/30/40 与较旧驱动。RTX 50（Blackwell）需改为 cu128 / cu130 索引。
+torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kanade_stems"]

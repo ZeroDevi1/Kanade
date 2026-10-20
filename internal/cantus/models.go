@@ -4,6 +4,7 @@
 package cantus
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 
@@ -22,6 +23,8 @@ const (
 	FamilyV1Instruct Family = "v1-instruct"
 	FamilyV2         Family = "v2"
 	FamilyV3         Family = "v3"
+	// FamilyV3SFT 是在 Kanade 中微调出的 CosyVoice 3 说话人模型（目录含 kanade-sft.json），只有预训练音色模式。
+	FamilyV3SFT Family = "v3-sft"
 )
 
 // Mode 是推理模式，同时是引擎任务名的后缀（cosyvoice.<Mode>）。
@@ -52,6 +55,7 @@ var familyModes = map[Family][]Mode{
 	FamilyV1Instruct: {ModeInstruct},
 	FamilyV2:         {ModeZeroShot, ModeCrossLingual, ModeInstruct},
 	FamilyV3:         {ModeZeroShot, ModeCrossLingual, ModeInstruct},
+	FamilyV3SFT:      {ModeSFT},
 }
 
 // Source 是模型下载源。
@@ -72,15 +76,47 @@ type Model struct {
 	HuggingFace string // Hugging Face 仓库 ID
 	// SizeGB 是只下载推理所需文件时的大小（2026-10 查询 ModelScope 文件列表所得），用于下载前提示。
 	SizeGB float64
+	// Speakers 是 SFT 模型内置的音色；为空时 CosyVoice 1 SFT / Instruct 模型使用 SFTSpeakers。
+	Speakers []string
 }
 
 // Models 是支持的模型，推荐的排在前面。
 var Models = []Model{
-	{"Fun-CosyVoice3-0.5B", "Fun-CosyVoice 3 · 0.5B（推荐）", FamilyV3, "FunAudioLLM/Fun-CosyVoice3-0.5B-2512", "FunAudioLLM/Fun-CosyVoice3-0.5B-2512", 5.4},
-	{"CosyVoice2-0.5B", "CosyVoice 2 · 0.5B", FamilyV2, "iic/CosyVoice2-0.5B", "FunAudioLLM/CosyVoice2-0.5B", 4.1},
-	{"CosyVoice-300M", "CosyVoice 1 · 300M 基础", FamilyV1, "iic/CosyVoice-300M", "FunAudioLLM/CosyVoice-300M", 2.3},
-	{"CosyVoice-300M-SFT", "CosyVoice 1 · 300M 预训练音色", FamilyV1SFT, "iic/CosyVoice-300M-SFT", "FunAudioLLM/CosyVoice-300M-SFT", 2.3},
-	{"CosyVoice-300M-Instruct", "CosyVoice 1 · 300M 指令", FamilyV1Instruct, "iic/CosyVoice-300M-Instruct", "FunAudioLLM/CosyVoice-300M-Instruct", 2.3},
+	{"Fun-CosyVoice3-0.5B", "Fun-CosyVoice 3 · 0.5B（推荐）", FamilyV3, "FunAudioLLM/Fun-CosyVoice3-0.5B-2512", "FunAudioLLM/Fun-CosyVoice3-0.5B-2512", 5.4, nil},
+	{"CosyVoice2-0.5B", "CosyVoice 2 · 0.5B", FamilyV2, "iic/CosyVoice2-0.5B", "FunAudioLLM/CosyVoice2-0.5B", 4.1, nil},
+	{"CosyVoice-300M", "CosyVoice 1 · 300M 基础", FamilyV1, "iic/CosyVoice-300M", "FunAudioLLM/CosyVoice-300M", 2.3, nil},
+	{"CosyVoice-300M-SFT", "CosyVoice 1 · 300M 预训练音色", FamilyV1SFT, "iic/CosyVoice-300M-SFT", "FunAudioLLM/CosyVoice-300M-SFT", 2.3, nil},
+	{"CosyVoice-300M-Instruct", "CosyVoice 1 · 300M 指令", FamilyV1Instruct, "iic/CosyVoice-300M-Instruct", "FunAudioLLM/CosyVoice-300M-Instruct", 2.3, nil},
+}
+
+// AllModels 返回内置模型与数据根目录中训练出的 SFT 模型（<名称>-SFT/kanade-sft.json）。
+func AllModels(l paths.Layout) []Model {
+	out := append([]Model(nil), Models...)
+	dirs, _ := filepath.Glob(filepath.Join(Root(l), "*-SFT", "kanade-sft.json"))
+	for _, meta := range dirs {
+		data, err := os.ReadFile(meta)
+		if err != nil {
+			continue
+		}
+		var info struct {
+			SpkID string `json:"spk_id"`
+			Base  string `json:"base"`
+		}
+		if json.Unmarshal(data, &info) != nil || info.SpkID == "" {
+			continue
+		}
+		key := filepath.Base(filepath.Dir(meta))
+		out = append(out, Model{Key: key, Title: info.SpkID + "（微调音色）", Family: FamilyV3SFT, Speakers: []string{info.SpkID}})
+	}
+	return out
+}
+
+// SpeakerList 返回预训练音色模式可选的音色。
+func (m Model) SpeakerList() []string {
+	if len(m.Speakers) > 0 {
+		return m.Speakers
+	}
+	return SFTSpeakers
 }
 
 // Modes 返回模型支持的模式，顺序即界面顺序。

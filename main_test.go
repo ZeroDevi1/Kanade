@@ -13,7 +13,7 @@ func TestNavigation(t *testing.T) {
 	if err := tt.Click("分轨"); err != nil {
 		t.Fatal(err)
 	}
-	if a.current != "stems" || !tt.HasText("Stems · MDX / Demucs / BS-RoFormer 源分离。") {
+	if a.current != "stems" || !tt.HasText("推理后端未启动。") {
 		t.Errorf("page %q after clicking 分轨, texts %q", a.current, tt.Texts())
 	}
 }
@@ -43,7 +43,7 @@ func TestSimulatedJob(t *testing.T) {
 func TestPagesWithoutBackend(t *testing.T) {
 	a := newApp()
 	tt := ui.NewTester(a.view, 1200, 780)
-	for _, page := range []string{"语音生成", "任务", "设置"} {
+	for _, page := range []string{"语音生成", "分轨", "音色转换", "任务", "设置"} {
 		if err := tt.Click(page); err != nil {
 			t.Fatal(err)
 		}

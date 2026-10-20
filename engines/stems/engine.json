@@ -1,0 +1,13 @@
+{
+  "name": "stems",
+  "title": "分轨与人声净化",
+  "description": "伴奏 / 干声分离、去和声、去混响、降噪（audio-separator，Roformer 模型）。",
+  "python": "3.12",
+  "module": "kanade_stems",
+  "tasks": [
+    "stems.chain",
+    "stems.separate",
+    "stems.download",
+    "stems.doctor"
+  ]
+}

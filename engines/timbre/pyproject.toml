@@ -1,0 +1,61 @@
+[project]
+name = "kanade-timbre"
+version = "0.1.0"
+description = "Kanade 的音色转换引擎（Timbre）：RVC 推理与训练，推理与训练核心 vendor 自 Applio"
+requires-python = "==3.12.*"
+# 版本取自 Applio requirements-engine.txt（vendor/VENDOR.md 记录的提交）；去掉 WebUI、TTS、实时变声相关的包
+# （gradio、edge-tts、sounddevice、webrtcvad、fastapi、uvicorn、websockets）。
+dependencies = [
+    "kanade-engine-sdk",
+    "numpy==2.4.6",
+    "requests==2.34.2",
+    "tqdm==4.68.4",
+    "faiss-cpu==1.14.3",
+    "librosa==0.11.0",
+    "scipy==1.18.0",
+    "soundfile==0.14.0",
+    "stftpitchshift==2.0",
+    "soxr==1.1.0",
+    "torch==2.11.0",
+    "torchaudio==2.11.0",
+    "torchcrepe==0.0.24",
+    "torchfcpe==0.0.4",
+    "einops==0.8.2",
+    "transformers==5.13.1",
+    "matplotlib==3.11.0",
+    "tensorboard==2.21.0",
+    "onnx==1.23.1",
+    # Swift f0 预测器使用 ONNX；两个平台都用 CPU 版，训练与主流 f0 方法（rmvpe / crepe / fcpe）走 PyTorch。
+    "onnxruntime==1.31.0",
+    "beautifulsoup4==4.15.0",
+    "psutil==7.2.2",
+    # 训练集预处理与 MP3 等格式解码需要 ffmpeg；与分轨引擎一样使用 imageio-ffmpeg 自带的静态二进制。
+    "imageio-ffmpeg==0.6.0",
+    # 索引训练（MiniBatchKMeans）。
+    "scikit-learn",
+]
+
+[tool.uv]
+environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[tool.uv.sources]
+# editable：SDK 版本号不变时 uv sync 不会重装非 editable 的 path 依赖，改为直接引用释放出的源码。
+kanade-engine-sdk = { path = "../sdk", editable = true }
+# Windows 用 PyTorch 官方 CUDA 12.8 构建（Applio 锁定 torch 2.11；cu128 同时支持 RTX 50 系列）。
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32'" }]
+torchaudio = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kanade_timbre"]

@@ -23,6 +23,14 @@ type settingsState struct {
 	err       string
 	// expanded 记录展开了安装日志的引擎名称。
 	expanded map[string]bool
+
+	// 下载镜像的编辑值；mirrorLoaded 为 false 时从已保存设置初始化。
+	mirrorLoaded bool
+	mirrorCN     bool
+	ghMirror     string
+	mirrorSaved  bool
+	// doctor 是各引擎环境检查任务的 ID。
+	doctor map[string]string
 }
 
 var engineStateLabel = map[conductor.EngineState]string{
@@ -101,6 +109,88 @@ func (a *app) settingsPage(c *ui.Context, tk *fluent.Tokens) {
 		for _, e := range a.be.cond.Engines() {
 			a.engineRow(c, tk, e)
 		}
+	})
+
+	a.mirrorCard(c, tk)
+	a.doctorCard(c, tk)
+}
+
+// mirrorCard 设置模型与运行时的下载镜像，保存后对之后启动的引擎生效。
+func (a *app) mirrorCard(c *ui.Context, tk *fluent.Tokens) {
+	t := c.Theme()
+	s := &a.settings
+	if !s.mirrorLoaded {
+		s.mirrorLoaded = true
+		s.mirrorCN, s.ghMirror = a.be.settings.Mirror == settings.MirrorCN, a.be.settings.GitHubMirror
+	}
+	card(c, tk, "下载镜像", func() {
+		ui.Checkbox(c, &s.mirrorCN, "Hugging Face 使用国内镜像（"+settings.HFMirror+"）")
+		ui.TextInput(c, &s.ghMirror).Label("GitHub 镜像前缀").Placeholder("留空直连，例如 https://ghfast.top/").Width(360)
+		ui.Text(c, "GitHub 镜像用于分轨模型、uv 与 Python 运行时的下载；CosyVoice 模型可在语音生成页选择 ModelScope。").
+			FontSize(12).TextColor(t.TextMuted)
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			if ui.Button(c, "保存").Clicked() {
+				gh := strings.TrimSpace(s.ghMirror)
+				if gh != "" && !strings.HasPrefix(gh, "https://") {
+					s.err, s.mirrorSaved = "GitHub 镜像前缀须以 https:// 开头", false
+					return
+				}
+				next := a.be.settings
+				next.Mirror, next.GitHubMirror = "", gh
+				if s.mirrorCN {
+					next.Mirror = settings.MirrorCN
+				}
+				if err := settings.Save(a.be.userData, next); err != nil {
+					s.err, s.mirrorSaved = "保存设置失败："+err.Error(), false
+					return
+				}
+				a.be.settings, s.err, s.mirrorSaved = next, "", true
+				a.be.cond.SetEnv(next.Env())
+			}
+			if s.mirrorSaved {
+				ui.Text(c, "已保存，对之后启动的引擎生效").FontSize(12).TextColor(t.Success)
+			}
+		})
+	})
+}
+
+// doctorCard 对已安装的引擎运行环境检查，显示 Python、torch、CUDA 版本与实际使用的设备。
+func (a *app) doctorCard(c *ui.Context, tk *fluent.Tokens) {
+	t := c.Theme()
+	s := &a.settings
+	card(c, tk, "环境检查", func() {
+		engines := a.be.cond.Engines()
+		if ui.Button(c, "检查已安装的引擎").Clicked() {
+			if s.doctor == nil {
+				s.doctor = map[string]string{}
+			}
+			for _, e := range engines {
+				if e.State == conductor.EngineReady || e.State == conductor.EngineRunning {
+					id, err := a.be.cond.Submit(e.Spec.Name, e.Spec.Name+".doctor", map[string]any{})
+					s.doctor[e.Spec.Name], s.err = id, errText(err)
+				}
+			}
+		}
+		for _, e := range engines {
+			ui.Row(c.Key("doctor-" + e.Spec.Name)).Gap(12).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, e.Spec.Title).Width(180).SingleLine()
+				id := s.doctor[e.Spec.Name]
+				switch j, _ := a.be.cond.Job(id); {
+				case e.State == conductor.EngineMissing || e.State == conductor.EngineFailed:
+					ui.Text(c, "未安装").FontSize(12).TextColor(t.TextMuted)
+				case id == "":
+					ui.Text(c, "—").FontSize(12).TextColor(t.TextMuted)
+				case j.State == conductor.JobDone:
+					ui.Text(c, j.Message).FontSize(12).Font("monospace").Selectable()
+				case j.State == conductor.JobFailed:
+					ui.Text(c, j.Err).FontSize(12).TextColor(t.Danger).Selectable()
+				default:
+					ui.Spinner(c)
+				}
+			})
+		}
+		ui.Text(c, "Windows 上应显示 CUDA 与显卡型号；显示 CPU 时请检查 NVIDIA 驱动。CosyVoice 不使用 Apple MPS。").
+			FontSize(12).TextColor(t.TextMuted)
 	})
 }
 

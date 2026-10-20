@@ -66,7 +66,7 @@ func TestDownloadUVVerifiesChecksum(t *testing.T) {
 	withFakeRelease(t, archive, hex.EncodeToString(sum[:]))
 
 	l := paths.New(t.TempDir())
-	uv, err := DownloadUV(context.Background(), l)
+	uv, err := DownloadUV(context.Background(), l, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestDownloadUVRejectsBadChecksum(t *testing.T) {
 	withFakeRelease(t, fakeUVArchive(t, []byte("tampered")), strings.Repeat("0", 64))
 
 	l := paths.New(t.TempDir())
-	if _, err := DownloadUV(context.Background(), l); err == nil || !strings.Contains(err.Error(), "校验失败") {
+	if _, err := DownloadUV(context.Background(), l, ""); err == nil || !strings.Contains(err.Error(), "校验失败") {
 		t.Fatalf("err = %v, want checksum failure", err)
 	}
 	if _, err := os.Stat(filepath.Join(l.UVDir, exeName("uv"))); !os.IsNotExist(err) {

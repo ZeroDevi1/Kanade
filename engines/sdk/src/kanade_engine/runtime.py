@@ -54,11 +54,14 @@ class Job:
         self.output_dir = Path(output_dir)
         self._channel = channel
         self._cancel = threading.Event()
+        # fraction 是最近一次上报的进度，供只想更新消息、不改变进度的调用方使用。
+        self.fraction = 0.0
 
     def progress(self, fraction: float, message: str = "") -> None:
         """上报进度并检查取消；fraction 会被裁剪到 [0, 1]。已取消时抛出 Cancelled。"""
         self.check_cancelled()
-        self._channel.send("progress", self.id, {"fraction": min(max(fraction, 0.0), 1.0), "message": message})
+        self.fraction = min(max(fraction, 0.0), 1.0)
+        self._channel.send("progress", self.id, {"fraction": self.fraction, "message": message})
 
     def artifact(self, path: str | os.PathLike[str], kind: str = "file") -> None:
         """登记一个输出文件；path 应位于 output_dir 内。"""
@@ -76,13 +79,41 @@ class Job:
 Handler = Callable[[Job], None]
 
 
+def doctor(allow_mps: bool = True) -> Handler:
+    """返回环境检查处理函数：报告 Python、torch、计算设备与 CUDA 版本，结果写在最终进度消息中。
+
+    serve() 默认为每个引擎注册 doctor()；不使用 MPS 的引擎（如 CosyVoice）自行注册 doctor(allow_mps=False)。
+    """
+    return lambda job: _doctor(job, allow_mps)
+
+
+def _doctor(job: Job, allow_mps: bool) -> None:
+    import platform
+
+    parts = [f"Python {platform.python_version()}"]
+    try:
+        import torch
+
+        from .device import pick
+
+        dev = pick(allow_mps=allow_mps)
+        parts.append(f"torch {torch.__version__}")
+        if torch.version.cuda:
+            parts.append(f"CUDA {torch.version.cuda}")
+        parts.append(f"设备 {dev.label}")
+    except ImportError:
+        parts.append("未安装 torch")
+    job.progress(1.0, " · ".join(parts))
+
+
 def serve(engine: str, version: str, handlers: Mapping[str, Handler]) -> None:
     """运行 worker 直到收到 shutdown 或 stdin 关闭。
 
-    handlers 把任务名映射到处理函数；处理函数在后台线程执行，主线程持续读取 stdin，
+    handlers 把任务名映射到处理函数（另自动提供 <engine>.doctor 环境检查）；处理函数在后台线程执行，主线程持续读取 stdin，
     以便随时收到 cancel。处理函数抛出的异常转为 error 事件，不会终止 worker。
     """
     channel = _Channel()
+    handlers = {f"{engine}.doctor": doctor(), **handlers}
     channel.send("hello", data={"engine": engine, "version": version, "tasks": sorted(handlers), "protocol": PROTOCOL_VERSION})
 
     current: Job | None = None

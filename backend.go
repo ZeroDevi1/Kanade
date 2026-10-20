@@ -55,6 +55,7 @@ func startBackend(onChange func()) backend {
 	if b.cond, b.err = conductor.New(b.layout, engines.FS, onChange); b.err != nil {
 		return b
 	}
+	b.cond.SetEnv(b.settings.Env())
 	b.cond.Start()
 	return b
 }

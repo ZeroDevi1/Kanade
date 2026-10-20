@@ -6,7 +6,8 @@ requires-python = ">=3.10"
 dependencies = ["kanade-engine-sdk"]
 
 [tool.uv.sources]
-kanade-engine-sdk = { path = "../sdk" }
+# editable：SDK 版本号不变时 uv sync 不会重装非 editable 的 path 依赖，改为直接引用释放出的源码。
+kanade-engine-sdk = { path = "../sdk", editable = true }
 
 [build-system]
 requires = ["hatchling"]

@@ -25,7 +25,13 @@ MODES = {
     "v1-instruct": {"instruct"},
     "v2": {"zero_shot", "cross_lingual", "instruct"},
     "v3": {"zero_shot", "cross_lingual", "instruct"},
+    # Kanade 训练的 CosyVoice 3 说话人 SFT 模型（目录中有 kanade-sft.json），见 sft.py。
+    "v3-sft": {"sft"},
 }
+
+# SFT 推理的保守采样参数，取自 VoiceLab cosyvoice_sft_param_playbook（sampling06k10）：降低韵律随机性与崩坏概率。
+SFT_SAMPLING = {"top_p": 0.6, "top_k": 10, "win_size": 10, "tau_r": 1.0}
+SFT_SEED = 1986
 
 # CosyVoice 3 的提示文本须以系统提示开头，见上游 example.py 的 cosyvoice3_example。
 V3_SYSTEM = "You are a helpful assistant."
@@ -51,7 +57,7 @@ _registered: set[str] = set()  # 已注册到当前模型 spk2info 的音色键
 def family(model_dir: Path) -> str:
     """按 yaml 与权重判断模型版本，返回 MODES 的键。"""
     if (model_dir / "cosyvoice3.yaml").exists():
-        return "v3"
+        return "v3-sft" if (model_dir / "kanade-sft.json").exists() else "v3"
     if (model_dir / "cosyvoice2.yaml").exists():
         return "v2"
     if (model_dir / "cosyvoice.yaml").exists():
@@ -234,12 +240,40 @@ def cross_lingual(job: Job) -> None:
 
 
 def sft(job: Job) -> None:
-    p, model, _, speed, tf = _common(job, "sft")
+    p, model, fam, speed, tf = _common(job, "sft")
     spk_id = p.get("spk_id") or ""
     if spk_id not in model.list_available_spks():
         raise ValueError(f"预训练音色不存在：{spk_id}，可用：{'、'.join(model.list_available_spks())}")
     text = p["text"]
+    if fam == "v3-sft":
+        synthesize(job, model, text, tf, lambda: _sft_v3(model, text, spk_id, p.get("instruct") or "", speed, tf))
+        return
     synthesize(job, model, text, tf, lambda: model.inference_sft(text, spk_id, stream=False, speed=speed, text_frontend=tf))
+
+
+def _sft_v3(model, text: str, spk_id: str, guide: str, speed: float, tf: bool):
+    """CosyVoice 3 SFT 推理：LLM 要求 <|endofprompt|> 出现在提示或正文中，上游 inference_sft 不提供提示，
+    因此逐句构造输入并注入 prompt_text（默认只有标记本身，减少提示内容泄露到语音；guide 可写情绪 / 风格引导）。
+    同时覆盖 LLM 采样参数并固定随机种子，便于 A/B 对比。"""
+    import random
+
+    import numpy as np
+    import torch
+    from cosyvoice.utils.common import ras_sampling
+
+    prompt = guide.strip()
+    if END not in prompt:
+        prompt += END
+    model.model.llm.sampling = lambda scores, decoded, sampling: ras_sampling(scores, decoded, sampling, **SFT_SAMPLING)
+    random.seed(SFT_SEED)
+    np.random.seed(SFT_SEED)
+    torch.manual_seed(SFT_SEED)
+    prompt_norm = model.frontend.text_normalize(prompt, split=False, text_frontend=tf)
+    prompt_token, prompt_len = model.frontend._extract_text_token(prompt_norm)
+    for seg in model.frontend.text_normalize(text, split=True, text_frontend=tf):
+        model_input = model.frontend.frontend_sft(seg, spk_id)
+        model_input["prompt_text"], model_input["prompt_text_len"] = prompt_token, prompt_len
+        yield from model.model.tts(**model_input, stream=False, speed=speed)
 
 
 def instruct(job: Job) -> None:

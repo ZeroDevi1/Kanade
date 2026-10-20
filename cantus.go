@@ -3,12 +3,15 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
+	"strconv"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
 	"kanade/internal/cantus"
 	"kanade/internal/conductor"
+	"kanade/internal/dataset"
 	"kanade/internal/ui/fluent"
 )
 
@@ -38,6 +41,15 @@ type cantusState struct {
 	// confirmDelete 是等待二次确认删除的音色 ID。
 	confirmDelete string
 
+	// models 是内置模型与训练出的 SFT 模型，speakersStale 置位时一并刷新。
+	models []cantus.Model
+
+	// SFT 训练。
+	sftName, sftDataset, sftASR, sftPart, sftEpochs string
+	sftSummary                                      *dataset.Summary
+	sftPrepareJob, sftTrainJob                      string
+	sftScanned                                      string // 已为其刷新过模型列表的训练任务
+
 	job       string            // 最近提交的合成任务
 	downloads map[string]string // 模型 Key → 下载任务 ID
 	results   []string          // 本次运行生成的文件，最新在前
@@ -47,11 +59,12 @@ type cantusState struct {
 
 func newCantusState() cantusState {
 	return cantusState{speed: 1, textFrontend: true, voice: voiceFromFile, spkID: cantus.SFTSpeakers[0],
-		source: sourceTitles[0], speakersStale: true, downloads: map[string]string{}}
+		source: sourceTitles[0], speakersStale: true, downloads: map[string]string{}, models: cantus.Models,
+		sftASR: cantus.ASRModels[0], sftPart: cantus.SFTParts[0].Title, sftEpochs: "30"}
 }
 
 func (s *cantusState) model() cantus.Model {
-	for _, m := range cantus.Models {
+	for _, m := range s.models {
 		if m.Title == s.modelTitle {
 			return m
 		}
@@ -83,7 +96,7 @@ func (a *app) cantusPage(c *ui.Context, tk *fluent.Tokens) {
 	if s.speakersStale {
 		s.speakersStale = false
 		list, err := cantus.ListSpeakers(a.be.layout)
-		s.speakers = list
+		s.speakers, s.models = list, cantus.AllModels(a.be.layout)
 		if err != nil {
 			s.err = "读取音色库失败：" + err.Error()
 		}
@@ -92,6 +105,7 @@ func (a *app) cantusPage(c *ui.Context, tk *fluent.Tokens) {
 	a.cantusInputCard(c, tk)
 	card(c, tk, "结果", func() { a.cantusResults(c, tk) })
 	a.cantusSpeakersCard(c, tk)
+	a.cantusSFTCard(c, tk)
 }
 
 // cantusModelCard 选择模型并管理下载。
@@ -100,8 +114,8 @@ func (a *app) cantusModelCard(c *ui.Context, tk *fluent.Tokens) {
 	s := &a.cantus
 	l := a.be.layout
 	card(c, tk, "模型", func() {
-		titles := make([]string, len(cantus.Models))
-		for i, m := range cantus.Models {
+		titles := make([]string, len(s.models))
+		for i, m := range s.models {
 			titles[i] = m.Title
 		}
 		m := s.model()
@@ -189,7 +203,14 @@ func (a *app) cantusInputCard(c *ui.Context, tk *fluent.Tokens) {
 
 		usesSpk := mode == cantus.ModeSFT || (mode == cantus.ModeInstruct && m.Family == cantus.FamilyV1Instruct)
 		if usesSpk {
-			ui.Select(c, &s.spkID, cantus.SFTSpeakers).Label("预训练音色").Width(200)
+			spks := m.SpeakerList()
+			if !slices.Contains(spks, s.spkID) {
+				s.spkID = spks[0]
+			}
+			ui.Select(c, &s.spkID, spks).Label("预训练音色").Width(200)
+			if m.Family == cantus.FamilyV3SFT {
+				ui.TextInput(c, &s.instruct).Label("风格引导（可选）").Placeholder("例如：请非常开心地说一句话。留空则只用音色本身")
+			}
 		} else {
 			a.cantusVoice(c, tk, mode)
 		}
@@ -425,6 +446,91 @@ func (a *app) cantusSpeakersCard(c *ui.Context, tk *fluent.Tokens) {
 					s.confirmDelete, s.speakersStale = "", true
 				}
 			})
+		}
+	})
+}
+
+// cantusSFTCard 是 CosyVoice 3 说话人微调：准备数据（文本取自 .list，缺失时可用 Whisper 转写）→ 训练 → 组装模型。
+// 训练需要 NVIDIA CUDA；微调出的模型以「<音色名>（微调音色）」出现在模型列表，使用预训练音色模式。
+func (a *app) cantusSFTCard(c *ui.Context, tk *fluent.Tokens) {
+	t := c.Theme()
+	s := &a.cantus
+	l := a.be.layout
+	card(c, tk, "说话人微调（SFT）", func() {
+		ui.Text(c, "用几百条带文本的干净人声，把一个说话人微调进 Fun-CosyVoice 3。数据集目录中的同名 .list 提供文本；"+
+			"训练需要 NVIDIA CUDA（数据准备可在本机完成）。").FontSize(12).TextColor(t.TextMuted)
+		ui.TextInput(c, &s.sftName).Label("音色名").Placeholder("例如 xuan").Width(240)
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "数据集").FontSize(12).Width(64)
+			name := "未选择"
+			if s.sftDataset != "" {
+				name = s.sftDataset
+			}
+			ui.Text(c, name).FontSize(12).Font("monospace").TextColor(t.TextMuted).Grow(1).SingleLine()
+			if ui.Button(c, "选择目录…").Clicked() {
+				a.pickDir("选择数据集目录", func(dir string) {
+					s.sftDataset = dir
+					sum, err := dataset.Inspect(dir, "")
+					s.sftSummary, s.err = &sum, errText(err)
+					if s.sftName == "" {
+						s.sftName = filepath.Base(dir)
+					}
+				})
+			}
+		})
+		if sum := s.sftSummary; sum != nil {
+			text := fmt.Sprintf("%d 个音频文件", sum.Audio)
+			if sum.List != "" {
+				text += fmt.Sprintf(" · %s：%d 条，%d 条找到音频，%d 条有文本", filepath.Base(sum.List), sum.Listed, sum.Matched, sum.WithText)
+			} else {
+				text += " · 未找到 .list，需要用 Whisper 转写文本"
+			}
+			ui.Text(c, text).FontSize(12).TextColor(t.TextMuted)
+		}
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Select(c, &s.sftASR, cantus.ASRModels).Label("缺文本时转写").Width(160)
+			_, preparing := a.jobStatusPeek(s.sftPrepareJob)
+			if ui.Button(c, "1. 准备数据").Disabled(preparing).Clicked() {
+				params, err := cantus.SFTPrepareParams(l, s.sftName, s.sftDataset, s.sftASR)
+				if err == nil {
+					s.sftPrepareJob, err = a.be.cond.Submit(cantus.Engine, "cosyvoice.sft_prepare", params)
+				}
+				s.err = errText(err)
+			}
+		})
+		if j, _ := a.jobStatus(c, s.sftPrepareJob); j.State == conductor.JobDone {
+			ui.Text(c, j.Message).FontSize(12).TextColor(t.Success)
+		}
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			parts := make([]string, len(cantus.SFTParts))
+			for i, p := range cantus.SFTParts {
+				parts[i] = p.Title
+			}
+			ui.Select(c, &s.sftPart, parts).Label("训练部分").Width(200)
+			ui.TextInput(c, &s.sftEpochs).Label("轮数").Width(80)
+			_, training := a.jobStatusPeek(s.sftTrainJob)
+			if ui.PrimaryButton(c, "2. 开始训练").Disabled(training).Clicked() {
+				part := "llm"
+				for _, p := range cantus.SFTParts {
+					if p.Title == s.sftPart {
+						part = p.Key
+					}
+				}
+				epochs, err := strconv.Atoi(s.sftEpochs)
+				var params map[string]any
+				if err == nil {
+					params, err = cantus.SFTTrainParams(l, s.sftName, part, epochs)
+				} else {
+					err = fmt.Errorf("轮数须为整数")
+				}
+				if err == nil {
+					s.sftTrainJob, err = a.be.cond.Submit(cantus.Engine, "cosyvoice.sft_train", params)
+				}
+				s.err = errText(err)
+			}
+		})
+		if j, _ := a.jobStatus(c, s.sftTrainJob); j.State == conductor.JobDone && s.sftScanned != s.sftTrainJob {
+			s.sftScanned, s.speakersStale = s.sftTrainJob, true
 		}
 	})
 }

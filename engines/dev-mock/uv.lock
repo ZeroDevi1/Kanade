@@ -11,9 +11,9 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "kanade-engine-sdk", directory = "../sdk" }]
+requires-dist = [{ name = "kanade-engine-sdk", editable = "../sdk" }]
 
 [[package]]
 name = "kanade-engine-sdk"
 version = "0.1.0"
-source = { directory = "../sdk" }
+source = { editable = "../sdk" }

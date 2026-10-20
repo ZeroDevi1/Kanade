@@ -8,6 +8,7 @@
 - cosyvoice.sft           {model_dir, text, spk_id, speed, text_frontend}
 - cosyvoice.instruct      {model_dir, text, instruct, spk_id（CosyVoice 1）| prompt_wav / speaker_dir（2、3）, speed}
 - cosyvoice.vc            {model_dir, source_wav, prompt_wav | speaker_dir}
+- cosyvoice.sft_prepare / cosyvoice.sft_train：CosyVoice 3 说话人 SFT，见 sft.py。
 
 模型版本由 model_dir 中的 yaml 判断，各版本支持的模式见 MODES；Go 端按同一张表限制界面选项。
 """
@@ -18,7 +19,7 @@ import os
 import sys
 from pathlib import Path
 
-from kanade_engine import serve
+from kanade_engine import doctor, serve
 
 ENGINE = "cosyvoice"
 VERSION = "0.1.0"
@@ -35,7 +36,7 @@ if _models:
 
 
 def main() -> None:
-    from . import tasks
+    from . import sft, tasks
 
     serve(ENGINE, VERSION, {
         "cosyvoice.download": tasks.download_model,
@@ -44,4 +45,8 @@ def main() -> None:
         "cosyvoice.sft": tasks.sft,
         "cosyvoice.instruct": tasks.instruct,
         "cosyvoice.vc": tasks.vc,
+        "cosyvoice.sft_prepare": sft.run_prepare,
+        "cosyvoice.sft_train": sft.run_train,
+        # 上游 CosyVoice 只用 CUDA 或 CPU（不使用 MPS），检查结果按此报告。
+        "cosyvoice.doctor": doctor(allow_mps=False),
     })

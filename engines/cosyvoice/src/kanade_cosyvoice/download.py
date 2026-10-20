@@ -7,7 +7,6 @@ JIT 等推理用不到的文件（Fun-CosyVoice3 全量 9.75 GB，筛选后约 5
 from __future__ import annotations
 
 import json
-import os
 import re
 import urllib.parse
 import urllib.request
@@ -16,6 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from kanade_engine import Job
+from kanade_engine.download import fetch, mirror
 
 # 推理用不到的文件：JIT/TensorRT 导出、批量版 tokenizer、RL 版 LLM 权重、flow 缓存、文档图片。
 _SKIP = re.compile(r"(\.zip$|estimator.*\.onnx$|\.batch\.onnx$|llm\.rl\.pt$|flow\.cache\.pt$|^asset/|\.md$|\.png$|\.jpg$|^\.gitattributes$)")
@@ -25,7 +25,6 @@ WETEXT_REPO = "pengzhendong/wetext"
 _WETEXT_KEEP = re.compile(r"^(zh|en)/tn/(tagger|verbalizer)\.fst$")
 
 COMPLETE_MARKER = ".kanade-complete"
-_CHUNK = 1 << 20
 _TIMEOUT = 60
 
 
@@ -37,7 +36,7 @@ class RemoteFile:
 
 
 def _get_json(url: str):
-    req = urllib.request.Request(url, headers={"User-Agent": "Kanade"})
+    req = urllib.request.Request(mirror(url), headers={"User-Agent": "Kanade"})
     with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
         return json.load(resp)
 
@@ -94,44 +93,16 @@ def fetch_repo(job: Job, source: str, repo: str, model_dir: Path, keep: Callable
 
     for f in files:
         dst = model_dir / f.path
-        if dst.exists() and (f.size == 0 or dst.stat().st_size == f.size):
+        if dst.exists() and f.size and dst.stat().st_size != f.size:
+            dst.unlink()  # 大小不符的旧文件（例如上游版本更新）重新下载
+        if dst.exists():
             done += f.size
             continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
 
-        def report(n: int, f=f) -> None:
+        def report(n: int, _total: int, f=f) -> None:
             job.progress(min((done + n) / total, 0.999), f"下载{label} {f.path}（{(done + n) / 1e9:.2f} / {total / 1e9:.2f} GB）")
 
-        _fetch(f, dst, report)
+        fetch(f.url, dst, report, f.size)
         done += f.size
 
     (model_dir / COMPLETE_MARKER).write_text(json.dumps({"source": source, "repo": repo, "files": [f.path for f in files]}, ensure_ascii=False))
-
-
-def _fetch(f: RemoteFile, dst: Path, report: Callable[[int], None]) -> None:
-    """下载单个文件：先写 .part，完成并校验大小后改名。report 接收当前文件已下载字节数，并负责检查取消。"""
-    part = dst.with_name(dst.name + ".part")
-    have = part.stat().st_size if part.exists() else 0
-    headers = {"User-Agent": "Kanade"}
-    if have:
-        headers["Range"] = f"bytes={have}-"
-    req = urllib.request.Request(f.url, headers=headers)
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-        if have and resp.status != 206:
-            have = 0  # 服务器不支持续传，从头下载
-        with open(part, "ab" if have else "wb") as out:
-            last = 0
-            while True:
-                chunk = resp.read(_CHUNK)
-                if not chunk:
-                    break
-                out.write(chunk)
-                have += len(chunk)
-                # 每 16 MB 上报一次，避免进度事件过多
-                if have - last >= 16 * _CHUNK:
-                    report(have)
-                    last = have
-    if f.size and have != f.size:
-        raise IOError(f"{f.path} 大小不符：期望 {f.size}，实际 {have}")
-    os.replace(part, dst)
-    report(have)

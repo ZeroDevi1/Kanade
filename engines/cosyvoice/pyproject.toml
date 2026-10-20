@@ -30,10 +30,15 @@ dependencies = [
     "wetext==0.0.4",
     "rich==13.7.1",
     "pyarrow==18.1.0",
+    # SFT 数据准备用 DataFrame.to_parquet 写分片（与上游 tools/make_parquet_list.py 一致）。
+    "pandas==2.2.3",
     # pyworld 在 Windows 有 cp310 wheel；macOS 需本地编译（Xcode 命令行工具）。
     "pyworld==0.3.4",
     "gdown==5.1.0",
     "wget==3.2",
+    # SFT 训练：上游 train_utils 导入 SummaryWriter；psutil 用于取消时结束训练进程树。
+    "tensorboard==2.14.0",
+    "psutil",
     # lightning 2.2.4（Matcha-TTS 导入）在 import 时使用 pkg_resources，新版 setuptools 已移除该模块。
     "setuptools<81",
 ]
@@ -49,7 +54,8 @@ environments = [
 build-constraint-dependencies = ["setuptools<81"]
 
 [tool.uv.sources]
-kanade-engine-sdk = { path = "../sdk" }
+# editable：SDK 版本号不变时 uv sync 不会重装非 editable 的 path 依赖，改为直接引用释放出的源码。
+kanade-engine-sdk = { path = "../sdk", editable = true }
 # Windows 用 PyTorch 官方 CUDA 12.1 构建（与上游 requirements 的 cu121 一致）；macOS 用 PyPI 的 CPU/MPS 构建。
 torch = [{ index = "pytorch-cu121", marker = "sys_platform == 'win32'" }]
 torchaudio = [{ index = "pytorch-cu121", marker = "sys_platform == 'win32'" }]

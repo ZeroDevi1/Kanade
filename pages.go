@@ -15,9 +15,9 @@ func (a *app) page(c *ui.Context, tk *fluent.Tokens) {
 		case "cantus":
 			a.cantusPage(c, tk)
 		case "timbre":
-			placeholder(c, tk, "音色转换", "Timbre · RVC 歌曲与纯人声音色转换。")
+			a.timbrePage(c, tk)
 		case "stems":
-			placeholder(c, tk, "分轨", "Stems · MDX / Demucs / BS-RoFormer 源分离。")
+			a.stemsPage(c, tk)
 		case "score":
 			placeholder(c, tk, "音乐分析", "Score · 调号、拍号、BPM、和弦与情绪识别。")
 		case "tasks":

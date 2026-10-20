@@ -20,6 +20,7 @@ worker -> Conductor（启动时 dup 出的原 stdout 描述符）::
 音频等大数据只经文件路径传递。worker 同一时间只执行一个任务；stdin 关闭（父进程退出）时 worker 自行退出。
 """
 
-from .runtime import PROTOCOL_VERSION, Cancelled, Job, serve
+from .device import Device, pick as pick_device
+from .runtime import PROTOCOL_VERSION, Cancelled, Job, doctor, serve
 
-__all__ = ["Cancelled", "Job", "serve", "PROTOCOL_VERSION"]
+__all__ = ["Cancelled", "Device", "Job", "doctor", "serve", "pick_device", "PROTOCOL_VERSION"]

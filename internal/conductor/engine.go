@@ -134,8 +134,8 @@ func Ready(src fs.FS, l paths.Layout, name string) bool {
 // Install 释放引擎源码并执行 uv sync，使引擎就绪；已就绪时直接返回。
 //
 // 源码哈希变化时先删除旧的 src 目录再释放，避免旧版本遗留的模块被导入；.venv 保留，由 uv sync 增量更新。
-// uv 的输出逐行交给 logf。ctx 取消时终止 uv 并返回错误。
-func Install(ctx context.Context, src fs.FS, l paths.Layout, uv *UV, spec Spec, logf func(string)) error {
+// uv 的输出逐行交给 logf；env 为追加的环境变量（镜像设置）。ctx 取消时终止 uv 并返回错误。
+func Install(ctx context.Context, src fs.FS, l paths.Layout, uv *UV, spec Spec, logf func(string), env ...string) error {
 	if Ready(src, l, spec.Name) {
 		return nil
 	}
@@ -171,7 +171,7 @@ func Install(ctx context.Context, src fs.FS, l paths.Layout, uv *UV, spec Spec, 
 	// 同步虚拟环境：--frozen 严格按 uv.lock 安装，不重新解析依赖。
 	logf(fmt.Sprintf("uv sync（Python %s）", spec.Python))
 	cmd := exec.CommandContext(ctx, uv.Path, "sync", "--frozen", "--no-dev", "--python", spec.Python, "--project", Dir(l, spec.Name))
-	cmd.Env = Env(l)
+	cmd.Env = Env(l, env...)
 	hideWindow(cmd)
 	out, err := cmd.StdoutPipe()
 	if err != nil {

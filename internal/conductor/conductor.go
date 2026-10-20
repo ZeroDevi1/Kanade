@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -97,10 +98,12 @@ type Conductor struct {
 	wake    chan struct{}     // 有新任务时唤醒 runner，容量 1
 	worker  *Worker
 	wEngine string // worker 所属引擎
-	closed  bool
-	ctx     context.Context
-	stop    context.CancelFunc
-	done    chan struct{}
+	// extraEnv 是追加给 uv 与 worker 的环境变量（下载镜像），对之后启动的进程生效。
+	extraEnv []string
+	closed   bool
+	ctx      context.Context
+	stop     context.CancelFunc
+	done     chan struct{}
 }
 
 // New 创建 Conductor：读取嵌入的引擎描述并检查各引擎是否已就绪。onChange 可为 nil。
@@ -130,6 +133,19 @@ func New(l paths.Layout, src fs.FS, onChange func()) (*Conductor, error) {
 	return c, nil
 }
 
+// SetEnv 设置追加给 uv 与之后启动的 worker 的环境变量；已在运行的 worker 不受影响。
+func (c *Conductor) SetEnv(env []string) {
+	c.mu.Lock()
+	c.extraEnv = append([]string(nil), env...)
+	c.mu.Unlock()
+}
+
+func (c *Conductor) env() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.extraEnv
+}
+
 // Start 启动任务调度 goroutine。只能调用一次。
 func (c *Conductor) Start() { go c.run() }
 
@@ -148,7 +164,13 @@ func (c *Conductor) EnsureUV(ctx context.Context) (*UV, error) {
 	if uv := c.UV(); uv != nil {
 		return uv, nil
 	}
-	uv, err := DownloadUV(ctx, c.layout)
+	mirror := ""
+	for _, kv := range c.env() {
+		if v, ok := strings.CutPrefix(kv, "KANADE_GITHUB_MIRROR="); ok {
+			mirror = v
+		}
+	}
+	uv, err := DownloadUV(ctx, c.layout, mirror)
 	if err != nil {
 		return nil, err
 	}
@@ -220,6 +242,25 @@ func (c *Conductor) Submit(engine, task string, params map[string]any) (string, 
 	c.signal()
 	c.onChange()
 	return id, nil
+}
+
+// Wait 等待任务进入终态并返回其快照。ctx 结束时返回 ctx.Err()，任务本身不受影响。
+// 以 200 ms 间隔轮询：任务通常持续数秒到数小时，轮询开销可以忽略，也避免为每个任务维护订阅。
+func (c *Conductor) Wait(ctx context.Context, id string) (Job, error) {
+	for {
+		j, ok := c.Job(id)
+		if !ok {
+			return Job{}, fmt.Errorf("任务 %s 不存在", id)
+		}
+		if j.State.Finished() {
+			return j, nil
+		}
+		select {
+		case <-ctx.Done():
+			return j, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
 
 // Cancel 取消任务：排队中的直接标记为已取消，运行中的通知 worker 在下一个检查点停止。
@@ -443,7 +484,7 @@ func (c *Conductor) install(ctx context.Context, name string) error {
 		uv, err = c.EnsureUV(ctx)
 	}
 	if err == nil {
-		err = Install(ctx, c.src, c.layout, uv, e.spec, logf)
+		err = Install(ctx, c.src, c.layout, uv, e.spec, logf, c.env()...)
 	}
 
 	c.mu.Lock()
@@ -497,7 +538,7 @@ func (c *Conductor) workerFor(name string) (*Worker, error) {
 	c.mu.Lock()
 	spec := c.engines[name].spec
 	c.mu.Unlock()
-	w, err := StartWorker(c.layout, spec)
+	w, err := StartWorker(c.layout, spec, c.env()...)
 	if err != nil {
 		c.mu.Lock()
 		c.worker, c.wEngine = nil, ""

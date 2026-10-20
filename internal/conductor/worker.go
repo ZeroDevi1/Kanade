@@ -78,12 +78,12 @@ type Worker struct {
 
 // StartWorker 用引擎虚拟环境的 Python 启动 worker，等待 hello 并校验协议版本。
 //
-// worker 的 stderr（含所有日志与 traceback）追加写入 l.Logs/<engine>.log。
+// env 为追加的环境变量（镜像设置）。worker 的 stderr（含所有日志与 traceback）追加写入 l.Logs/<engine>.log。
 // 启动失败、超时或协议不符时结束进程并返回错误。
-func StartWorker(l paths.Layout, spec Spec) (*Worker, error) {
+func StartWorker(l paths.Layout, spec Spec, env ...string) (*Worker, error) {
 	cmd := exec.Command(VenvPython(l, spec.Name), "-m", spec.Module)
 	cmd.Dir = Dir(l, spec.Name)
-	cmd.Env = Env(l)
+	cmd.Env = Env(l, env...)
 	prepareWorker(cmd)
 
 	logFile, err := os.OpenFile(filepath.Join(l.Logs, spec.Name+".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)

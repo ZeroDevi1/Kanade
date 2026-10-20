@@ -74,6 +74,11 @@ func (r Request) Params(l paths.Layout) (map[string]any, error) {
 	}
 
 	switch r.Mode {
+	case ModeSFT:
+		// 微调模型可选的风格引导（注入为 CosyVoice 3 的提示文本），为空时只注入结束标记。
+		if r.Model.Family == FamilyV3SFT && strings.TrimSpace(r.Instruct) != "" {
+			p["instruct"] = r.Instruct
+		}
 	case ModeInstruct:
 		if strings.TrimSpace(r.Instruct) == "" {
 			return nil, errors.New("请填写指令")

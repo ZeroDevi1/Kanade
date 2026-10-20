@@ -1,0 +1,14 @@
+{
+  "name": "timbre",
+  "title": "RVC 音色转换",
+  "description": "RVC 推理、训练与混音（推理与训练核心来自 Applio）。",
+  "python": "3.12",
+  "module": "kanade_timbre",
+  "tasks": [
+    "timbre.prepare",
+    "timbre.infer",
+    "timbre.train",
+    "timbre.mix",
+    "timbre.doctor"
+  ]
+}
