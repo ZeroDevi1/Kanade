@@ -25,20 +25,36 @@ var SFTParts = []struct{ Key, Title string }{
 	{"both", "LLM + Flow"},
 }
 
-// SFTLLMScopes 是 LLM 的训练范围：Layers 为只训练的 Qwen 顶部层数，0 表示全量。
+// SFTLLMScopes 是 LLM 的训练范围：Layers 为只训练的 Qwen 顶部层数，0 表示全量，-1 表示按显存自动选择。
 // 全量 fp32 Adam 需要约 10 GB 显存加激活（实测见 docs/windows-test-plan.md）；顶部 12 层可在 8 GB 显卡上训练。
 var SFTLLMScopes = []struct {
 	Layers int
 	Title  string
 }{
+	{-1, "按显存自动选择"},
 	{12, "顶部 12 层（8 GB 显存）"},
 	{0, "全部层（12 GB 以上显存）"},
 }
 
+// SFTSmartASR 是智能模式在 .list 缺文本时使用的 Whisper 模型：medium 在中文上比 small 准确得多，
+// 约 5 GB 显存，8 GB 显卡可用（large-v3 约需 10 GB）。
+const SFTSmartASR = "medium"
+
+// SFTTrain 是一次 SFT 训练的参数。零值的 LR、Workers 使用引擎默认（1e-5、4）。
+type SFTTrain struct {
+	Name      string
+	Part      string // llm / both
+	Epochs    int
+	LLMLayers int // 取自 SFTLLMScopes
+	LR        float64
+	Workers   int
+}
+
 var sftNameRE = regexp.MustCompile(`^[\p{Han}\w-]+$`)
 
-// SFTPrepareParams 返回 cosyvoice.sft_prepare 的任务参数。asr 为 ASRModels 中的一项。
-func SFTPrepareParams(l paths.Layout, name, datasetDir, asr string) (map[string]any, error) {
+// SFTPrepareParams 返回 cosyvoice.sft_prepare 的任务参数。asr 为 ASRModels 中的一项；
+// devRatio 为验证集比例（0 为引擎默认 0.05）。
+func SFTPrepareParams(l paths.Layout, name, datasetDir, asr string, devRatio float64) (map[string]any, error) {
 	name = strings.TrimSpace(name)
 	if !sftNameRE.MatchString(name) {
 		return nil, errors.New("音色名只能包含字母、数字、中文、下划线与连字符")
@@ -54,6 +70,12 @@ func SFTPrepareParams(l paths.Layout, name, datasetDir, asr string) (map[string]
 	if asr != "" && asr != ASRModels[0] {
 		p["asr_model"] = asr
 	}
+	if devRatio < 0 || devRatio > 0.5 {
+		return nil, errors.New("验证集比例须在 0–0.5 之间")
+	}
+	if devRatio > 0 {
+		p["dev_ratio"] = devRatio
+	}
 	return p, nil
 }
 
@@ -63,20 +85,30 @@ func SFTPrepared(l paths.Layout, name string) bool {
 	return err == nil
 }
 
-// SFTTrainParams 返回 cosyvoice.sft_train 的任务参数。llmLayers 取自 SFTLLMScopes（0 为全量训练）。
-func SFTTrainParams(l paths.Layout, name, part string, epochs, llmLayers int) (map[string]any, error) {
-	name = strings.TrimSpace(name)
+// SFTTrainParams 返回 cosyvoice.sft_train 的任务参数。
+func SFTTrainParams(l paths.Layout, t SFTTrain) (map[string]any, error) {
+	name := strings.TrimSpace(t.Name)
 	if !SFTPrepared(l, name) {
 		return nil, errors.New("请先完成数据准备")
 	}
-	if part != "llm" && part != "both" {
-		return nil, fmt.Errorf("未知的训练部分 %q", part)
+	if t.Part != "llm" && t.Part != "both" {
+		return nil, fmt.Errorf("未知的训练部分 %q", t.Part)
 	}
-	if epochs < 1 || epochs > 1000 {
+	if t.Epochs < 1 || t.Epochs > 1000 {
 		return nil, errors.New("轮数须在 1–1000 之间")
 	}
-	if llmLayers < 0 {
-		return nil, errors.New("LLM 训练层数不能为负")
+	if t.LLMLayers < -1 {
+		return nil, errors.New("LLM 训练层数无效")
 	}
-	return map[string]any{"name": name, "base_model_dir": SFTBase().Dir(l), "part": part, "epochs": epochs, "llm_layers": llmLayers}, nil
+	if t.LR < 0 || t.LR > 1e-2 || t.Workers < 0 || t.Workers > 32 {
+		return nil, errors.New("学习率须在 0–0.01 之间，数据加载进程数 0–32")
+	}
+	p := map[string]any{"name": name, "base_model_dir": SFTBase().Dir(l), "part": t.Part, "epochs": t.Epochs, "llm_layers": t.LLMLayers}
+	if t.LR > 0 {
+		p["lr"] = t.LR
+	}
+	if t.Workers > 0 {
+		p["num_workers"] = t.Workers
+	}
+	return p, nil
 }

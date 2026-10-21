@@ -40,15 +40,34 @@ func TestCantusSubmitsZeroShot(t *testing.T) {
 		t.Errorf("job %+v", j)
 	}
 
-	// 任务进行中「生成」按钮禁用；取消排队任务后，缺少参考文本时不提交，并在界面显示原因。
+	// 智能模式：清空参考文本后改用跨语种复刻（不需要参考文本）。
 	cond.Cancel(j.ID)
 	a.cantus.promptText = ""
 	tt.Frame()
 	if err := tt.Click("生成"); err != nil {
 		t.Fatal(err)
 	}
+	if jobs := cond.Jobs(); len(jobs) != 2 || jobs[1].Task != "cosyvoice.cross_lingual" || jobs[1].Params["seed"] != nil {
+		t.Fatalf("smart without prompt text: %+v", jobs)
+	}
+
+	// 专业模式：零样本克隆缺少参考文本时不提交，并在界面显示原因；固定种子随任务提交。
+	cond.Cancel(cond.Jobs()[1].ID)
+	a.cantus.synthMode, a.cantus.seedFixed = modePro, true
 	tt.Frame()
-	if len(cond.Jobs()) != 1 || !tt.HasText("零样本克隆需要填写参考音频对应的文本") {
+	if err := tt.Click("生成"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if len(cond.Jobs()) != 2 || !tt.HasText("零样本克隆需要填写参考音频对应的文本") {
 		t.Errorf("jobs %d, texts %q", len(cond.Jobs()), tt.Texts())
+	}
+	a.cantus.promptText = "参考"
+	tt.Frame()
+	if err := tt.Click("生成"); err != nil {
+		t.Fatal(err)
+	}
+	if jobs := cond.Jobs(); len(jobs) != 3 || jobs[2].Task != "cosyvoice.zero_shot" || jobs[2].Params["seed"] != 1986 {
+		t.Errorf("pro job %+v", jobs[len(jobs)-1])
 	}
 }

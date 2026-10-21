@@ -6,12 +6,16 @@
 - 实验目录已有 G_*.pth / D_*.pth 时，Applio 训练脚本会自动续训，总轮数可以比上次大。
 - skip_preprocess / skip_extract 用于续训时跳过已完成的阶段。
 
+- 智能模式：sample_rate / epochs / batch_size / save_every 传 0 表示自动（见 auto_* 函数），选定的值写入
+  实验目录的 kanade-train.json，续训时沿用其中的采样率。
+
 进度分配：预处理 0–8%，提取 8–20%，训练 20–97%，索引 97–100%。训练进度从脚本每轮输出的
 「<名称> | epoch=N | step=…」行解析。
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -25,6 +29,10 @@ from kanade_engine import Cancelled, Job, annotations
 from . import runtime
 
 SAMPLE_RATES = (32000, 40000, 48000)
+CUT_MODES = ("Automatic", "Simple", "Skip")
+NORMALIZATION = ("none", "pre", "post")
+INDEX_ALGORITHMS = ("Auto", "Faiss", "KMeans")
+TRAIN_META = "kanade-train.json"
 _EPOCH = re.compile(r"\| epoch=(\d+) \| step=(\d+)")
 _NAME = re.compile(r"^[\w\-一-鿿]+$")
 
@@ -130,6 +138,10 @@ def _kill_tree(pid: int) -> None:
             pass
 
 
+def _flag(p: dict, key: str, default: bool) -> str:
+    return "True" if p.get(key, default) else "False"
+
+
 def run_train(job: Job) -> None:
     p = job.params
     name = (p.get("name") or "").strip()
@@ -138,26 +150,53 @@ def run_train(job: Job) -> None:
     dataset = Path(p.get("dataset_dir") or "")
     if not dataset.is_dir() and not p.get("skip_preprocess"):
         raise ValueError(f"数据集目录不存在：{dataset}")
-    sr = int(p.get("sample_rate") or 48000)
-    if sr not in SAMPLE_RATES:
-        raise ValueError(f"采样率须为 {SAMPLE_RATES} 之一")
-    f0 = p.get("f0_method") or "rmvpe"
-    epochs = int(p.get("epochs") or 50)
-    batch = int(p.get("batch_size") or 4)
-    save_every = int(p.get("save_every") or 5)
-    cores = int(p.get("cpu_cores") or min(os.cpu_count() or 4, 8))
     exp_dir = runtime.LOGS / name
     exp_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = exp_dir / TRAIN_META
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+    f0 = p.get("f0_method") or "rmvpe"
+    cores = int(p.get("cpu_cores") or min(os.cpu_count() or 4, 8))
+    cut = p.get("cut_mode") or "Automatic"
+    norm = p.get("normalization") or "none"
+    index_algo = p.get("index_algorithm") or "Auto"
+    if cut not in CUT_MODES or norm not in NORMALIZATION or index_algo not in INDEX_ALGORITHMS:
+        raise ValueError("切片方式、响度归一化或索引算法取值无效")
+    chunk = float(p.get("chunk_len") or 3.0)
+    overlap = float(p.get("overlap_len") if p.get("overlap_len") is not None else 0.3)
     vendor = runtime.VENDOR / "rvc" / "train"
+
+    # 数据集先整理（白名单），自动参数要按实际使用的音频估计。
+    src = dataset
+    if not p.get("skip_preprocess"):
+        list_path = Path(p["list"]) if p.get("list") else None
+        src = stage_dataset(job, dataset, list_path, exp_dir)
+
+    sr = int(p.get("sample_rate") or 0) or int(meta.get("sample_rate") or 0) or (auto_sample_rate(src) if src.is_dir() else 40000)
+    if sr not in SAMPLE_RATES:
+        raise ValueError(f"采样率须为 {SAMPLE_RATES} 之一")
+    if meta.get("sample_rate") and int(meta["sample_rate"]) != sr:
+        raise ValueError(f"该模型此前以 {meta['sample_rate']} Hz 训练，续训须使用相同采样率；换采样率请换一个模型名")
+    trained = latest_epoch(exp_dir, name)
+    epochs = int(p.get("epochs") or 0)
+    if not epochs:
+        epochs = auto_epochs(dataset_minutes(src) if src.is_dir() else float(meta.get("minutes") or 0), trained)
+    batch = int(p.get("batch_size") or 0) or auto_batch()
+    save_every = int(p.get("save_every") or 0) or max(5, min(epochs // 10, 20))
+    if trained and epochs <= trained:
+        raise ValueError(f"已训练 {trained} 轮，续训的总轮数须大于 {trained}")
+    meta.update({"sample_rate": sr, "epochs": epochs, "batch_size": batch, "save_every": save_every, "f0_method": f0})
+    if src.is_dir():
+        meta["minutes"] = round(dataset_minutes(src), 2)
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    resume = f"，从第 {trained} 轮续训" if trained else ""
+    job.progress(0.0, f"采样率 {sr} Hz · {epochs} 轮 · batch {batch} · 每 {save_every} 轮保存{resume}")
 
     runtime.ensure(job, runtime.EMBEDDER + runtime.PREDICTORS.get(f0, []) + runtime.pretrained(sr), 0.0, 0.03)
 
     if not p.get("skip_preprocess"):
-        list_path = Path(p["list"]) if p.get("list") else None
-        src = stage_dataset(job, dataset, list_path, exp_dir)
-        # 切片参数沿用 Applio 默认：自动切分、3 秒片段、0.3 秒重叠，不做额外音频效果与响度归一化。
+        # 切片默认沿用 Applio：自动切分、3 秒片段、0.3 秒重叠，不做额外音频效果与响度归一化。
         run_script(job, [str(vendor / "preprocess" / "preprocess.py"), str(exp_dir), str(src), str(sr), str(cores),
-                         "Automatic", "False", "3.0", "0.3", "none"], 0.03, 0.08, "预处理")
+                         cut, _flag(p, "process_effects", False), str(chunk), str(overlap), norm], 0.03, 0.08, "预处理")
     if not p.get("skip_extract"):
         # gpus 传 "0"：有 CUDA 用第 0 块卡；"-" 强制 CPU。macOS 上用 CPU：Applio 在 MPS 上提取 embedding 时
         # 会因 float64 张量失败，且只打印警告、退出码仍为 0（2026-10 的 Applio 5171e1d 实测）。训练阶段仍使用 MPS。
@@ -176,9 +215,10 @@ def run_train(job: Job) -> None:
     # 名称、每 N 轮保存、总轮数、G 底模、D 底模、GPU、batch、采样率、只保留最新、每次保存导出权重、
     # 数据缓存到 GPU、清除旧训练、声码器、梯度检查点。
     run_script(job, [str(vendor / "train.py"), name, str(save_every), str(epochs), pg, pd, "0", str(batch), str(sr),
-                     "True", "True", "False", "False", "HiFi-GAN", "False"], 0.20, 0.97, "训练", epoch_progress)
+                     "True", "True", _flag(p, "cache_gpu", False), "False", "HiFi-GAN", _flag(p, "checkpointing", False)],
+               0.20, 0.97, "训练", epoch_progress)
     # 经 faiss_compat 启动：模型名含中文时 faiss 原生的 write_index 无法写入（见 faiss_compat 说明）。
-    run_script(job, ["-m", "kanade_timbre.faiss_compat", str(vendor / "process" / "extract_index.py"), str(exp_dir), "Auto"],
+    run_script(job, ["-m", "kanade_timbre.faiss_compat", str(vendor / "process" / "extract_index.py"), str(exp_dir), index_algo],
                0.97, 0.995, "生成索引")
 
     weights = latest_weights(exp_dir, name)
@@ -189,6 +229,65 @@ def run_train(job: Job) -> None:
     if index.is_file():
         job.artifact(index, "rvc-index")
     job.progress(1.0, f"完成：{weights.name}")
+
+
+# ---------- 智能模式的自动参数 ----------
+
+def _durations(src: Path) -> list[tuple[float, int]]:
+    """数据集中各音频的 (时长秒, 采样率)；soundfile 读不了的格式（如 M4A）跳过。"""
+    import soundfile as sf
+
+    out = []
+    for f in annotations.audio_files(src):
+        try:
+            info = sf.info(str(f))
+        except Exception:  # noqa: BLE001
+            continue
+        out.append((info.duration, info.samplerate))
+    return out
+
+
+def dataset_minutes(src: Path) -> float:
+    return sum(d for d, _ in _durations(src)) / 60
+
+
+def auto_sample_rate(src: Path) -> int:
+    """按数据集的采样率中位数选底模：≥ 48 kHz 用 48k；44.1 kHz 等用 40k（不上采样虚增高频）；更低用 32k。"""
+    rates = sorted(r for _, r in _durations(src))
+    if not rates:
+        return 40000
+    mid = rates[len(rates) // 2]
+    return 48000 if mid >= 48000 else 40000 if mid >= 40000 else 32000
+
+
+def auto_epochs(minutes: float, trained: int) -> int:
+    """按数据时长取总轮数：数据越少每轮步数越少，需要更多轮；经验值来自 Applio / AI Hub 的训练建议。
+
+    已训练到 trained 轮时，在其基础上再训目标轮数的四分之一（至少 20 轮）。
+    """
+    target = 300 if minutes < 5 else 200 if minutes < 15 else 150 if minutes < 30 else 100
+    if trained >= target:
+        return trained + max(target // 4, 20)
+    return target
+
+
+def auto_batch() -> int:
+    """按显存选 batch：8 GB 显卡用 4（2026-10-20 RTX 5060 实测），6 GB 以下用 2；MPS 用 4，CPU 用 2。"""
+    import torch
+
+    if torch.cuda.is_available():
+        gb = torch.cuda.get_device_properties(0).total_memory / 2**30
+        return 2 if gb < 7 else 4 if gb < 11 else 8 if gb < 20 else 12
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return 4
+    return 2
+
+
+def latest_epoch(exp_dir: Path, name: str) -> int:
+    """已导出权重中的最大轮数；没有时为 0。"""
+    w = latest_weights(exp_dir, name)
+    m = re.search(r"_(\d+)e_\d+s\.pth$", w.name) if w else None
+    return int(m.group(1)) if m else 0
 
 
 def check_extracted(exp_dir: Path) -> None:

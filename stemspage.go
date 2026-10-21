@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"path/filepath"
 
 	"github.com/egoist/mygo/ui"
@@ -16,10 +17,12 @@ type stemsState struct {
 	input string
 	// disabled 记录用户取消勾选的步骤；未出现的键视为勾选（默认执行全部）。
 	disabled map[string]bool
-	job      string
-	dlJob    string
-	preview  audioPreview
-	err      string
+	// models 是各步选中的模型文件（步骤 ID → 文件名）；未出现的步骤使用默认模型。
+	models  map[string]string
+	job     string
+	dlJob   string
+	results resultSet
+	err     string
 }
 
 func (s *stemsState) selected() []string {
@@ -43,36 +46,60 @@ func (a *app) stemsPage(c *ui.Context, tk *fluent.Tokens) {
 	card(c, tk, "结果", func() { a.stemsResults(c, tk) })
 }
 
-// stemsModelsCard 显示净化链各步骤所需模型的下载状态。
+// stemsModelsCard 选择各步骤的模型并显示下载状态。默认与 VoiceLab 一致，「评估推荐」一键切换到评估最优组合。
 func (a *app) stemsModelsCard(c *ui.Context, tk *fluent.Tokens) {
 	t := c.Theme()
 	s := &a.stems
 	l := a.be.layout
 	card(c, tk, "模型", func() {
-		missing, missingMB := 0, 0
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			if ui.Button(c, "评估推荐").Tooltip("伴奏、干声、去和声换成 docs/stems-evaluation.md 的评估最优模型").Clicked() {
+				s.models = maps.Clone(stems.Recommended)
+			}
+			if ui.Button(c, "恢复默认").Clicked() {
+				s.models = nil
+			}
+			ui.Text(c, "评估推荐的伴奏里残留的原唱约为默认链的 1/4。").FontSize(12).TextColor(t.TextMuted)
+		})
 		for _, st := range stems.Steps {
 			ui.Row(c.Key("model-" + st.ID)).Gap(12).AlignItems(ui.Center).Children(func() {
 				ui.Text(c, st.Title).Width(72)
-				ui.Text(c, st.Model).Font("monospace").FontSize(12).TextColor(t.TextMuted).Grow(1).SingleLine()
-				if st.Installed(l) {
+				opts := st.Options()
+				cur := st.Pick(s.models).Title
+				if len(opts) > 1 {
+					if ui.Select(c, &cur, titles(opts, func(o stems.ModelOption) string { return o.Title })).Label(st.Title + "模型").Width(300).Changed() {
+						for _, o := range opts {
+							if o.Title == cur {
+								if s.models == nil {
+									s.models = map[string]string{}
+								}
+								s.models[st.ID] = o.File
+							}
+						}
+					}
+				} else {
+					ui.Box(c).Width(300).Shrink(0) // 与有下拉框的行对齐
+				}
+				o := st.Pick(s.models)
+				ui.Text(c, o.File).Font("monospace").FontSize(12).TextColor(t.TextMuted).Grow(1).SingleLine().Tooltip(o.File)
+				if stems.ModelInstalled(l, o.File) {
 					ui.Text(c, "已下载").FontSize(12).TextColor(t.Success)
 				} else {
-					missing++
-					missingMB += st.SizeMB
-					ui.Textf(c, "未下载 · %d MB", st.SizeMB).FontSize(12).TextColor(t.TextMuted)
+					ui.Textf(c, "未下载 · %d MB", o.SizeMB).FontSize(12).TextColor(t.TextMuted)
 				}
 			})
 		}
+		missing, missingMB := stems.Missing(l, stems.AllSteps(), s.models)
 		var dl conductor.Job
 		active := false
 		if s.dlJob != "" {
 			dl, _ = a.be.cond.Job(s.dlJob)
 			active = !dl.State.Finished()
 		}
-		if missing > 0 || active {
+		if len(missing) > 0 || active {
 			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 				if ui.PrimaryButton(c, fmt.Sprintf("下载缺少的模型（约 %.1f GB）", float64(missingMB)/1000)).Disabled(active).Clicked() {
-					id, err := a.be.cond.Submit(stems.Engine, "stems.download", map[string]any{})
+					id, err := a.be.cond.Submit(stems.Engine, "stems.download", stems.DownloadParams(missing))
 					s.dlJob, s.err = id, errText(err)
 				}
 				if active {
@@ -114,7 +141,7 @@ func (a *app) stemsRunCard(c *ui.Context, tk *fluent.Tokens) {
 		}
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 			if ui.PrimaryButton(c, "开始处理").Disabled(active).Clicked() {
-				params, err := stems.ChainParams(s.input, s.selected())
+				params, err := stems.ChainParams(s.input, s.selected(), s.models)
 				if err == nil {
 					s.job, err = a.be.cond.Submit(stems.Engine, "stems.chain", params)
 				}
@@ -140,31 +167,20 @@ func (a *app) stemsRunCard(c *ui.Context, tk *fluent.Tokens) {
 	})
 }
 
-// stemsResults 列出最近一次任务的输出（处理中会逐步出现），点击切换预览。
+// stemsResults 登记最近一次任务的输出（处理中会逐步出现）并显示结果列表。
 func (a *app) stemsResults(c *ui.Context, tk *fluent.Tokens) {
 	s := &a.stems
-	var outs []string
 	if s.job != "" {
 		j, _ := a.be.cond.Job(s.job)
-		outs = j.Artifacts
-	}
-	if len(outs) > 0 && s.preview.path == "" {
-		s.preview.load(a, outs[len(outs)-1])
-	}
-	s.preview.show(c, tk, "处理结果会显示在这里。")
-	for _, p := range outs {
-		title := stems.OutputTitle(p)
-		if title == "" {
-			title = filepath.Base(p)
-		}
-		b := ui.Button(c.Key("stem-"+p), title)
-		if p == s.preview.path {
-			b = b.Disabled(true)
-		}
-		if b.Clicked() {
-			s.preview.load(a, p)
+		for _, p := range j.Artifacts {
+			title := stems.OutputTitle(p)
+			if title == "" {
+				title = filepath.Base(p)
+			}
+			s.results.add(a, p, title, "", false)
 		}
 	}
+	s.results.show(c, tk, a, "处理结果会显示在这里。")
 }
 
 // errText 把可能为 nil 的错误转为界面文本。

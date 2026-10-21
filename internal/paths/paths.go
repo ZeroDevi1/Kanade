@@ -22,8 +22,12 @@ type Layout struct {
 	// Engines 下每个子目录是一个引擎的 uv 项目，其 .venv 由 uv sync 生成。
 	Engines string
 	Models  string
+	// Outputs 是另存结果时对话框的默认目录。
 	Outputs string
 	Logs    string
+	// Scratch 是任务输出的暂存区：推理结果先写在这里，用户选择保存后才复制到磁盘上的目标位置。
+	// New 设为 Outputs 下的 _scratch；应用启动时由 WithScratch 改到系统临时目录，退出时整个删除。
+	Scratch string
 }
 
 // DirName 是默认根目录在「文档」下的名称。
@@ -40,12 +44,19 @@ func New(root string) Layout {
 		Models:    filepath.Join(root, "models"),
 		Outputs:   filepath.Join(root, "outputs"),
 		Logs:      filepath.Join(root, "logs"),
+		Scratch:   filepath.Join(root, "outputs", "_scratch"),
 	}
+}
+
+// WithScratch 返回把暂存区换成 dir 的布局。
+func (l Layout) WithScratch(dir string) Layout {
+	l.Scratch = dir
+	return l
 }
 
 // Ensure 创建布局中的所有目录。
 func (l Layout) Ensure() error {
-	for _, d := range []string{l.UVDir, l.PythonDir, l.UVCache, l.Engines, l.Models, l.Outputs, l.Logs} {
+	for _, d := range []string{l.UVDir, l.PythonDir, l.UVCache, l.Engines, l.Models, l.Outputs, l.Logs, l.Scratch} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return err
 		}

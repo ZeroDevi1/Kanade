@@ -36,3 +36,22 @@ func TestOutputTitleLongestSuffix(t *testing.T) {
 		}
 	}
 }
+
+func TestChainParamsModelOverrides(t *testing.T) {
+	p, err := ChainParams("/a.wav", []string{"karaoke"}, Recommended)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 伴奏不在要执行的步骤中，不传它的覆盖；默认模型也不传。
+	want := map[string]any{"vocals": "BS-Roformer-SW.ckpt", "karaoke": "mel_band_roformer_karaoke_gabox_v2.ckpt"}
+	if !reflect.DeepEqual(p["models"], want) {
+		t.Errorf("models %v", p["models"])
+	}
+	if p, _ := ChainParams("/a.wav", []string{"dry"}, nil); p["models"] != nil {
+		t.Errorf("default chain sent overrides %v", p["models"])
+	}
+	// 不在可选列表中的模型回退为默认。
+	if Steps[0].Pick(map[string]string{"other": "unknown.ckpt"}).File != Steps[0].Model {
+		t.Error("unknown model not ignored")
+	}
+}

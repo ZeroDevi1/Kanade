@@ -10,6 +10,9 @@
 - cosyvoice.vc            {model_dir, source_wav, prompt_wav | speaker_dir}
 - cosyvoice.sft_prepare / cosyvoice.sft_train：CosyVoice 3 说话人 SFT，见 sft.py。
 
+除 vc 外的合成任务都可另带 seed（固定随机种子）与 sampling {top_p, top_k, win_size, tau_r}（LLM 采样），
+见 tasks.configure_sampling。
+
 模型版本由 model_dir 中的 yaml 判断，各版本支持的模式见 MODES；Go 端按同一张表限制界面选项。
 """
 

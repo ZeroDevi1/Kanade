@@ -4,6 +4,7 @@ package main
 
 import (
 	"log"
+	"os"
 	"runtime"
 
 	"github.com/egoist/mygo"
@@ -22,6 +23,8 @@ type app struct {
 
 	current      string // 当前页面，取 navItem.id
 	navCollapsed bool
+	// saveDir 是上次另存结果的目录，作为下次保存对话框的默认目录；空为数据根目录下的 outputs。
+	saveDir string
 
 	lab      labState
 	settings settingsState
@@ -35,7 +38,20 @@ func newApp() *app {
 }
 
 func main() {
+	// 单实例：重复启动时把参数交给已运行的实例并退出，避免两个实例各自启动 worker 争用 GPU，
+	// 也保证启动时清理暂存区不会删掉另一个实例的结果。
+	if !mygo.App.RequestSingleInstanceLock() {
+		return
+	}
 	a := newApp()
+	mygo.App.OnSecondInstance(func([]string, string) {
+		a.post(func() {
+			if a.win != nil {
+				a.win.Show()
+				a.win.Focus()
+			}
+		})
+	})
 	mygo.App.WhenReady(func() {
 		opts := mygo.WindowOptions{
 			Title:     "Kanade",
@@ -54,8 +70,9 @@ func main() {
 			Content:         ui.View(a.view),
 		}
 		if runtime.GOOS == "darwin" {
-			// 红绿灯按钮高 12，放在 48 高标题栏的垂直中线上。
-			opts.TrafficLightPosition = &mygo.Point{X: 18, Y: (titleBarHeight - 12) / 2}
+			// 红绿灯按钮框高 16，放在 48 高标题栏的垂直中线上，与导航切换按钮居中对齐。
+			// +1：实测按钮框的上沿比给定的 Y 高 1 pt（macOS 26，Y=16 时 AX 框位于 y=15）。
+			opts.TrafficLightPosition = &mygo.Point{X: 18, Y: (titleBarHeight-16)/2 + 1}
 		}
 		a.win = mygo.NewWindow(opts)
 		a.post = a.win.Update
@@ -65,10 +82,13 @@ func main() {
 			log.Printf("后端启动失败：%v", a.be.err)
 		}
 	})
-	// 退出时关闭 worker，释放显存；App.Exit 不触发此钩子。
+	// 退出时关闭 worker，释放显存，并删除未保存的暂存结果；App.Exit 不触发此钩子。
 	mygo.App.OnQuit(func() {
 		if a.be.cond != nil {
 			a.be.cond.Shutdown(shutdownGrace)
+		}
+		if a.be.layout.Scratch != "" {
+			_ = os.RemoveAll(a.be.layout.Scratch)
 		}
 	})
 	if err := mygo.App.Run(); err != nil {

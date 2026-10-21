@@ -13,7 +13,8 @@
 | 去混响 | `dereverb_mel_band_roformer_anvuew_sdr_19.1729` | 同默认 | 合成集最优 |
 | 降噪 | `denoise_mel_band_roformer_aufr33_sdr_27.9959` | 同默认 | 未单独评估 |
 
-默认链未修改；`stems.chain` 新增 `models` 参数可按步骤覆盖模型（翻唱测试用的就是上表「评估最优」一列）。
+默认链未修改；`stems.chain` 的 `models` 参数可按步骤覆盖模型。分轨页的「评估推荐」按钮与一键翻唱（智能模式，
+专业模式可选）使用上表「评估最优」一列（`internal/stems` 的 `Recommended`）。
 是否把默认值换成评估最优，需要结合主观试听决定：big_beta5e 等「fullness」取向的模型本就不以 SDR 为目标。
 
 ## 1. 人声 / 伴奏分离（MUSDB18 测试集，有真值）

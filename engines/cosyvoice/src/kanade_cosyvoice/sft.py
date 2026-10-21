@@ -4,7 +4,7 @@
   读取 .list 文本（缺文本时可用 Whisper 转写）→ wetext 归一化 → campplus 提取说话人向量 → 写 parquet 与 data.list。
 - cosyvoice.sft_train {name, base_model_dir, part (llm|flow|both), epochs, lr?, num_workers?, llm_layers?}
   需要 NVIDIA CUDA。llm_layers > 0 时 LLM 只训练 Qwen 顶部这么多层（8 GB 显存用 12，见 sft_launch._install_freeze_hook）；
-  0 或缺省为全量训练，约需 12 GB 以上显存。依次训练所选部分 → val_best 平均 checkpoint → 组装模型目录（含 spk2info.pt）。
+  0 或缺省为全量训练，约需 12 GB 以上显存；-1 为按显存自动选择（见 auto_llm_layers）。依次训练所选部分 → val_best 平均 checkpoint → 组装模型目录（含 spk2info.pt）。
 
 工作目录：<models>/cosyvoice/_sft/<name>/{data/train, data/dev, exp, tensorboard}。
 产出模型：<models>/cosyvoice/<name>-SFT/，与基础模型同版本，Cantus 中以「预训练音色」模式使用，音色名即 name。
@@ -277,6 +277,9 @@ def run_train(job: Job) -> None:
     lr = float(p.get("lr") or 1e-5)
     workers = int(p.get("num_workers") or 4)
     llm_layers = int(p.get("llm_layers") or 0)
+    if llm_layers < 0:
+        llm_layers = auto_llm_layers()
+        job.progress(0.0, "LLM 训练范围：" + ("全部层" if llm_layers == 0 else f"顶部 {llm_layers} 层") + "（按显存自动选择）")
 
     # 训练时在线提取语音 token 需要批量版 tokenizer，推理下载按 _SKIP 跳过了它（约 1 GB），这里按需补下。
     dl.ensure_files(job, base, ["speech_tokenizer_v3.batch.onnx"])
@@ -311,6 +314,15 @@ def run_train(job: Job) -> None:
     out = assemble(base, name, wd)
     job.artifact(out, "cosyvoice-model")
     job.progress(1.0, f"完成：{out.name}")
+
+
+def auto_llm_layers() -> int:
+    """显存 12 GB 及以上全量训练 LLM，否则只训顶部 12 层（8 GB 显卡实测可行，见 docs/windows-test-plan.md）。"""
+    import torch
+
+    gb = torch.cuda.get_device_properties(0).total_memory / 2**30
+    # 「12 GB」显卡报告的总显存约 11.6–12.0 GiB，阈值留出余量。
+    return 0 if gb >= 11.5 else 12
 
 
 def assemble(base: Path, name: str, wd: Path) -> Path:

@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
 	"kanade/internal/conductor"
 	"kanade/internal/dataset"
+	"kanade/internal/stems"
 	"kanade/internal/timbre"
 	"kanade/internal/ui/fluent"
 )
@@ -22,6 +24,12 @@ const (
 	timbreTabModels
 )
 
+// 翻唱的分轨模型选择（专业模式）。
+var coverStemChoices = []string{"评估推荐（推荐）", "默认（与 VoiceLab 一致）", "与「分轨」页相同"}
+
+// rateAuto 是训练采样率下拉框中的自动选项。
+const rateAuto = "自动"
+
 // timbreState 是音色转换页的界面状态。
 type timbreState struct {
 	tab int
@@ -31,7 +39,11 @@ type timbreState struct {
 	modelsStale bool
 	modelName   string // 选中的模型名
 
-	// 推理参数（转换与翻唱共用）。
+	// 推理参数（转换与翻唱共用）。inferMode 为 modeSmart 时只用 content 与 shift。
+	inferMode int
+	content   string // timbre.ContentKinds 的 Title（仅「转换」；翻唱固定为歌声）
+	shift     string // timbre.VoiceShifts 的 Title
+	// 专业模式参数。
 	preset         string // timbre.Preset.Title
 	pitch          float64
 	f0             string
@@ -41,26 +53,42 @@ type timbreState struct {
 	stereo         string // timbre.StereoModes 的 Title
 	normalize      bool
 
-	input   string
-	job     string
-	preview audioPreview
+	input      string
+	job        string
+	convertOut resultSet
 
 	// 翻唱。
-	song          string
-	backing       bool
-	backingGain   float64
-	cover         *timbre.Cover
-	coverPreview  audioPreview
-	coverShownMix string
+	coverSource  int // timbre.CoverSource
+	song         string
+	vocal        string
+	inst         string
+	harmonyFile  string
+	harmonyMode  string // timbre.HarmonyModes 之一
+	stemChoice   string // coverStemChoices 之一
+	keepDryLevel bool
+	mix          timbre.MixOptions
+	cover        *timbre.Cover
+	coverName    string // 本次翻唱的曲名，用于结果的建议文件名
+	coverOut     resultSet
 
-	// 训练。
+	// 训练。trainMode 为 modeSmart 时采样率、轮数、batch 与保存间隔交给引擎自动选择。
+	trainMode        int
 	trainName        string
 	trainDataset     string
 	trainSummary     *dataset.Summary
 	trainRate        string
-	trainEpochs      string
-	trainBatch       string
-	trainSaveEvery   string
+	trainEpochs      float64
+	trainBatch       float64
+	trainSaveEvery   float64
+	trainF0          string
+	trainCores       float64 // 0 为自动
+	trainCut         string
+	trainChunk       float64
+	trainOverlap     float64
+	trainNorm        string
+	trainIndex       string
+	trainCacheGPU    bool
+	trainCheckpoint  bool
 	trainSkipPre     bool
 	trainSkipExtract bool
 	trainJob         string
@@ -74,8 +102,12 @@ type timbreState struct {
 }
 
 func newTimbreState() timbreState {
-	s := timbreState{modelsStale: true, normalize: true, stereo: timbre.StereoModes[1].Title, backing: true, backingGain: -3,
-		trainRate: "48000", trainEpochs: "200", trainBatch: "4", trainSaveEvery: "3"}
+	s := timbreState{modelsStale: true, normalize: true, stereo: timbre.StereoModes[1].Title,
+		content: timbre.ContentKinds[0].Title, shift: timbre.VoiceShifts[0].Title,
+		harmonyMode: timbre.HarmonyModes[0], stemChoice: coverStemChoices[0], mix: timbre.DefaultMix(),
+		trainRate: "48000", trainEpochs: 200, trainBatch: 4, trainSaveEvery: 10, trainF0: "rmvpe",
+		trainCut: timbre.CutModes[0], trainChunk: 3, trainOverlap: 0.3, trainNorm: timbre.Normalizations[0],
+		trainIndex: timbre.IndexAlgorithms[0]}
 	s.applyPreset(timbre.Presets[2])
 	return s
 }
@@ -102,8 +134,29 @@ func (s *timbreState) stereoKey() string {
 	return "mono"
 }
 
-func (s *timbreState) inferRequest(input string) timbre.InferRequest {
+func (s *timbreState) shiftPitch() int {
+	for _, v := range timbre.VoiceShifts {
+		if v.Title == s.shift {
+			return v.Pitch
+		}
+	}
+	return 0
+}
+
+// inferRequest 按当前参数模式组装推理参数。singing 为 true 时（翻唱）智能模式固定使用歌声预设。
+func (s *timbreState) inferRequest(input string, singing bool) timbre.InferRequest {
 	m, _ := s.model()
+	if s.inferMode == modeSmart {
+		preset := timbre.ContentKinds[0].Preset
+		for _, k := range timbre.ContentKinds {
+			if k.Title == s.content && !singing {
+				preset = k.Preset
+			}
+		}
+		r := timbre.SmartInfer(m, preset, s.shiftPitch())
+		r.Input = input
+		return r
+	}
 	return timbre.InferRequest{Model: m, Input: input, Pitch: int(s.pitch), F0: s.f0, IndexRate: s.indexRate,
 		Protect: s.protect, VolumeEnvelope: s.volumeEnvelope, Stereo: s.stereoKey(), Normalize: s.normalize}
 }
@@ -145,10 +198,7 @@ func (a *app) timbreModelSelect(c *ui.Context) bool {
 		ui.Text(c, "还没有音色模型：在「训练」中训练，或在「模型」中导入已有的 .pth / .index。").TextColor(c.Theme().TextMuted)
 		return false
 	}
-	names := make([]string, len(s.models))
-	for i, m := range s.models {
-		names[i] = m.Name
-	}
+	names := titles(s.models, func(m timbre.Model) string { return m.Name })
 	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 		ui.Select(c, &s.modelName, names).Label("音色模型").Width(240)
 		if m, ok := s.model(); ok {
@@ -165,16 +215,24 @@ func (a *app) timbreModelSelect(c *ui.Context) bool {
 	return true
 }
 
-// timbreParams 显示推理参数：预设、变调、音高算法，以及可微调的检索比例、辅音保护与响度包络。
-func (a *app) timbreParams(c *ui.Context) {
+// timbreParams 显示推理参数。智能模式只有内容类型（翻唱时省略）与音高方向；
+// 专业模式为预设、音高算法、立体声、变调与检索比例等全部参数。
+func (a *app) timbreParams(c *ui.Context, singing bool) {
 	t := c.Theme()
 	s := &a.timbre
-	titles := make([]string, len(timbre.Presets))
-	for i, p := range timbre.Presets {
-		titles[i] = p.Title
+	modeSwitch(c, "infer-mode", &s.inferMode, "按内容类型套用推荐预设，音高只需选择是否跨性别。")
+	if s.inferMode == modeSmart {
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			if !singing {
+				ui.Select(c, &s.content, titles(timbre.ContentKinds, func(k timbre.ContentKind) string { return k.Title })).
+					Label("内容").Width(120)
+			}
+			ui.Select(c, &s.shift, titles(timbre.VoiceShifts, func(v timbre.VoiceShift) string { return v.Title })).Label("音高").Width(240)
+		})
+		return
 	}
 	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-		if ui.Select(c, &s.preset, titles).Label("预设").Width(200).Changed() {
+		if ui.Select(c, &s.preset, titles(timbre.Presets, func(p timbre.Preset) string { return p.Title })).Label("预设").Width(200).Changed() {
 			for _, p := range timbre.Presets {
 				if p.Title == s.preset {
 					s.applyPreset(p)
@@ -190,22 +248,18 @@ func (a *app) timbreParams(c *ui.Context) {
 	})
 	for _, p := range timbre.Presets {
 		if p.Title == s.preset {
-			ui.Text(c, p.Hint+"。变调：男转女常用 +12，女转男 −3 ~ −6，歌声先从 0 开始。").FontSize(12).TextColor(t.TextMuted)
+			ui.Text(c, p.Hint+"。变调：男转女常用 +12，女转男 −3 ~ −12，歌声先从 0 开始。").FontSize(12).TextColor(t.TextMuted)
 		}
 	}
-	slider := func(label string, v *float64, lo, hi float64, format string) {
-		ui.Row(c.Key("slider-" + label)).Gap(12).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, label).FontSize(12).Width(72)
-			ui.Slider(c, v, lo, hi).Label(label).Width(240)
-			ui.Textf(c, format, *v).FontSize(12).Font("monospace").Width(64)
-		})
-	}
-	slider("变调（半音）", &s.pitch, timbre.MinPitch, timbre.MaxPitch, "%+.0f")
+	labeledSlider(c, "变调（半音）", &s.pitch, timbre.MinPitch, timbre.MaxPitch, "%+.0f")
 	s.pitch = float64(int(s.pitch + 0.5*sign(s.pitch))) // 变调按整数半音
-	slider("检索比例", &s.indexRate, 0, 1, "%.2f")
-	slider("辅音保护", &s.protect, 0, 0.5, "%.2f")
-	slider("响度包络", &s.volumeEnvelope, 0, 1, "%.2f")
-	ui.Checkbox(c, &s.normalize, "输出峰值归一化")
+	labeledSlider(c, "检索比例", &s.indexRate, 0, 1, "%.2f")
+	labeledSlider(c, "辅音保护", &s.protect, 0, 0.5, "%.2f")
+	labeledSlider(c, "响度包络", &s.volumeEnvelope, 0, 1, "%.2f")
+	if !singing {
+		// 翻唱的电平由混音对齐原曲，不做峰值归一化。
+		ui.Checkbox(c, &s.normalize, "输出峰值归一化")
+	}
 }
 
 func sign(v float64) float64 {
@@ -246,11 +300,11 @@ func (a *app) timbreConvert(c *ui.Context, tk *fluent.Tokens) {
 			return
 		}
 		a.audioPicker(c, "输入人声", &s.input, directAudioExts)
-		ui.Text(c, "整首歌请先用「分轨」得到干净主唱，或直接用「翻唱」。").FontSize(12).TextColor(c.Theme().TextMuted)
-		a.timbreParams(c)
+		ui.Text(c, "整首歌请用「翻唱」，或先用「分轨」得到干净主唱。").FontSize(12).TextColor(c.Theme().TextMuted)
+		a.timbreParams(c, false)
 		_, active := a.jobStatusPeek(s.job)
 		if ui.PrimaryButton(c, "开始转换").Disabled(active).Clicked() {
-			params, err := s.inferRequest(s.input).Params()
+			params, err := s.inferRequest(s.input, false).Params()
 			if err == nil {
 				s.job, err = a.be.cond.Submit(timbre.Engine, "timbre.infer", params)
 			}
@@ -258,10 +312,12 @@ func (a *app) timbreConvert(c *ui.Context, tk *fluent.Tokens) {
 		}
 		j, _ := a.jobStatus(c, s.job)
 		if j.State == conductor.JobDone && len(j.Artifacts) > 0 {
-			s.preview.load(a, j.Artifacts[0])
+			in := strings.TrimSuffix(filepath.Base(s.input), filepath.Ext(s.input))
+			m, _ := s.model()
+			s.convertOut.add(a, j.Artifacts[0], in+" → "+m.Name, fmt.Sprintf("%s_%s", in, m.Name), true)
 		}
 	})
-	card(c, tk, "结果", func() { s.preview.show(c, tk, "转换结果会显示在这里。") })
+	card(c, tk, "结果", func() { s.convertOut.show(c, tk, a, "转换结果会显示在这里。") })
 }
 
 // jobStatusPeek 返回任务快照与是否进行中，不构建界面。
@@ -273,6 +329,38 @@ func (a *app) jobStatusPeek(id string) (conductor.Job, bool) {
 	return j, !j.State.Finished()
 }
 
+// coverStemModels 返回翻唱使用的分轨模型：智能模式为评估推荐，专业模式按选择。
+func (a *app) coverStemModels() map[string]string {
+	s := &a.timbre
+	if s.inferMode == modeSmart || s.stemChoice == coverStemChoices[0] {
+		return stems.Recommended
+	}
+	if s.stemChoice == coverStemChoices[2] {
+		return a.stems.models
+	}
+	return nil
+}
+
+func (a *app) coverRequest() timbre.CoverRequest {
+	s := &a.timbre
+	r := timbre.CoverRequest{Source: timbre.CoverSource(s.coverSource), Song: s.song, Vocal: s.vocal, Inst: s.inst,
+		Harmony: s.harmonyFile, StemModels: a.coverStemModels(), Infer: s.inferRequest("", true), Mix: s.mix}
+	if s.inferMode == modeSmart {
+		// 智能模式：和声转换后混入、混响用默认值，只保留人声音量与 MP3 两项。
+		def := timbre.DefaultMix()
+		def.VocalGainDB, def.MP3 = s.mix.VocalGainDB, s.mix.MP3
+		r.Mix, r.HarmonyMode = def, timbre.HarmonyConvert
+		return r
+	}
+	for i, m := range timbre.HarmonyModes {
+		if m == s.harmonyMode {
+			r.HarmonyMode = timbre.HarmonyMode(i)
+		}
+	}
+	r.KeepDryLevel = s.keepDryLevel
+	return r
+}
+
 func (a *app) timbreCover(c *ui.Context, tk *fluent.Tokens) {
 	t := c.Theme()
 	s := &a.timbre
@@ -281,25 +369,37 @@ func (a *app) timbreCover(c *ui.Context, tk *fluent.Tokens) {
 		st = s.cover.Snapshot()
 	}
 	card(c, tk, "一键翻唱", func() {
-		ui.Text(c, "分轨与人声净化 → 用干净主唱转换音色 → 与伴奏（及和声）混音。").FontSize(12).TextColor(t.TextMuted)
+		ui.Text(c, "整首歌：分轨净化 → 主唱与和声转换音色 → 对齐原曲响度、加混响后与伴奏混音。纯干声：跳过分轨，直接转换并混音。").
+			FontSize(12).TextColor(t.TextMuted)
 		if !a.timbreModelSelect(c) {
 			return
 		}
-		a.audioPicker(c, "歌曲", &s.song, anyAudioExts())
-		a.timbreParams(c)
-		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-			ui.Checkbox(c, &s.backing, "混入原曲和声")
-			if s.backing {
-				ui.Slider(c, &s.backingGain, -24, 6).Label("和声增益").Width(160)
-				ui.Textf(c, "%+.0f dB", s.backingGain).FontSize(12).Font("monospace")
+		ui.Segmented(c, &s.coverSource, "整首歌（自动分轨）", "纯干声").Label("输入类型")
+		if timbre.CoverSource(s.coverSource) == timbre.SourceSong {
+			a.audioPicker(c, "歌曲", &s.song, anyAudioExts())
+		} else {
+			a.audioPicker(c, "主唱干声", &s.vocal, directAudioExts)
+			a.audioPicker(c, "伴奏（可选）", &s.inst, directAudioExts)
+			a.audioPicker(c, "和声（可选）", &s.harmonyFile, directAudioExts)
+		}
+		a.timbreParams(c, true)
+		a.coverMixParams(c)
+		if timbre.CoverSource(s.coverSource) == timbre.SourceSong {
+			if files, mb := stems.Missing(a.be.layout, []string{"other", "dry"}, a.coverStemModels()); len(files) > 0 {
+				ui.Textf(c, "首次运行会下载 %d 个分轨模型（约 %.1f GB）。", len(files), float64(mb)/1000).FontSize(12).TextColor(t.TextMuted)
 			}
-		})
+		}
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			if ui.PrimaryButton(c, "开始翻唱").Disabled(st.Running() && s.cover != nil).Clicked() {
-				cv, err := timbre.StartCover(a.be.cond, timbre.CoverRequest{Song: s.song, Infer: s.inferRequest(""),
-					Backing: s.backing, BackingGainDB: s.backingGain}, func() { a.post(func() {}) })
+			if ui.PrimaryButton(c, "开始翻唱").Disabled(s.cover != nil && st.Running()).Clicked() {
+				r := a.coverRequest()
+				cv, err := timbre.StartCover(a.be.cond, r, func() { a.post(func() {}) })
 				if err == nil {
-					s.cover, s.coverShownMix = cv, ""
+					src := r.Song
+					if r.Source == timbre.SourceDry {
+						src = r.Vocal
+					}
+					s.cover, s.coverName = cv, strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
+					st = cv.Snapshot()
 				}
 				s.err = errText(err)
 			}
@@ -312,46 +412,124 @@ func (a *app) timbreCover(c *ui.Context, tk *fluent.Tokens) {
 		if s.cover == nil {
 			return
 		}
-		for i, title := range timbre.StageTitles[:timbre.StageDone] {
-			mark, color := "○", t.TextMuted
-			switch {
-			case st.Err != "" && i == st.Stage:
-				mark, color = "✕", t.Danger
-			case i < st.Stage:
-				mark, color = "✓", t.Success
-			case i == st.Stage:
-				mark, color = "●", t.Accent
-			}
-			ui.Row(c.Key("stage-" + title)).Gap(8).Children(func() {
-				ui.Text(c, mark).TextColor(color).Width(16)
-				ui.Text(c, title)
-			})
-		}
-		if st.Job != "" && st.Running() {
-			a.jobStatus(c, st.Job)
-		}
-		if st.Err != "" {
-			ui.Text(c, st.Err).FontSize(12).TextColor(t.Danger).Selectable()
-		}
-		if mix := st.Outputs["mix"]; mix != "" && mix != s.coverShownMix {
-			s.coverShownMix = mix
-			s.coverPreview.load(a, mix)
-		}
+		a.coverStages(c, st)
 	})
 	card(c, tk, "结果", func() {
-		s.coverPreview.show(c, tk, "翻唱成品会显示在这里。")
-		for _, k := range []struct{ key, title string }{{"mix", "成品"}, {"converted", "转换后的人声"}, {"dry", "原曲干声"}, {"other", "伴奏"}, {"backing", "和声"}} {
-			if p := st.Outputs[k.key]; p != "" {
-				b := ui.Button(c.Key("cover-"+k.key), k.title)
-				if p == s.coverPreview.path {
-					b = b.Disabled(true)
-				}
-				if b.Clicked() {
-					s.coverPreview.load(a, p)
-				}
-			}
+		a.registerCoverOutputs(st)
+		s.coverOut.show(c, tk, a, "翻唱成品会显示在这里。")
+		if rep := st.Report; rep != nil {
+			coverReport(c, rep)
 		}
 	})
+}
+
+// coverMixParams 显示混音参数：智能模式只有人声音量与 MP3；专业模式有分轨模型、和声处理、各轨偏移与混响。
+func (a *app) coverMixParams(c *ui.Context) {
+	t := c.Theme()
+	s := &a.timbre
+	m := &s.mix
+	ui.Text(c, "混音").FontWeight(600)
+	if s.inferMode == modeSmart {
+		ui.Text(c, "主唱与和声自动对齐原曲的演唱段响度，加人声混响，成品峰值 −1 dBFS、24 bit。").FontSize(12).TextColor(t.TextMuted)
+		labeledSlider(c, "人声音量", &m.VocalGainDB, -6, 6, "%+.1f dB")
+		ui.Checkbox(c, &m.MP3, "同时导出 MP3")
+		return
+	}
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		if timbre.CoverSource(s.coverSource) == timbre.SourceSong {
+			ui.Select(c, &s.stemChoice, coverStemChoices).Label("分轨模型").Width(220)
+		}
+		ui.Select(c, &s.harmonyMode, timbre.HarmonyModes).Label("和声").Width(200)
+	})
+	if timbre.CoverSource(s.coverSource) == timbre.SourceDry {
+		ui.Checkbox(c, &s.keepDryLevel, "保持输入干声与伴奏的原有比例（三者来自同一首歌的分轨时勾选）")
+	}
+	ui.Text(c, "以下增益都是相对智能推荐电平的偏移，0 即推荐值。").FontSize(12).TextColor(t.TextMuted)
+	labeledSlider(c, "主唱", &m.VocalGainDB, -timbre.MaxGainOffsetDB, timbre.MaxGainOffsetDB, "%+.1f dB")
+	labeledSlider(c, "和声", &m.HarmonyGainDB, -timbre.MaxGainOffsetDB, timbre.MaxGainOffsetDB, "%+.1f dB")
+	labeledSlider(c, "伴奏", &m.InstGainDB, -timbre.MaxGainOffsetDB, timbre.MaxGainOffsetDB, "%+.1f dB")
+	ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+		ui.Checkbox(c, &m.Reverb, "人声混响")
+		ui.Checkbox(c, &m.MP3, "同时导出 MP3")
+		if ui.Button(c, "恢复推荐值").Clicked() {
+			mp3 := m.MP3
+			*m = timbre.DefaultMix()
+			m.MP3 = mp3
+		}
+	})
+	if m.Reverb {
+		labeledSlider(c, "湿声电平", &m.ReverbWetDB, timbre.MinWetDB, timbre.MaxWetDB, "%.1f dB")
+		labeledSlider(c, "混响时间", &m.RT60, timbre.MinRT60, timbre.MaxRT60, "%.2f s")
+		labeledSlider(c, "预延迟", &m.PreDelayMS, 0, timbre.MaxPreDelayMS, "%.0f ms")
+		ui.Text(c, "和声的湿声比主唱多 3 dB，让和声退到主唱后面。").FontSize(12).TextColor(t.TextMuted)
+	}
+}
+
+// coverStages 显示流水线各阶段的状态与当前任务进度。
+func (a *app) coverStages(c *ui.Context, st timbre.CoverState) {
+	t := c.Theme()
+	for i, title := range timbre.StageTitles[:timbre.StageDone] {
+		mark, color := "○", t.TextMuted
+		switch {
+		case st.Skipped[i]:
+			mark, title = "–", title+"（跳过）"
+		case st.Err != "" && i == st.Stage:
+			mark, color = "✕", t.Danger
+		case i < st.Stage:
+			mark, color = "✓", t.Success
+		case i == st.Stage:
+			mark, color = "●", t.Accent
+		}
+		ui.Row(c.Key("stage-" + title)).Gap(8).Children(func() {
+			ui.Text(c, mark).TextColor(color).Width(16)
+			ui.Text(c, title).TextColor(color)
+		})
+	}
+	if st.Job != "" && st.Running() {
+		a.jobStatus(c, st.Job)
+	}
+	if st.Err != "" {
+		ui.Text(c, st.Err).FontSize(12).TextColor(t.Danger).Selectable()
+	}
+}
+
+// coverOutputs 是翻唱各产物在结果列表中的标题，成品在最后登记，使预览停在成品上。
+var coverOutputs = []struct{ key, title string }{
+	{"dry", "原曲干声"}, {"other", "伴奏"}, {"backing", "原曲和声"},
+	{"converted", "转换后的主唱"}, {"converted_backing", "转换后的和声"},
+	{"mix_mp3", "成品（MP3）"}, {"mix", "成品"},
+}
+
+// registerCoverOutputs 把流水线新出现的产物登记到结果列表；干声模式下用户自己的输入文件不登记。
+func (a *app) registerCoverOutputs(st timbre.CoverState) {
+	s := &a.timbre
+	for _, o := range coverOutputs {
+		p := st.Outputs[o.key]
+		if p == "" || st.Skipped[timbre.StageStems] && (o.key == "dry" || o.key == "other" || o.key == "backing") {
+			continue
+		}
+		name := s.coverName + "_" + o.key
+		if o.key == "mix" || o.key == "mix_mp3" {
+			name = strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+		}
+		s.coverOut.add(a, p, o.title, name, o.key == "mix")
+	}
+}
+
+// coverReport 显示混音实际应用的电平，说明智能推荐做了什么。
+func coverReport(c *ui.Context, rep *timbre.MixReport) {
+	t := c.Theme()
+	role := map[string]string{timbre.RoleVocal: "主唱", timbre.RoleHarmony: "和声", timbre.RoleInst: "伴奏", timbre.RoleOther: "原曲和声"}
+	ui.Text(c, "混音电平").FontSize(12).FontWeight(600)
+	for _, tr := range rep.Tracks {
+		level := "—"
+		if tr.LevelDBFS != nil {
+			level = fmt.Sprintf("%.1f dBFS", *tr.LevelDBFS)
+		}
+		ui.Textf(c, "%s：%s，增益 %+.1f dB（其中偏移 %+.1f dB），演唱段电平 %s", role[tr.Role], tr.Basis, tr.GainDB, tr.OffsetDB, level).
+			FontSize(12).TextColor(t.TextMuted)
+	}
+	ui.Textf(c, "母带增益 %+.1f dB → 峰值 −1 dBFS", rep.MasterGainDB).FontSize(12).TextColor(t.TextMuted)
 }
 
 func (a *app) timbreTrain(c *ui.Context, tk *fluent.Tokens) {
@@ -360,7 +538,10 @@ func (a *app) timbreTrain(c *ui.Context, tk *fluent.Tokens) {
 	card(c, tk, "训练 RVC 模型", func() {
 		ui.Text(c, "v2 + f0 模型。数据集为一个目录的干净人声（建议先用「分轨」净化）；目录中有同名 .list 时只使用其中列出的音频。").
 			FontSize(12).TextColor(t.TextMuted)
-		ui.TextInput(c, &s.trainName).Label("模型名").Placeholder("例如 xingtong_v2_48k").Width(320)
+		modeSwitch(c, "train-mode", &s.trainMode, "采样率按数据集、轮数按数据时长、batch 按显存自动选择。")
+		ui.Field(c, "模型名", func() {
+			ui.TextInput(c, &s.trainName).Placeholder("例如 xingtong_v2_48k").Width(320)
+		})
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "数据集").FontSize(12).Width(64)
 			name := "未选择"
@@ -391,38 +572,21 @@ func (a *app) timbreTrain(c *ui.Context, tk *fluent.Tokens) {
 				ui.Textf(c, "找不到音频的条目（前 %d 条）：%v", len(sum.Missing), sum.Missing).FontSize(12).TextColor(t.Warning)
 			}
 		}
-		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-			rates := make([]string, len(timbre.SampleRates))
-			for i, r := range timbre.SampleRates {
-				rates[i] = strconv.Itoa(r)
+		for _, m := range s.models {
+			if m.Trained && m.Name == strings.TrimSpace(s.trainName) {
+				ui.Textf(c, "已有同名模型（%d 轮）：将从上次的检查点续训。", m.Epoch).FontSize(12).TextColor(t.Warning)
 			}
-			ui.Select(c, &s.trainRate, rates).Label("采样率").Width(120)
-			ui.TextInput(c, &s.trainEpochs).Label("总轮数").Width(100)
-			ui.TextInput(c, &s.trainBatch).Label("batch").Width(80)
-			ui.TextInput(c, &s.trainSaveEvery).Label("每 N 轮保存").Width(110)
-		})
-		ui.Text(c, "显存不足（如 6 GB）时把 batch 降到 2。已有同名模型时会从上次的检查点续训，总轮数需大于已训练轮数。").
-			FontSize(12).TextColor(t.TextMuted)
-		ui.Row(c).Gap(16).Children(func() {
-			ui.Checkbox(c, &s.trainSkipPre, "跳过预处理（续训）")
-			ui.Checkbox(c, &s.trainSkipExtract, "跳过特征提取（续训）")
-		})
+		}
+		if s.trainMode == modePro {
+			a.timbreTrainPro(c)
+		}
 		_, active := a.jobStatusPeek(s.trainJob)
 		if ui.PrimaryButton(c, "开始训练").Disabled(active).Clicked() {
-			rate, _ := strconv.Atoi(s.trainRate)
-			epochs, err1 := strconv.Atoi(s.trainEpochs)
-			batch, err2 := strconv.Atoi(s.trainBatch)
-			every, err3 := strconv.Atoi(s.trainSaveEvery)
-			if err := firstNonNil(err1, err2, err3); err != nil {
-				s.err = "轮数、batch 与保存间隔须为整数"
-			} else {
-				params, err := timbre.TrainRequest{Name: s.trainName, Dataset: s.trainDataset, SampleRate: rate, F0: "rmvpe",
-					Epochs: epochs, BatchSize: batch, SaveEvery: every, SkipPreprocess: s.trainSkipPre, SkipExtract: s.trainSkipExtract}.Params()
-				if err == nil {
-					s.trainJob, err = a.be.cond.Submit(timbre.Engine, "timbre.train", params)
-				}
-				s.err = errText(err)
+			params, err := s.trainRequest().Params()
+			if err == nil {
+				s.trainJob, err = a.be.cond.Submit(timbre.Engine, "timbre.train", params)
 			}
+			s.err = errText(err)
 		}
 		j, _ := a.jobStatus(c, s.trainJob)
 		if j.State == conductor.JobDone {
@@ -436,13 +600,54 @@ func (a *app) timbreTrain(c *ui.Context, tk *fluent.Tokens) {
 	})
 }
 
-func firstNonNil(errs ...error) error {
-	for _, e := range errs {
-		if e != nil {
-			return e
+// timbreTrainPro 是训练的专业参数。
+func (a *app) timbreTrainPro(c *ui.Context) {
+	t := c.Theme()
+	s := &a.timbre
+	ui.Row(c).Gap(12).AlignItems(ui.End).Children(func() {
+		rates := []string{rateAuto}
+		for _, r := range timbre.SampleRates {
+			rates = append(rates, strconv.Itoa(r))
 		}
+		ui.Field(c, "采样率", func() { ui.Select(c, &s.trainRate, rates).Width(120) })
+		ui.Field(c, "总轮数", func() { ui.NumberInput(c, &s.trainEpochs, 1, 10000, 10).Width(120) })
+		ui.Field(c, "batch", func() { ui.NumberInput(c, &s.trainBatch, 1, 64, 1).Width(100) })
+		ui.Field(c, "每 N 轮保存", func() { ui.NumberInput(c, &s.trainSaveEvery, 1, 1000, 1).Width(110) })
+	})
+	ui.Text(c, "显存不足（如 6 GB）时把 batch 降到 2 或开启梯度检查点。续训时总轮数需大于已训练轮数，采样率须与上次相同。").
+		FontSize(12).TextColor(t.TextMuted)
+	ui.Row(c).Gap(12).AlignItems(ui.End).Children(func() {
+		ui.Field(c, "音高算法", func() { ui.Select(c, &s.trainF0, timbre.F0Methods).Width(110) })
+		ui.Field(c, "CPU 进程数（0 自动）", func() { ui.NumberInput(c, &s.trainCores, 0, 64, 1).Width(110) })
+		ui.Field(c, "索引算法", func() { ui.Select(c, &s.trainIndex, timbre.IndexAlgorithms).Width(110) })
+	})
+	ui.Row(c).Gap(12).AlignItems(ui.End).Children(func() {
+		ui.Field(c, "切片方式", func() { ui.Select(c, &s.trainCut, timbre.CutModes).Width(120) })
+		ui.Field(c, "切片长度（秒）", func() { ui.NumberInput(c, &s.trainChunk, 0.5, 10, 0.5).Width(110) })
+		ui.Field(c, "切片重叠（秒）", func() { ui.NumberInput(c, &s.trainOverlap, 0, 1, 0.1).Width(110) })
+		ui.Field(c, "响度归一化", func() { ui.Select(c, &s.trainNorm, timbre.Normalizations).Width(110) })
+	})
+	ui.Row(c).Gap(16).Children(func() {
+		ui.Checkbox(c, &s.trainCacheGPU, "数据缓存到显存")
+		ui.Checkbox(c, &s.trainCheckpoint, "梯度检查点（省显存）")
+		ui.Checkbox(c, &s.trainSkipPre, "跳过预处理（续训）")
+		ui.Checkbox(c, &s.trainSkipExtract, "跳过特征提取（续训）")
+	})
+}
+
+// trainRequest 按当前模式组装训练参数：智能模式的采样率、轮数、batch 与保存间隔为 0（引擎自动选择）。
+func (s *timbreState) trainRequest() timbre.TrainRequest {
+	r := timbre.TrainRequest{Name: s.trainName, Dataset: s.trainDataset, F0: "rmvpe"}
+	if s.trainMode == modeSmart {
+		return r
 	}
-	return nil
+	r.SampleRate, _ = strconv.Atoi(s.trainRate) // 「自动」解析失败即 0
+	r.Epochs, r.BatchSize, r.SaveEvery = int(s.trainEpochs), int(s.trainBatch), int(s.trainSaveEvery)
+	r.F0, r.CPUCores, r.IndexAlgorithm = s.trainF0, int(s.trainCores), s.trainIndex
+	r.CutMode, r.ChunkLen, r.OverlapLen, r.Normalization = s.trainCut, s.trainChunk, s.trainOverlap, s.trainNorm
+	r.CacheGPU, r.Checkpointing = s.trainCacheGPU, s.trainCheckpoint
+	r.SkipPreprocess, r.SkipExtract = s.trainSkipPre, s.trainSkipExtract
+	return r
 }
 
 // pickDir 在后台打开目录选择框，选定后在 UI 线程调用 fn。
@@ -514,7 +719,7 @@ func (a *app) timbreModels(c *ui.Context, tk *fluent.Tokens) {
 	})
 	card(c, tk, "导入模型", func() {
 		ui.Text(c, "导入 RVC v2 模型（.pth，可附带 .index），例如 VoiceLab 或 RVC WebUI 训练的模型。").FontSize(12).TextColor(t.TextMuted)
-		ui.TextInput(c, &s.importName).Label("模型名").Width(240)
+		ui.Field(c, "模型名", func() { ui.TextInput(c, &s.importName).Width(240) })
 		filePicker := func(label string, path *string, ext string) {
 			ui.Row(c.Key("imp-" + label)).Gap(8).AlignItems(ui.Center).Children(func() {
 				ui.Text(c, label).FontSize(12).Width(64)

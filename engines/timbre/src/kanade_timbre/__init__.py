@@ -5,8 +5,10 @@
 - timbre.infer  {model, index?, input, pitch, f0_method, index_rate, protect, volume_envelope,
                  stereo_mode, normalize}：转换一段人声。
 - timbre.train  {name, dataset_dir, list?, sample_rate, f0_method, epochs, batch_size, save_every,
-                 skip_preprocess?, skip_extract?}：预处理 → 提取 f0 / 特征 → 训练（自动续训）→ 建索引。
-- timbre.mix    {tracks: [{path, gain_db}], name}：把转换后的人声与伴奏等混合为一个文件。
+                 skip_preprocess?, skip_extract?, cpu_cores?, cut_mode?, chunk_len?, overlap_len?, normalization?,
+                 process_effects?, cache_gpu?, checkpointing?, index_algorithm?}：预处理 → 提取 f0 / 特征 →
+                 训练（自动续训）→ 建索引。采样率、轮数、batch、保存间隔为 0 时自动选择。
+- timbre.mix    {tracks: [{path, role, ref?, gain_db}], reverb?, master?, name}：响度对齐、人声混响与母带，见 mix.py。
 - timbre.prepare {train?, sample_rate?}：预下载推理（及训练）所需的底模与预测器。
 
 Applio 以工作目录解析模型路径（rvc/models/...），并在导入时记录 os.getcwd()，因此必须在导入 rvc 之前

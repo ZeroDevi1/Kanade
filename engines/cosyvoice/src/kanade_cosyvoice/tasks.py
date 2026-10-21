@@ -32,6 +32,8 @@ MODES = {
 # SFT 推理的保守采样参数，取自 VoiceLab cosyvoice_sft_param_playbook（sampling06k10）：降低韵律随机性与崩坏概率。
 SFT_SAMPLING = {"top_p": 0.6, "top_k": 10, "win_size": 10, "tau_r": 1.0}
 SFT_SEED = 1986
+# 任务参数 sampling 可覆盖的 ras_sampling 参数；未给出的项用模型 yaml 的默认（上游各版本均为 0.8 / 25 / 10 / 0.1）。
+SAMPLING_KEYS = {"top_p": float, "top_k": int, "win_size": int, "tau_r": float}
 
 # CosyVoice 3 的提示文本须以系统提示开头，见上游 example.py 的 cosyvoice3_example。
 V3_SYSTEM = "You are a helpful assistant."
@@ -204,11 +206,46 @@ def write_output(job: Job, model, chunks: list) -> None:
     job.artifact(out, "audio")
 
 
+def configure_sampling(model, fam: str, p: dict) -> None:
+    """按任务参数设置 LLM 采样与随机种子，每个任务都重新设置（同一模型实例跨任务复用）。
+
+    - sampling {top_p, top_k, win_size, tau_r}：覆盖 ras_sampling 参数；缺省时微调模型用 SFT_SAMPLING，其他模型恢复 yaml 默认。
+    - seed：非负整数时固定 random / numpy / torch 的种子，便于复现与 A/B 对比；缺省时微调模型用 SFT_SEED，其他模型不固定。
+    """
+    import random
+
+    import numpy as np
+    import torch
+    from cosyvoice.utils.common import ras_sampling
+
+    llm = model.model.llm
+    if not hasattr(llm, "_kanade_default_sampling"):
+        llm._kanade_default_sampling = llm.sampling
+    sampling = p.get("sampling")
+    if sampling is None and fam == "v3-sft":
+        sampling = SFT_SAMPLING
+    if sampling:
+        kw = {k: conv(sampling[k]) for k, conv in SAMPLING_KEYS.items() if sampling.get(k) is not None}
+        llm.sampling = lambda scores, decoded, s: ras_sampling(scores, decoded, s, **kw)
+    else:
+        llm.sampling = llm._kanade_default_sampling
+    seed = p.get("seed")
+    if seed is None and fam == "v3-sft":
+        seed = SFT_SEED
+    if seed is not None and int(seed) >= 0:
+        random.seed(int(seed))
+        np.random.seed(int(seed))
+        torch.manual_seed(int(seed))
+
+
 def _common(job: Job, mode: str):
     p = job.params
     model_dir = Path(p["model_dir"])
     model = load(job, model_dir, mode)
-    return p, model, family(model_dir), float(p.get("speed") or 1.0), bool(p.get("text_frontend", True))
+    fam = family(model_dir)
+    if mode != "vc":  # 声音转换不经过 LLM
+        configure_sampling(model, fam, p)
+    return p, model, fam, float(p.get("speed") or 1.0), bool(p.get("text_frontend", True))
 
 
 # ---------- 任务 ----------
@@ -254,20 +291,10 @@ def sft(job: Job) -> None:
 def _sft_v3(model, text: str, spk_id: str, guide: str, speed: float, tf: bool):
     """CosyVoice 3 SFT 推理：LLM 要求 <|endofprompt|> 出现在提示或正文中，上游 inference_sft 不提供提示，
     因此逐句构造输入并注入 prompt_text（默认只有标记本身，减少提示内容泄露到语音；guide 可写情绪 / 风格引导）。
-    同时覆盖 LLM 采样参数并固定随机种子，便于 A/B 对比。"""
-    import random
-
-    import numpy as np
-    import torch
-    from cosyvoice.utils.common import ras_sampling
-
+    采样参数与随机种子已由 configure_sampling 设置。"""
     prompt = guide.strip()
     if END not in prompt:
         prompt += END
-    model.model.llm.sampling = lambda scores, decoded, sampling: ras_sampling(scores, decoded, sampling, **SFT_SAMPLING)
-    random.seed(SFT_SEED)
-    np.random.seed(SFT_SEED)
-    torch.manual_seed(SFT_SEED)
     prompt_norm = model.frontend.text_normalize(prompt, split=False, text_frontend=tf)
     prompt_token, prompt_len = model.frontend._extract_text_token(prompt_norm)
     for seg in model.frontend.text_normalize(text, split=True, text_frontend=tf):

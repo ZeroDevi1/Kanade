@@ -48,7 +48,14 @@ func startBackend(onChange func()) backend {
 		}
 		root = filepath.Join(docs, paths.DirName)
 	}
-	b.layout = paths.New(root)
+	// 暂存区放在系统临时目录：结果未保存前不占用数据根目录。应用持有单实例锁，启动时清掉上次异常退出留下的暂存。
+	tmp, err := mygo.App.Path(mygo.PathTemp)
+	if err != nil {
+		b.err = err
+		return b
+	}
+	b.layout = paths.New(root).WithScratch(filepath.Join(tmp, scratchDirName))
+	_ = os.RemoveAll(b.layout.Scratch)
 	if b.err = b.layout.Ensure(); b.err != nil {
 		return b
 	}
@@ -59,6 +66,9 @@ func startBackend(onChange func()) backend {
 	b.cond.Start()
 	return b
 }
+
+// scratchDirName 是系统临时目录下的暂存区名称。
+const scratchDirName = "Kanade-scratch"
 
 // loadedAudio 是解码后的音频：用于波形的峰值与播放器。
 type loadedAudio struct {

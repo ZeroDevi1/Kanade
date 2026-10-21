@@ -72,8 +72,6 @@ func (a *app) titleBar(c *ui.Context) {
 		if toggle.Clicked() {
 			a.navCollapsed = !a.navCollapsed
 		}
-		// 应用图标占位：强调色圆角方块。
-		ui.Box(c).Size(16, 16).Radius(4).Background(t.Accent)
 		ui.Text(c, "Kanade").FontSize(12)
 	})
 }

@@ -401,7 +401,7 @@ func (c *Conductor) execute(j *Job) {
 		return
 	}
 
-	outDir := filepath.Join(c.layout.Outputs, j.Engine)
+	outDir := filepath.Join(c.layout.Scratch, j.Engine)
 	c.update(j, func(j *Job) { j.State, j.Message = JobRunning, "已提交给 worker" })
 	if err := w.Run(j.ID, j.Task, j.Params, outDir); err != nil {
 		c.fail(j, fmt.Errorf("发送任务: %w", err))

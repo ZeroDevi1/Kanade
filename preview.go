@@ -4,7 +4,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/audio"
 	"github.com/egoist/mygo/ui"
 
@@ -54,7 +53,8 @@ func (pv *audioPreview) load(a *app, path string) {
 }
 
 // show 构建预览：文件名、播放按钮、时间与波形。没有文件时显示 empty。
-func (pv *audioPreview) show(c *ui.Context, tk *fluent.Tokens, empty string) {
+// actions 在播放按钮之后构建额外的按钮（例如保存），可为 nil。
+func (pv *audioPreview) show(c *ui.Context, tk *fluent.Tokens, empty string, actions func()) {
 	t := c.Theme()
 	if pv.path == "" {
 		ui.Text(c, empty).TextColor(t.TextMuted)
@@ -80,9 +80,8 @@ func (pv *audioPreview) show(c *ui.Context, tk *fluent.Tokens, empty string) {
 				}
 			}
 		}
-		if ui.Button(c, "在文件夹中显示").Clicked() {
-			dir := filepath.Dir(pv.path)
-			go func() { _ = mygo.Shell.OpenPath(dir) }()
+		if actions != nil {
+			actions()
 		}
 	})
 	if pv.err != "" {

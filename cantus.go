@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
-	"strconv"
+	"strings"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -44,24 +44,45 @@ type cantusState struct {
 	// models 是内置模型与训练出的 SFT 模型，speakersStale 置位时一并刷新。
 	models []cantus.Model
 
-	// SFT 训练。
-	sftName, sftDataset, sftASR, sftPart, sftEpochs, sftScope string
-	sftSummary                                      *dataset.Summary
-	sftPrepareJob, sftTrainJob                      string
-	sftScanned                                      string // 已为其刷新过模型列表的训练任务
+	// synthMode 为 modeSmart 时推理模式按输入自动选择（cantus.SmartMode），只填音色、文本与可选风格。
+	synthMode int
+	style     string // 智能模式的风格，styleNone 或 cantus.InstructPresets 之一
+	// 专业模式的随机种子与 LLM 采样参数。
+	seedFixed   bool
+	seed        float64
+	samplingOn  bool
+	sampling    cantus.Sampling
+	samplingTop float64 // ui.NumberInput 只编辑 float64，提交时转为整数
+	samplingWin float64
+
+	// SFT 训练。sftMode 为 modeSmart 时一键完成准备与训练（缺文本用 cantus.SFTSmartASR 转写，层数按显存）。
+	sftMode                      int
+	sftName, sftDataset, sftASR  string
+	sftPart, sftScope            string
+	sftEpochs, sftLR, sftWorkers float64
+	sftDevRatio                  float64
+	sftSummary                   *dataset.Summary
+	sftPrepareJob, sftTrainJob   string
+	sftChain                     string // 智能模式：完成后自动开始训练的准备任务
+	sftScanned                   string // 已为其刷新过模型列表的训练任务
 
 	job       string            // 最近提交的合成任务
+	jobName   string            // 最近提交任务结果的建议文件名
 	downloads map[string]string // 模型 Key → 下载任务 ID
-	results   []string          // 本次运行生成的文件，最新在前
-	preview   audioPreview
+	results   resultSet
 	err       string
 }
+
+// styleNone 是智能模式风格下拉框中的「不指定」。
+const styleNone = "自然（不指定风格）"
 
 func newCantusState() cantusState {
 	return cantusState{speed: 1, textFrontend: true, voice: voiceFromFile, spkID: cantus.SFTSpeakers[0],
 		source: sourceTitles[0], speakersStale: true, downloads: map[string]string{}, models: cantus.Models,
-		sftASR: cantus.ASRModels[0], sftPart: cantus.SFTParts[0].Title, sftEpochs: "30",
-		sftScope: cantus.SFTLLMScopes[0].Title}
+		sftASR: cantus.ASRModels[0], sftPart: cantus.SFTParts[0].Title, sftEpochs: 30, sftLR: 1e-5, sftWorkers: 4,
+		sftDevRatio: 0.05, sftScope: cantus.SFTLLMScopes[0].Title, style: styleNone,
+		sampling: cantus.DefaultSampling, samplingTop: float64(cantus.DefaultSampling.TopK),
+		samplingWin: float64(cantus.DefaultSampling.WinSize), seed: 1986}
 }
 
 func (s *cantusState) model() cantus.Model {
@@ -73,8 +94,17 @@ func (s *cantusState) model() cantus.Model {
 	return cantus.Models[0]
 }
 
+// mode 返回当前推理模式：专业模式为用户所选，智能模式按音色、参考文本与风格自动选择。
 func (s *cantusState) mode() cantus.Mode {
-	modes := s.model().Modes()
+	m := s.model()
+	if s.synthMode == modeSmart {
+		hasText := strings.TrimSpace(s.promptText) != ""
+		if s.voice != voiceFromFile {
+			hasText = s.speaker() != nil && s.speaker().PromptText != ""
+		}
+		return cantus.SmartMode(m, hasText, s.style != styleNone)
+	}
+	modes := m.Modes()
 	return modes[min(s.modeIdx, len(modes)-1)]
 }
 
@@ -186,63 +216,158 @@ func (a *app) downloadModel(m cantus.Model) {
 
 // cantusInputCard 显示当前模型支持的模式与对应输入，并提交合成任务。
 func (a *app) cantusInputCard(c *ui.Context, tk *fluent.Tokens) {
-	t := c.Theme()
 	s := &a.cantus
 	m := s.model()
 	card(c, tk, "合成", func() {
-		modes := m.Modes()
-		labels := make([]string, len(modes))
-		for i, md := range modes {
-			labels[i] = cantus.ModeTitle[md]
-		}
-		s.modeIdx = min(s.modeIdx, len(modes)-1)
-		if ui.Segmented(c, &s.modeIdx, labels...).Label("推理模式").Changed() {
-			s.err = ""
-		}
-		mode := s.mode()
-		ui.Text(c, modeHint(m, mode)).FontSize(12).TextColor(t.TextMuted)
-
-		usesSpk := mode == cantus.ModeSFT || (mode == cantus.ModeInstruct && m.Family == cantus.FamilyV1Instruct)
-		if usesSpk {
-			spks := m.SpeakerList()
-			if !slices.Contains(spks, s.spkID) {
-				s.spkID = spks[0]
-			}
-			ui.Select(c, &s.spkID, spks).Label("预训练音色").Width(200)
-			if m.Family == cantus.FamilyV3SFT {
-				ui.TextInput(c, &s.instruct).Label("风格引导（可选）").Placeholder("例如：请非常开心地说一句话。留空则只用音色本身")
-			}
+		modeSwitch(c, "synth-mode", &s.synthMode, "只需选音色、填文本；按是否有参考文本与风格自动选择克隆方式。")
+		if s.synthMode == modeSmart {
+			a.cantusSmartInput(c, tk, m)
 		} else {
-			a.cantusVoice(c, tk, mode)
+			a.cantusProInput(c, tk, m)
 		}
-		if mode == cantus.ModeVC {
-			a.audioPicker(c, "源音频", &s.sourceWav, directAudioExts)
-		}
-		if mode == cantus.ModeInstruct {
-			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-				ui.TextInput(c, &s.instruct).Label("指令").Placeholder("例如：请用四川话表达。").Grow(1)
-				presets := append([]string{"常用指令…"}, cantus.InstructPresets...)
-				if s.preset == "" {
-					s.preset = presets[0]
-				}
-				if ui.Select(c, &s.preset, presets).Label("常用指令").Width(220).Changed() && s.preset != presets[0] {
-					s.instruct = s.preset
-				}
-			})
-		}
-		if mode != cantus.ModeVC {
+		if s.mode() != cantus.ModeVC {
 			ui.TextArea(c, &s.text).Label("要合成的文本").Placeholder("输入文本，长文本会按句切分后依次合成").Height(120)
 		}
-		ui.Row(c).Gap(16).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "语速").FontSize(12)
-			ui.Slider(c, &s.speed, cantus.MinSpeed, cantus.MaxSpeed).Label("语速").Width(200)
-			ui.Textf(c, "%.2f×", s.speed).FontSize(12).Font("monospace").Width(48)
-			if mode != cantus.ModeVC {
-				ui.Checkbox(c, &s.textFrontend, "文本归一化（数字、符号读法）")
-			}
-		})
+		if s.synthMode == modePro {
+			a.cantusProTuning(c)
+		}
 		a.cantusSubmitRow(c)
 	})
+}
+
+// cantusSmartInput 是智能模式的输入：音色（或预训练音色）与可选风格。
+func (a *app) cantusSmartInput(c *ui.Context, tk *fluent.Tokens, m cantus.Model) {
+	t := c.Theme()
+	s := &a.cantus
+	if m.Supports(cantus.ModeSFT) || m.Family == cantus.FamilyV1Instruct {
+		spks := m.SpeakerList()
+		if !slices.Contains(spks, s.spkID) {
+			s.spkID = spks[0]
+		}
+		if len(spks) > 1 {
+			ui.Select(c, &s.spkID, spks).Label("预训练音色").Width(200)
+		}
+	} else {
+		a.cantusVoice(c, tk, cantus.ModeZeroShot)
+	}
+	if m.Supports(cantus.ModeInstruct) {
+		styles := append([]string{styleNone}, cantus.InstructPresets...)
+		if m.Family == cantus.FamilyV1Instruct {
+			styles = styles[1:] // CosyVoice 1 指令模型必须给出指令
+			if s.style == styleNone {
+				s.style = styles[0]
+			}
+		}
+		ui.Select(c, &s.style, styles).Label("风格").Width(300)
+	}
+	ui.Text(c, "当前将使用："+cantus.ModeTitle[s.mode()]+"。"+smartHint(s.mode())).FontSize(12).TextColor(t.TextMuted)
+}
+
+// smartHint 说明智能模式为何选了该模式，以及怎样切换到效果更好的模式。
+func smartHint(mode cantus.Mode) string {
+	switch mode {
+	case cantus.ModeCrossLingual:
+		return "填写参考音频说的话后会改用零样本克隆，同语种时音色更像。"
+	case cantus.ModeZeroShot:
+		return "参考音频与目标文本语种不同时，清空参考文本可改用跨语种复刻。"
+	case cantus.ModeInstruct:
+		return "按所选风格朗读。"
+	}
+	return ""
+}
+
+// cantusProInput 是专业模式的输入：手动选择推理模式与对应的全部输入。
+func (a *app) cantusProInput(c *ui.Context, tk *fluent.Tokens, m cantus.Model) {
+	t := c.Theme()
+	s := &a.cantus
+	modes := m.Modes()
+	labels := make([]string, len(modes))
+	for i, md := range modes {
+		labels[i] = cantus.ModeTitle[md]
+	}
+	s.modeIdx = min(s.modeIdx, len(modes)-1)
+	if ui.Segmented(c, &s.modeIdx, labels...).Label("推理模式").Changed() {
+		s.err = ""
+	}
+	mode := s.mode()
+	ui.Text(c, modeHint(m, mode)).FontSize(12).TextColor(t.TextMuted)
+
+	usesSpk := mode == cantus.ModeSFT || (mode == cantus.ModeInstruct && m.Family == cantus.FamilyV1Instruct)
+	if usesSpk {
+		spks := m.SpeakerList()
+		if !slices.Contains(spks, s.spkID) {
+			s.spkID = spks[0]
+		}
+		ui.Select(c, &s.spkID, spks).Label("预训练音色").Width(200)
+		if m.Family == cantus.FamilyV3SFT {
+			ui.TextInput(c, &s.instruct).Label("风格引导（可选）").Placeholder("例如：请非常开心地说一句话。留空则只用音色本身")
+		}
+	} else {
+		a.cantusVoice(c, tk, mode)
+	}
+	if mode == cantus.ModeVC {
+		a.audioPicker(c, "源音频", &s.sourceWav, directAudioExts)
+	}
+	if mode == cantus.ModeInstruct {
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.TextInput(c, &s.instruct).Label("指令").Placeholder("例如：请用四川话表达。").Grow(1)
+			presets := append([]string{"常用指令…"}, cantus.InstructPresets...)
+			if s.preset == "" {
+				s.preset = presets[0]
+			}
+			if ui.Select(c, &s.preset, presets).Label("常用指令").Width(220).Changed() && s.preset != presets[0] {
+				s.instruct = s.preset
+			}
+		})
+	}
+}
+
+// cantusProTuning 是专业模式的语速、文本归一化、随机种子与 LLM 采样参数。
+func (a *app) cantusProTuning(c *ui.Context) {
+	t := c.Theme()
+	s := &a.cantus
+	mode := s.mode()
+	ui.Row(c).Gap(16).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, "语速").FontSize(12)
+		ui.Slider(c, &s.speed, cantus.MinSpeed, cantus.MaxSpeed).Label("语速").Width(200)
+		ui.Textf(c, "%.2f×", s.speed).FontSize(12).Font("monospace").Width(48)
+		if mode != cantus.ModeVC {
+			ui.Checkbox(c, &s.textFrontend, "文本归一化（数字、符号读法）")
+		}
+	})
+	if mode == cantus.ModeVC {
+		return
+	}
+	ui.Row(c).Gap(12).AlignItems(ui.End).Children(func() {
+		ui.Checkbox(c, &s.seedFixed, "固定随机种子")
+		if s.seedFixed {
+			ui.Field(c, "种子", func() { ui.NumberInput(c, &s.seed, 0, 2147483647, 1).Width(140) })
+		}
+		ui.Checkbox(c, &s.samplingOn, "自定义采样参数")
+	})
+	ui.Text(c, "不固定种子时，微调模型默认用种子 1986，其他模型每次随机；固定后同样的输入得到同样的结果，便于对比参数。").
+		FontSize(12).TextColor(t.TextMuted)
+	if !s.samplingOn {
+		return
+	}
+	ui.Row(c).Gap(12).AlignItems(ui.End).Children(func() {
+		ui.Field(c, "top_p", func() { ui.NumberInput(c, &s.sampling.TopP, 0.05, 1, 0.05).Width(100) })
+		ui.Field(c, "top_k", func() { ui.NumberInput(c, &s.samplingTop, 1, 200, 1).Width(100) })
+		ui.Field(c, "重复窗口", func() { ui.NumberInput(c, &s.samplingWin, 1, 100, 1).Width(100) })
+		ui.Field(c, "重复阈值 tau_r", func() { ui.NumberInput(c, &s.sampling.TauR, 0, 1, 0.05).Width(110) })
+		if ui.Button(c, "模型默认").Clicked() {
+			s.setSampling(cantus.DefaultSampling)
+		}
+		if ui.Button(c, "微调保守").Clicked() {
+			s.setSampling(cantus.SFTSampling)
+		}
+	})
+	ui.Text(c, "top_p / top_k 越小越稳定、越单调；重复窗口内同一 token 占比超过 tau_r 时改为随机采样，防止卡在重复上。").
+		FontSize(12).TextColor(t.TextMuted)
+}
+
+func (s *cantusState) setSampling(v cantus.Sampling) {
+	s.sampling, s.samplingTop, s.samplingWin = v, float64(v.TopK), float64(v.WinSize)
 }
 
 // modeHint 是各模式的一句用法说明，内容取自上游 WebUI 与 example.py。
@@ -286,7 +411,9 @@ func (a *app) cantusVoice(c *ui.Context, tk *fluent.Tokens, mode cantus.Mode) {
 		return
 	}
 	a.audioPicker(c, "参考音频", &s.promptWav, directAudioExts)
-	if mode == cantus.ModeZeroShot || mode == cantus.ModeInstruct {
+	if s.synthMode == modeSmart {
+		ui.TextInput(c, &s.promptText).Label("参考音频的文本").Placeholder("可选：参考音频里说的话，填写后同语种克隆更像")
+	} else if mode == cantus.ModeZeroShot || mode == cantus.ModeInstruct {
 		ui.TextInput(c, &s.promptText).Label("参考音频的文本").Placeholder("参考音频里说的话，零样本克隆必填")
 	}
 	if s.promptWav != "" {
@@ -375,13 +502,9 @@ func (a *app) cantusSubmitRow(c *ui.Context) {
 	if s.err != "" {
 		ui.Text(c, s.err).FontSize(12).TextColor(t.Danger)
 	}
-	// 只在任务刚完成时登记一次结果：结果列表首项已是该输出则跳过。
+	// 任务完成后登记结果（resultSet 按路径去重，只登记一次）。
 	if job.State == conductor.JobDone && len(job.Artifacts) > 0 {
-		out := job.Artifacts[0]
-		if len(s.results) == 0 || s.results[0] != out {
-			s.results = append([]string{out}, s.results...)
-			s.preview.load(a, out)
-		}
+		s.results.add(a, job.Artifacts[0], s.jobName, s.jobName, true)
 	}
 }
 
@@ -395,6 +518,23 @@ func (a *app) submitCantus() {
 	if s.voice != voiceFromFile {
 		r.Speaker = s.speaker()
 	}
+	if s.synthMode == modeSmart {
+		// 智能模式：语速 1×、文本归一化开、采样与种子用引擎默认；风格作为指令。
+		r.Speed, r.TextFrontend, r.Instruct = 1, true, ""
+		if r.Mode == cantus.ModeInstruct {
+			r.Instruct = s.style
+		}
+	} else {
+		if s.seedFixed {
+			seed := int(s.seed)
+			r.Seed = &seed
+		}
+		if s.samplingOn {
+			sp := s.sampling
+			sp.TopK, sp.WinSize = int(s.samplingTop), int(s.samplingWin)
+			r.Sampling = &sp
+		}
+	}
 	params, err := r.Params(a.be.layout)
 	if err != nil {
 		s.err = err.Error()
@@ -406,25 +546,31 @@ func (a *app) submitCantus() {
 		return
 	}
 	s.job, s.err = id, ""
+	s.jobName = cantusResultName(r)
 }
 
-// cantusResults 显示当前预览与本次运行生成的文件列表，点击切换预览。
+// cantusResultName 是合成结果的建议文件名：<音色>_<文本开头>。
+func cantusResultName(r cantus.Request) string {
+	voice := r.SpkID
+	switch {
+	case r.Speaker != nil:
+		voice = r.Speaker.Name
+	case r.Mode != cantus.ModeSFT && r.PromptWav != "":
+		voice = strings.TrimSuffix(filepath.Base(r.PromptWav), filepath.Ext(r.PromptWav))
+	}
+	text := []rune(strings.Join(strings.Fields(r.Text), ""))
+	if r.Mode == cantus.ModeVC {
+		text = []rune(strings.TrimSuffix(filepath.Base(r.SourceWav), filepath.Ext(r.SourceWav)))
+	}
+	if len(text) > 16 {
+		text = text[:16]
+	}
+	return voice + "_" + string(text)
+}
+
+// cantusResults 显示当前预览与本次运行生成的文件列表。
 func (a *app) cantusResults(c *ui.Context, tk *fluent.Tokens) {
-	s := &a.cantus
-	s.preview.show(c, tk, "生成的音频会显示在这里。")
-	if len(s.results) < 2 {
-		return
-	}
-	ui.Text(c, "本次生成").FontSize(12).TextColor(c.Theme().TextMuted)
-	for _, p := range s.results {
-		b := ui.Button(c.Key("result-"+p), filepath.Base(p))
-		if p == s.preview.path {
-			b = b.Disabled(true)
-		}
-		if b.Clicked() {
-			s.preview.load(a, p)
-		}
-	}
+	a.cantus.results.show(c, tk, a, "生成的音频会显示在这里。")
 }
 
 // cantusSpeakersCard 列出已保存音色，可删除。
@@ -467,14 +613,15 @@ func (a *app) cantusSpeakersCard(c *ui.Context, tk *fluent.Tokens) {
 
 // cantusSFTCard 是 CosyVoice 3 说话人微调：准备数据（文本取自 .list，缺失时可用 Whisper 转写）→ 训练 → 组装模型。
 // 训练需要 NVIDIA CUDA；微调出的模型以「<音色名>（微调音色）」出现在模型列表，使用预训练音色模式。
+// 智能模式一键完成两步：准备任务成功后自动提交训练。
 func (a *app) cantusSFTCard(c *ui.Context, tk *fluent.Tokens) {
 	t := c.Theme()
 	s := &a.cantus
-	l := a.be.layout
 	card(c, tk, "说话人微调（SFT）", func() {
 		ui.Text(c, "用几百条带文本的干净人声，把一个说话人微调进 Fun-CosyVoice 3。数据集目录中的同名 .list 提供文本；"+
 			"训练需要 NVIDIA CUDA（数据准备可在本机完成）。").FontSize(12).TextColor(t.TextMuted)
-		ui.TextInput(c, &s.sftName).Label("音色名").Placeholder("例如 xuan").Width(240)
+		modeSwitch(c, "sft-mode", &s.sftMode, "缺文本时用 Whisper medium 转写，只训 LLM，训练层数按显存自动选择。")
+		ui.Field(c, "音色名", func() { ui.TextInput(c, &s.sftName).Placeholder("例如 xuan").Width(240) })
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "数据集").FontSize(12).Width(64)
 			name := "未选择"
@@ -502,61 +649,103 @@ func (a *app) cantusSFTCard(c *ui.Context, tk *fluent.Tokens) {
 			}
 			ui.Text(c, text).FontSize(12).TextColor(t.TextMuted)
 		}
-		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Select(c, &s.sftASR, cantus.ASRModels).Label("缺文本时转写").Width(160)
-			_, preparing := a.jobStatusPeek(s.sftPrepareJob)
-			if ui.Button(c, "1. 准备数据").Disabled(preparing).Clicked() {
-				params, err := cantus.SFTPrepareParams(l, s.sftName, s.sftDataset, s.sftASR)
-				if err == nil {
-					s.sftPrepareJob, err = a.be.cond.Submit(cantus.Engine, "cosyvoice.sft_prepare", params)
-				}
-				s.err = errText(err)
+		_, preparing := a.jobStatusPeek(s.sftPrepareJob)
+		_, training := a.jobStatusPeek(s.sftTrainJob)
+		if s.sftMode == modeSmart {
+			if ui.PrimaryButton(c, "开始微调").Disabled(preparing || training || s.sftChain != "").Clicked() {
+				a.submitSFTPrepare(true)
 			}
-		})
-		if j, _ := a.jobStatus(c, s.sftPrepareJob); j.State == conductor.JobDone {
-			ui.Text(c, j.Message).FontSize(12).TextColor(t.Success)
+		} else {
+			a.cantusSFTPro(c, preparing, training)
 		}
-		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			parts := make([]string, len(cantus.SFTParts))
-			for i, p := range cantus.SFTParts {
-				parts[i] = p.Title
+		pj, _ := a.jobStatus(c, s.sftPrepareJob)
+		if pj.State == conductor.JobDone {
+			ui.Text(c, pj.Message).FontSize(12).TextColor(t.Success)
+		}
+		// 智能模式的第二步：准备成功后自动提交训练；准备失败或取消时结束链条。
+		if s.sftChain != "" && s.sftChain == s.sftPrepareJob && pj.State.Finished() {
+			s.sftChain = ""
+			if pj.State == conductor.JobDone {
+				a.submitSFTTrain(false)
 			}
-			ui.Select(c, &s.sftPart, parts).Label("训练部分").Width(200)
-			scopes := make([]string, len(cantus.SFTLLMScopes))
-			for i, sc := range cantus.SFTLLMScopes {
-				scopes[i] = sc.Title
-			}
-			ui.Select(c, &s.sftScope, scopes).Label("LLM 训练范围").Width(220)
-			ui.TextInput(c, &s.sftEpochs).Label("轮数").Width(80)
-			_, training := a.jobStatusPeek(s.sftTrainJob)
-			if ui.PrimaryButton(c, "2. 开始训练").Disabled(training).Clicked() {
-				part := "llm"
-				for _, p := range cantus.SFTParts {
-					if p.Title == s.sftPart {
-						part = p.Key
-					}
-				}
-				layers := cantus.SFTLLMScopes[0].Layers
-				for _, sc := range cantus.SFTLLMScopes {
-					if sc.Title == s.sftScope {
-						layers = sc.Layers
-					}
-				}
-				epochs, err := strconv.Atoi(s.sftEpochs)
-				var params map[string]any
-				if err == nil {
-					params, err = cantus.SFTTrainParams(l, s.sftName, part, epochs, layers)
-				} else {
-					err = fmt.Errorf("轮数须为整数")
-				}
-				if err == nil {
-					s.sftTrainJob, err = a.be.cond.Submit(cantus.Engine, "cosyvoice.sft_train", params)
-				}
-				s.err = errText(err)
-			}
-		})
+		}
 		if j, _ := a.jobStatus(c, s.sftTrainJob); j.State == conductor.JobDone && s.sftScanned != s.sftTrainJob {
 			s.sftScanned, s.speakersStale = s.sftTrainJob, true
+			ui.Text(c, "微调完成，模型已出现在模型列表中。").FontSize(12).TextColor(t.Success)
 		}
 	})
+}
+
+// cantusSFTPro 是专业模式的两步：准备数据（转写模型、验证集比例）与训练（部分、层数、轮数、学习率、进程数）。
+func (a *app) cantusSFTPro(c *ui.Context, preparing, training bool) {
+	s := &a.cantus
+	ui.Row(c).Gap(12).AlignItems(ui.End).Children(func() {
+		ui.Field(c, "缺文本时转写", func() { ui.Select(c, &s.sftASR, cantus.ASRModels).Width(140) })
+		ui.Field(c, "验证集比例", func() { ui.NumberInput(c, &s.sftDevRatio, 0.01, 0.5, 0.01).Width(100) })
+		if ui.Button(c, "1. 准备数据").Disabled(preparing).Clicked() {
+			a.submitSFTPrepare(false)
+		}
+	})
+	ui.Row(c).Gap(12).AlignItems(ui.End).Children(func() {
+		ui.Field(c, "训练部分", func() {
+			ui.Select(c, &s.sftPart, titles(cantus.SFTParts, func(p struct{ Key, Title string }) string { return p.Title })).Width(180)
+		})
+		ui.Field(c, "LLM 训练范围", func() {
+			ui.Select(c, &s.sftScope, titles(cantus.SFTLLMScopes, func(sc struct {
+				Layers int
+				Title  string
+			}) string {
+				return sc.Title
+			})).Width(220)
+		})
+	})
+	ui.Row(c).Gap(12).AlignItems(ui.End).Children(func() {
+		ui.Field(c, "轮数", func() { ui.NumberInput(c, &s.sftEpochs, 1, 1000, 1).Width(100) })
+		ui.Field(c, "学习率", func() { ui.NumberInput(c, &s.sftLR, 1e-7, 1e-3, 1e-6).Width(120) })
+		ui.Field(c, "数据加载进程", func() { ui.NumberInput(c, &s.sftWorkers, 1, 32, 1).Width(100) })
+		if ui.PrimaryButton(c, "2. 开始训练").Disabled(training).Clicked() {
+			a.submitSFTTrain(true)
+		}
+	})
+}
+
+// submitSFTPrepare 提交数据准备；chain 为 true（智能模式）时准备成功后自动开始训练。
+func (a *app) submitSFTPrepare(chain bool) {
+	s := &a.cantus
+	asr, dev := s.sftASR, s.sftDevRatio
+	if chain {
+		asr, dev = cantus.SFTSmartASR, 0
+	}
+	params, err := cantus.SFTPrepareParams(a.be.layout, s.sftName, s.sftDataset, asr, dev)
+	if err == nil {
+		s.sftPrepareJob, err = a.be.cond.Submit(cantus.Engine, "cosyvoice.sft_prepare", params)
+	}
+	s.err = errText(err)
+	if err == nil && chain {
+		s.sftChain = s.sftPrepareJob
+	}
+}
+
+// submitSFTTrain 提交训练。pro 为 false 时使用智能模式的参数：只训 LLM、按显存选层数、30 轮。
+func (a *app) submitSFTTrain(pro bool) {
+	s := &a.cantus
+	t := cantus.SFTTrain{Name: s.sftName, Part: "llm", Epochs: 30, LLMLayers: -1}
+	if pro {
+		for _, p := range cantus.SFTParts {
+			if p.Title == s.sftPart {
+				t.Part = p.Key
+			}
+		}
+		for _, sc := range cantus.SFTLLMScopes {
+			if sc.Title == s.sftScope {
+				t.LLMLayers = sc.Layers
+			}
+		}
+		t.Epochs, t.LR, t.Workers = int(s.sftEpochs), s.sftLR, int(s.sftWorkers)
+	}
+	params, err := cantus.SFTTrainParams(a.be.layout, t)
+	if err == nil {
+		s.sftTrainJob, err = a.be.cond.Submit(cantus.Engine, "cosyvoice.sft_train", params)
+	}
+	s.err = errText(err)
 }
