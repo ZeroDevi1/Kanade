@@ -13,12 +13,32 @@ type MelodyNote struct {
 	Start float64 `json:"start"`
 	End   float64 `json:"end"`
 	Pitch float64 `json:"pitch"` // MIDI 音高，可含微分音
+	// Lyric 是该音唱的字（一个字的第一个音）；Slur 为 true 表示同一个字的后续音（连音）。两者都为空的音没有歌词。
+	// 只有分析时给了 LRC 歌词才有。
+	Lyric string `json:"lyric,omitempty"`
+	Slur  bool   `json:"slur,omitempty"`
 }
 
 // Melody 是引擎输出的旋律线。
 type Melody struct {
 	Notes  []MelodyNote `json:"notes"`
 	Source string       `json:"source"`
+	// Lyrics 是歌词对齐的概况；分析时没有歌词则为 nil。
+	Lyrics *MelodyLyrics `json:"lyrics,omitempty"`
+}
+
+// MelodyLyrics 是引擎的逐字对齐结果。
+type MelodyLyrics struct {
+	Source string `json:"source"` // LRC 文件路径
+	Words  []struct {
+		Text  string  `json:"text"`
+		Line  int     `json:"line"`  // 所在歌词行（从 0 起）
+		Start float64 `json:"start"` // 对齐出的起止时间（秒）
+		End   float64 `json:"end"`
+	} `json:"words"`
+	Matched int    `json:"matched"` // 分到音符的字数；其余的字没有对应的识别音符
+	Note    string `json:"note"`    // 非空时说明对齐放宽了哪些约束（结果可信度较低）
+	Method  string `json:"method"`  // 字与音符的对应方法（SlurModels 的 Key）；旧记录为空，即 align
 }
 
 // MelodySubdiv 是量化网格：每拍分为 2 格（八分音符）。更细的网格（十六分）在人声识别误差下会写出大量碎音符。
@@ -47,6 +67,9 @@ type MelodyItem struct {
 	Rest      bool // 休止符
 	Note      Note // 音高与拼写（Rest 为 false 时有效）
 	TieNext   bool // 与下一个同音符用连音线相连（时值拆分或跨小节）
+	// Lyric 是写在音符下的字（只在一个音的第一段上）；Slur 为 true 表示该音是前一个字的连音。
+	Lyric string
+	Slur  bool
 	// Start、End 是对应的实际时间（秒），用于播放高亮。
 	Start, End float64
 }
@@ -67,9 +90,13 @@ func (a *Analysis) MelodyLayout(ms []Measure, transpose int, flats bool) []Melod
 		return nil
 	}
 	// 1. 量化：起止时间换算到网格（四舍五入），单音化（后一个音开始时截断前一个），去掉长度为 0 的音。
+	//    快速的转音在八分音符网格上常量化到同一格：同时开始的音只留一个，通常是第一个；但后一个音带字而前一个
+	//    只是连音时留后一个，避免丢字。
 	type qn struct {
 		s, e  int
 		pitch int
+		lyric string
+		slur  bool
 	}
 	var qs []qn
 	for _, n := range a.Melody.Notes {
@@ -78,14 +105,17 @@ func (a *Analysis) MelodyLayout(ms []Measure, transpose int, flats bool) []Melod
 		if e <= s {
 			e = s + 1
 		}
-		qs = append(qs, qn{s, e, int(math.Round(n.Pitch)) + transpose})
+		qs = append(qs, qn{s, e, int(math.Round(n.Pitch)) + transpose, n.Lyric, n.Slur})
 	}
 	slices.SortStableFunc(qs, func(x, y qn) int { return x.s - y.s })
 	var mono []qn
 	for _, q := range qs {
 		if n := len(mono); n > 0 && mono[n-1].e > q.s {
 			if mono[n-1].s == q.s {
-				continue // 同时开始的两个音只留第一个
+				if mono[n-1].lyric == "" && q.lyric != "" {
+					mono[n-1] = q
+				}
+				continue
 			}
 			mono[n-1].e = q.s
 		}
@@ -114,7 +144,7 @@ func (a *Analysis) MelodyLayout(ms []Measure, transpose int, flats bool) []Melod
 		hi := lo + len(m.Beats)*MelodySubdiv
 		mm := MelodyMeasure{Slots: hi - lo}
 		cursor := lo
-		emit := func(s, e int, rest bool, pitch int, tieOut bool) {
+		emit := func(s, e int, rest bool, q qn, tieOut bool) {
 			// 拆成可以写出的时值，拆分处用连音线相连。
 			for s < e {
 				l := e - s
@@ -126,8 +156,12 @@ func (a *Analysis) MelodyLayout(ms []Measure, transpose int, flats bool) []Melod
 				}
 				it := MelodyItem{Slot: s - lo, Len: l, Rest: rest, Start: gridTime(s), End: gridTime(s + l)}
 				if !rest {
-					it.Note = spellPitch(pitch, flats)
+					it.Note = spellPitch(q.pitch, flats)
 					it.TieNext = s+l < e || tieOut
+					// 字只写在音的第一段：跨小节或拆分时值后的后续段是连线延续，不再标字。
+					if s == q.s {
+						it.Lyric, it.Slur = q.lyric, q.slur
+					}
 				}
 				mm.Items = append(mm.Items, it)
 				s += l
@@ -140,16 +174,16 @@ func (a *Analysis) MelodyLayout(ms []Measure, transpose int, flats bool) []Melod
 			}
 			s, e := max(q.s, lo), min(q.e, hi)
 			if s > cursor {
-				emit(cursor, s, true, 0, false)
+				emit(cursor, s, true, qn{}, false)
 			}
-			emit(s, e, false, q.pitch, q.e > hi)
+			emit(s, e, false, q, q.e > hi)
 			cursor = e
 			if q.e > hi {
 				break // 跨小节的音在下一小节继续
 			}
 		}
 		if cursor < hi {
-			emit(cursor, hi, true, 0, false)
+			emit(cursor, hi, true, qn{}, false)
 		}
 		out[i] = mm
 	}

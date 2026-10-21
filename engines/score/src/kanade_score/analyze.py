@@ -5,6 +5,7 @@
     input:           歌曲（任意 ffmpeg 可解码的格式）
     harmonic_input:  可选，去掉人声的伴奏；有时调号与和弦用它分析
     melody_input:    可选，分离出的主唱（去和声）；有时用 SOME 识别旋律线
+    lyrics_input:    可选，LRC 歌词；与 melody_input 同时给出时把歌词逐字对到旋律音符上（见 lyrics.py）
     options: {
         beat_method:   "beat_this"（默认）| "librosa"
         tempo_range:   [lo, hi]，可选；BPM 按倍数折叠到区间内（半速 / 倍速误判时用）
@@ -14,10 +15,15 @@
                        | "extended"（模板匹配，加七和弦、减三、挂四）
         chord_self_prob: HMM 自转移概率（0.5–0.99，默认 0.9，越大和弦越不易切换）
         chord_min_beats: 最短和弦（拍），默认 1
+        slur_model:    有歌词时字与音符的对应方法："align"（默认，SOME 音符 + 动态规划分配）| "game"（GAME 按字切分音符，
+                       权重为 CC BY-NC-SA 4.0 非商用许可）
         emotion:       是否做情绪识别，默认 true
     }
 
-melody 为 {notes: [{start, end, pitch}], source}，没有 melody_input 时为 null。
+melody 为 {notes: [{start, end, pitch, lyric?, slur?}], source, lyrics?}，没有 melody_input 时为 null。有歌词时
+lyric 是该音唱的字、slur 为 true 表示同一个字的后续音（连音）；lyrics 为 {source（LRC 路径）, words, matched, note}：
+words 是逐字对齐结果 [{text, line, start, end}]，matched 是分到音符的字数，note 非空时说明对齐放宽了哪些约束，
+method 是字与音符的对应方法（同 options.slur_model）。
 
 输出（任务目录下）：audio.wav（原曲解码为 44.1 kHz WAV，供界面预览）、analysis.json（结构见 run_analyze 末尾的 result）与 chords.lab（MIREX 和弦标注格式：
 起止秒与和弦名，制表符分隔，可导入 Sonic Visualiser 等工具）。
@@ -35,7 +41,7 @@ import soundfile as sf
 
 from kanade_engine import Job, pick_device
 
-from . import btc, emotion, harmony, melody, models, rhythm
+from . import btc, emotion, harmony, lyrics, melody, models, rhythm
 
 SR = 44100
 HOP = 512
@@ -65,6 +71,20 @@ def run_analyze(job: Job) -> None:
     mel_src = Path(p["melody_input"]) if p.get("melody_input") else None
     if mel_src is not None and not mel_src.is_file():
         raise ValueError(f"主唱文件不存在：{mel_src}")
+    lrc_src = Path(p["lyrics_input"]) if p.get("lyrics_input") and mel_src else None
+    lines = []
+    if lrc_src is not None:
+        if not lrc_src.is_file():
+            raise ValueError(f"歌词文件不存在：{lrc_src}")
+        # LRC 常见 UTF-8（可带 BOM）与 GBK 两种编码。
+        raw = lrc_src.read_bytes()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("gbk", errors="replace")
+        lines = lyrics.parse_lrc(text)
+        if not lines:
+            raise ValueError(f"{lrc_src.name} 中没有带时间戳的歌词行")
     o = p.get("options") or {}
     beat_method = o.get("beat_method") or "beat_this"
     if beat_method not in ("beat_this", "librosa"):
@@ -80,10 +100,15 @@ def run_analyze(job: Job) -> None:
     segment_s = float(o.get("key_segment_s", 30) or 0)
     fold = tuple(o["tempo_range"]) if o.get("tempo_range") else None
     want_emotion = o.get("emotion", True)
+    slur_model = o.get("slur_model") or "align"
+    if slur_model not in ("align", "game"):
+        raise ValueError(f"未知的连音方法：{slur_model}")
+    use_game = bool(lines) and slur_model == "game"
 
     # 1. 模型（按需下载）与解码。
     groups = (["beat_this"] if beat_method == "beat_this" else []) + (["clap"] if want_emotion else []) + \
-        (["some"] if mel_src else []) + (["btc"] if vocab == "full" else [])
+        (["some"] if mel_src else []) + (["btc"] if vocab == "full" else []) + (["lyrics"] if lines else []) + \
+        (["game"] if use_game else [])
     models.ensure(job, groups, 0.0, 0.15)
     out_dir = job.output_dir / job.id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -133,7 +158,15 @@ def run_analyze(job: Job) -> None:
     # 4. 旋律（主唱）与情绪（原曲）。
     tune = None
     if vy is not None:
-        tune = {"notes": melody.transcribe(job, vy.mean(axis=1), vsr, 0.58, 0.7), "source": "lead_vocal"}
+        tune = {"notes": melody.transcribe(job, vy.mean(axis=1), vsr, 0.58, 0.66 if lines else 0.7), "source": "lead_vocal"}
+        if lines:
+            words, note = lyrics.align(job, vy.mean(axis=1), vsr, lines, 0.66, 0.68 if use_game else 0.7)
+            if use_game:
+                tune["notes"], lost = lyrics.attach_game(job, vy.mean(axis=1), vsr, words, tune["notes"], 0.68, 0.7)
+            else:
+                tune["notes"], lost = lyrics.attach(tune["notes"], words)
+            tune["lyrics"] = {"source": str(lrc_src), "words": words, "matched": len(words) - lost, "note": note,
+                              "method": slur_model}
     mood = None
     if want_emotion:
         mood = emotion.analyze(job, y.mean(axis=1), sr, 0.7, 0.97)
@@ -152,7 +185,7 @@ def run_analyze(job: Job) -> None:
         "emotion": mood,
         "melody": tune,
         "options": {"beat_method": beat_method, "key_profile": profile, "chord_vocab": vocab,
-                    "chord_self_prob": self_prob, "chord_min_beats": min_beats},
+                    "chord_self_prob": self_prob, "chord_min_beats": min_beats, "slur_model": slur_model},
     }
     js = out_dir / "analysis.json"
     js.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

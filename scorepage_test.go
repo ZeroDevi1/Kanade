@@ -76,6 +76,75 @@ func TestScorePage(t *testing.T) {
 	a.score.runs[0].Cancel()
 }
 
+// 歌词：换歌时自动选用同名 .lrc，找不到则清空；「不用歌词」清除后不再被自动填回。
+func TestScoreLyricsPicker(t *testing.T) {
+	dir := t.TempDir()
+	song, lrc := filepath.Join(dir, "歌.flac"), filepath.Join(dir, "歌.lrc")
+	os.WriteFile(lrc, []byte("[00:01.00]秋天"), 0o644)
+	l := paths.New(t.TempDir())
+	cond, _ := conductor.New(l, engines.FS, nil)
+	a := newApp()
+	a.be, a.current = backend{layout: l, cond: cond}, "score"
+	a.score.input = song
+	tt := ui.NewTester(a.view, 1200, 2400)
+	if a.score.lyrics != lrc || !tt.HasText("歌.lrc") || a.scoreRequest().Lyrics != lrc {
+		t.Fatalf("auto lyrics %q", a.score.lyrics)
+	}
+	tt.Frame() // 选上歌词后模型卡片多出歌词模型一行，等布局稳定再点击
+	if err := tt.Click("不用歌词"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if a.score.lyrics != "" {
+		t.Errorf("cleared lyrics came back: %q", a.score.lyrics)
+	}
+	a.score.input = filepath.Join(dir, "另一首.flac")
+	a.score.lyrics = lrc
+	tt.Frame()
+	if a.score.lyrics != "" {
+		t.Errorf("lyrics kept after switching song: %q", a.score.lyrics)
+	}
+}
+
+// 连音方法：只在专业模式且有歌词时出现；选 GAME 后请求带上 slur_model，模型卡片列出 GAME。
+func TestScoreGameOption(t *testing.T) {
+	dir := t.TempDir()
+	song, lrc := filepath.Join(dir, "歌.flac"), filepath.Join(dir, "歌.lrc")
+	os.WriteFile(lrc, []byte("[00:01.00]秋天"), 0o644)
+	l := paths.New(t.TempDir())
+	cond, _ := conductor.New(l, engines.FS, nil)
+	a := newApp()
+	a.be, a.current = backend{layout: l, cond: cond}, "score"
+	tt := ui.NewTester(a.view, 1200, 3000)
+	if err := tt.Click("专业"); err != nil {
+		t.Fatal(err)
+	}
+	if tt.HasText("连音方法（有歌词时字与音符的对应）") {
+		t.Error("slur option shown without lyrics")
+	}
+	a.score.input = song
+	tt.Frame()
+	tt.Frame()
+	if !tt.HasText("连音方法（有歌词时字与音符的对应）") || tt.HasText("连音（GAME，非商用）") {
+		t.Fatalf("texts %q", tt.Texts())
+	}
+	a.score.slurTitle = score.SlurModels[1].Title
+	tt.Frame()
+	tt.Frame()
+	if !tt.HasText("连音（GAME，非商用）") {
+		t.Errorf("GAME model not listed: %q", tt.Texts())
+	}
+	r := a.scoreRequest()
+	if p, _ := r.Params("", "/v.wav"); r.Options.SlurModel != "game" || p["options"].(map[string]any)["slur_model"] != "game" {
+		t.Errorf("request %+v", r.Options)
+	}
+	// 智能模式不用 GAME。
+	a.score.mode = modeSmart
+	if a.scoreRequest().Options.SlurModel != "" {
+		t.Error("smart mode uses GAME")
+	}
+}
+
 // fileJobs 让分析流水线直接返回给定的 analysis.json。
 type fileJobs struct{ path string }
 
@@ -121,6 +190,40 @@ func TestScoreSheet(t *testing.T) {
 	}
 	if !tt.HasText("𝄞") || !tt.HasText("𝄢") {
 		t.Errorf("staff texts %q", tt.Texts())
+	}
+}
+
+// 五线谱上的歌词：字写在字的第一个音下，并显示对齐概况。
+func TestScoreSheetLyrics(t *testing.T) {
+	js := filepath.Join(t.TempDir(), "analysis.json")
+	os.WriteFile(js, []byte(`{"duration": 4, "beats": [0,0.5,1,1.5,2,2.5,3,3.5], "downbeats": [0,2],
+		"key": {"label": "C 大调", "tonic_pc": 0, "mode": "major"},
+		"chords": [{"start":0,"end":4,"label":"C","root":0,"quality":"maj"}],
+		"melody": {"source": "lead_vocal", "notes": [
+			{"start":0,"end":0.5,"pitch":72,"lyric":"秋"},{"start":0.5,"end":1,"pitch":74,"slur":true},
+			{"start":1,"end":2,"pitch":76,"lyric":"天"}],
+			"lyrics": {"source": "/x/歌.lrc", "words": [{"text":"秋","line":0,"start":0,"end":0.4},
+			{"text":"天","line":0,"start":1,"end":1.5},{"text":"满","line":0,"start":2.5,"end":3}], "matched": 2, "note": ""}}}`), 0o644)
+	l := paths.New(t.TempDir())
+	cond, _ := conductor.New(l, engines.FS, nil)
+	a := newApp()
+	a.be, a.current = backend{layout: l, cond: cond}, "score"
+	run, err := score.Start(fileJobs{js}, score.Request{Input: "/x/歌.flac", Options: score.DefaultOptions()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for run.Snapshot().Running() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	a.score.runs = []*score.Run{run}
+	tt := ui.NewTester(a.view, 1200, 6000)
+	if err := tt.Click("五线谱"); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"秋", "天", "歌词 歌.lrc：2 / 3 个字对上了音符，音符下的横线表示连音。"} {
+		if !tt.HasText(want) {
+			t.Errorf("missing %q in %q", want, tt.Texts())
+		}
 	}
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"path/filepath"
 	"slices"
 	"unicode/utf8"
 
@@ -415,6 +416,17 @@ func (a *app) staffSheet(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, 
 	if melody != nil {
 		t := c.Theme()
 		ui.Text(c, "旋律由主唱识别并量化到八分音符，仅供参考；低音谱表为和弦。").FontSize(12).TextColor(t.TextMuted)
+		if ly := res.Melody.Lyrics; ly != nil {
+			msg := fmt.Sprintf("歌词 %s：%d / %d 个字对上了音符，音符下的横线表示连音。", filepath.Base(ly.Source), ly.Matched, len(ly.Words))
+			if ly.Method == "game" {
+				msg = "连音由 GAME 切分。" + msg
+			}
+			color := t.TextMuted
+			if ly.Note != "" {
+				msg, color = msg+"对齐时"+ly.Note+"，字的位置可能不准。", t.Warning
+			}
+			ui.Text(c, msg).FontSize(12).TextColor(color)
+		}
 	}
 	for r := 0; r < len(ms); r += measuresPerRow {
 		rowEl := ui.Row(c.Key(fmt.Sprintf("staff-row-%d", r))).Height(systemHeight).AlignItems(ui.Stretch)
@@ -530,6 +542,14 @@ func (a *app) staffSheet(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, 
 							}
 							frac := (float32(k) + melodyX(it, mm)) / measuresPerRow
 							accidental(fmt.Sprintf("acc-m-%d-%d", i, it.Slot), it.Note, true, frac)
+							if it.Lyric != "" {
+								// 字居中在符头下方（按一个汉字宽度左移半个字）。
+								txt := ui.Text(c.Key(fmt.Sprintf("lyric-%d-%d", i, it.Slot)), it.Lyric).Absolute().LeftPercent(frac*100).
+									Top(lyricTop).Margin(0, 0, 0, -6.5).FontSize(13).NoWrap()
+								if pos >= it.Start && pos < it.End {
+									txt.TextColor(theme.Accent)
+								}
+							}
 						}
 					}
 				}
@@ -592,6 +612,9 @@ func drawStaffLines(p *ui.Painter, x, y, w float32, color ui.Color) {
 		}
 	}
 }
+
+// lyricTop 是歌词文字的顶端（相对系统顶端）：两行谱表之间，避开高音谱表的下行符干与低音谱表上方的加线。
+const lyricTop = float32(trebleBottom + 1.9*staffGap)
 
 // 符干与符杠的尺寸。
 const (
@@ -679,7 +702,36 @@ func drawMelody(p *ui.Painter, rc ui.Rect, x0, mw float32, mm score.MelodyMeasur
 		p.FillPath(beam, color)
 	}
 
-	// 2. 音符、休止符与连音线。
+	// 2. 歌词延长线：一个字的连音音符下方画一条横线，从字后延伸到它最后一个连音音符；字在前一小节时从小节起点画起。
+	for idx := 0; idx < len(mm.Items); idx++ {
+		it := mm.Items[idx]
+		if it.Rest || it.Lyric == "" && idx > 0 {
+			continue
+		}
+		last := -1
+		for j := idx + 1; j < len(mm.Items) && !mm.Items[j].Rest && mm.Items[j].Lyric == ""; j++ {
+			if mm.Items[j].Slur {
+				last = j
+			}
+		}
+		if it.Slur {
+			last = max(last, idx)
+		}
+		if last < 0 {
+			continue
+		}
+		x1, x2 := xOf(it)+7, xOf(mm.Items[last])+headW/2
+		if it.Lyric == "" {
+			x1 = x0 + 2
+		}
+		if x2 > x1 {
+			y := rc.Y + lyricTop + 15
+			p.Line(x1, y, x2, y, 1, theme.Text.Alpha(0.6))
+		}
+		idx = last
+	}
+
+	// 3. 音符、休止符与连音线。
 	for idx, it := range mm.Items {
 		x := xOf(it)
 		color := theme.Text

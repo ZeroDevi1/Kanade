@@ -32,6 +32,8 @@ type Options struct {
 	ChordSelfProb      float64 // 和弦平滑（HMM 自转移概率），0.5–0.99
 	ChordMinBeats      int     // 最短和弦（拍）
 	Emotion            bool
+	// SlurModel 是有歌词时字与音符的对应方法（SlurModels 之一），空为引擎默认 align。
+	SlurModel string
 }
 
 // 可选值，与引擎一致。Title 用于界面。
@@ -41,6 +43,9 @@ var (
 	ChordVocabs = []struct{ Key, Title string }{
 		{"full", "完整和弦（神经网络，推荐）"}, {"basic", "大小三和弦（模板匹配）"}, {"extended", "含七和弦、减三、挂四（模板匹配）"},
 	}
+	// SlurModels：align 把字分配给 SOME 识别的音符；game 由 GAME 按字切分音符（每个字至少一个音），
+	// 其权重为 CC BY-NC-SA 4.0 非商用许可。
+	SlurModels = []struct{ Key, Title string }{{"align", "SOME + 字音分配（默认）"}, {"game", "GAME 按字切分（非商用许可）"}}
 )
 
 // DefaultOptions 是智能模式使用的参数（引擎默认值）。
@@ -62,7 +67,8 @@ func (o Options) params() (map[string]any, error) {
 		return nil, errors.New("最短和弦与分段长度不能为负")
 	}
 	p := map[string]any{"emotion": o.Emotion, "key_segment_s": o.KeySegmentS}
-	for k, v := range map[string]string{"beat_method": o.BeatMethod, "key_profile": o.KeyProfile, "chord_vocab": o.ChordVocab} {
+	for k, v := range map[string]string{"beat_method": o.BeatMethod, "key_profile": o.KeyProfile, "chord_vocab": o.ChordVocab,
+		"slur_model": o.SlurModel} {
 		if v != "" {
 			p[k] = v
 		}
@@ -85,7 +91,9 @@ type Request struct {
 	Input    string
 	Separate bool
 	// Melody 为 true 时分离出主唱（干声 → 去和声）并识别旋律线；需要两步 GPU 分离。
-	Melody     bool
+	Melody bool
+	// Lyrics 是 LRC 歌词文件，非空且 Melody 为 true 时把歌词逐字对到旋律音符上（连音 / 转音按字分组）。
+	Lyrics     string
 	StemModels map[string]string // 分离伴奏用的模型，见 stems.Recommended
 	Options    Options
 	// History 非空时，成功的分析保存为该目录下的记录（见 HistoryDir），并复用同一首歌已分离的分轨。
@@ -107,6 +115,9 @@ func (r Request) Params(harmonic, melody string) (map[string]any, error) {
 	}
 	if melody != "" {
 		p["melody_input"] = melody
+		if r.Lyrics != "" {
+			p["lyrics_input"] = r.Lyrics
+		}
 	}
 	return p, nil
 }
@@ -127,6 +138,9 @@ var ModelGroups = []ModelGroup{
 	{"clap", "情绪（CLAP）", []string{"clap/clap-htsat-unfused/pytorch_model.bin", "clap/clap-htsat-unfused/config.json"}, 615},
 	{"some", "旋律（SOME）", []string{"some/0119_continuous256_5spk/model_ckpt_steps_100000_simplified.ckpt"}, 435},
 	{"btc", "和弦（BTC）", []string{"btc/btc_model_large_voca.pt"}, 12},
+	{"lyrics", "歌词对齐（wav2vec2）", []string{"lyrics/wav2vec2-large-xlsr-53-chinese-zh-cn/pytorch_model.bin",
+		"lyrics/wav2vec2-large-xlsr-53-chinese-zh-cn/vocab.json"}, 1276},
+	{"game", "连音（GAME，非商用）", []string{"game/GAME-1.0-medium/model.pt", "game/GAME-1.0-medium/config.yaml"}, 185},
 }
 
 // Installed 报告模型组是否已下载。

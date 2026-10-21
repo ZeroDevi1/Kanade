@@ -44,10 +44,17 @@ func TestBarsAndPosition(t *testing.T) {
 }
 
 func TestOptionsValidation(t *testing.T) {
-	r := Request{Input: "/a.flac", Options: DefaultOptions()}
+	r := Request{Input: "/a.flac", Options: DefaultOptions(), Lyrics: "/a.lrc"}
 	p, err := r.Params("/inst.wav", "")
 	if err != nil || p["harmonic_input"] != "/inst.wav" || p["options"].(map[string]any)["beat_method"] != "beat_this" {
 		t.Fatalf("%v %v", p, err)
+	}
+	// 歌词只在有主唱（识别旋律）时传给引擎。
+	if p["lyrics_input"] != nil {
+		t.Errorf("lyrics without melody: %v", p)
+	}
+	if p, _ := r.Params("", "/vocals.wav"); p["lyrics_input"] != "/a.lrc" {
+		t.Errorf("lyrics with melody: %v", p)
 	}
 	r.Options.TempoMin, r.Options.TempoMax = 80, 120 // 上限不足下限 2 倍，无法折叠
 	if _, err := r.Params("", ""); err == nil {

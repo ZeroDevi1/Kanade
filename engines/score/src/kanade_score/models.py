@@ -9,6 +9,11 @@
   经 KANADE_GITHUB_MIRROR 可走镜像。
 - some：openvpi/SOME 的 v1.0.0-baseline 权重（MIT），GitHub release 上的 zip（约 435 MB），下载后解压并删除 zip；
   经 KANADE_GITHUB_MIRROR 可走镜像。
+- lyrics：jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn（Apache-2.0，中文字级 CTC），约 1.28 GB，固定到提交；
+  用于把 LRC 歌词逐字对齐到主唱（见 lyrics.py），经 KANADE_HF_ENDPOINT 可走镜像。
+- game：openvpi/GAME 的 GAME-1.0-medium（约 50M 参数），GitHub release v1.0.0 上的 zip（约 185 MB），下载后解压并删除 zip；
+  经 KANADE_GITHUB_MIRROR 可走镜像。权重为 CC BY-NC-SA 4.0（非商用），只在用户选择 GAME 连音时下载。
+  取 medium 作为体积与精度的折中（small 约 47 MB、large 约 366 MB）。
 """
 
 from __future__ import annotations
@@ -55,7 +60,18 @@ BTC_CKPT = "btc/btc_model_large_voca.pt"
 BTC = [Asset("https://github.com/jayg996/BTC-ISMIR19/raw/2682317be668032e6e4b269ded36adaa2ad57df0/test/btc_model_large_voca.pt",
              BTC_CKPT, 12229576)]
 
-GROUPS = {"beat_this": BEAT_THIS, "clap": CLAP, "some": SOME, "btc": BTC}
+_LYRICS_REPO = "https://huggingface.co/jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn/resolve/99ccb2737be22b8bb50dcfcc39ad4d567fb90cfd"
+LYRICS_DIR = "lyrics/wav2vec2-large-xlsr-53-chinese-zh-cn"
+LYRICS = [Asset(f"{_LYRICS_REPO}/{f}", f"{LYRICS_DIR}/{f}", size) for f, size in (
+    ("config.json", 1567), ("preprocessor_config.json", 158), ("special_tokens_map.json", 85),
+    ("vocab.json", 44357), ("pytorch_model.bin", 1276296151),
+)]
+
+GAME_DIR = "game/GAME-1.0-medium"
+GAME = [Asset("https://github.com/openvpi/GAME/releases/download/v1.0.0/GAME-1.0-medium.zip",
+              "game/game.zip", 184550485, unpacks=f"{GAME_DIR}/model.pt")]
+
+GROUPS = {"beat_this": BEAT_THIS, "clap": CLAP, "some": SOME, "btc": BTC, "lyrics": LYRICS, "game": GAME}
 
 
 def path(asset_local: str) -> Path:

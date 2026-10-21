@@ -22,9 +22,13 @@ type scoreState struct {
 	input    string // 要分析的歌曲
 	separate bool   // 先分离伴奏，调号与和弦基于伴奏分析
 	melody   bool   // 分离主唱并识别旋律线
+	// lyrics 是 LRC 歌词（识别旋律线时逐字对到音符上），空为不用歌词。lyricsFor 是上次自动查找同名 .lrc 时的
+	// 歌曲路径：换歌时重新查找（找不到则清空），用户之后手动选择或清除不会被覆盖。
+	lyrics, lyricsFor string
 	// 专业模式参数。
 	stemChoice                          string // coverStemChoices 之一（与翻唱共用选项）
 	beatTitle, profileTitle, vocabTitle string
+	slurTitle                           string // score.SlurModels 之一的 Title
 	fold                                bool
 	foldMin, foldMax                    float64
 	keySegment                          float64
@@ -48,7 +52,8 @@ type scoreState struct {
 func newScoreState() scoreState {
 	d := score.DefaultOptions()
 	return scoreState{separate: true, melody: true, stemChoice: coverStemChoices[0], beatTitle: score.BeatMethods[0].Title,
-		profileTitle: score.KeyProfiles[0].Title, vocabTitle: score.ChordVocabs[0].Title, foldMin: 70, foldMax: 180,
+		profileTitle: score.KeyProfiles[0].Title, vocabTitle: score.ChordVocabs[0].Title,
+		slurTitle: score.SlurModels[0].Title, foldMin: 70, foldMax: 180,
 		keySegment: d.KeySegmentS, selfProb: d.ChordSelfProb, minBeats: float64(d.ChordMinBeats), emotion: true,
 		sheet: newSheetState()}
 }
@@ -65,7 +70,7 @@ func keyOf(list []struct{ Key, Title string }, title string) string {
 // request 按当前模式组装分析请求：智能模式只有「分离伴奏」一项，其余用引擎默认。
 func (a *app) scoreRequest() score.Request {
 	s := &a.score
-	r := score.Request{Input: s.input, Separate: s.separate, Melody: s.melody, StemModels: stems.Recommended,
+	r := score.Request{Input: s.input, Separate: s.separate, Melody: s.melody, Lyrics: s.lyrics, StemModels: stems.Recommended,
 		Options: score.DefaultOptions(), History: score.HistoryDir(a.be.layout)}
 	if s.mode == modeSmart {
 		return r
@@ -79,6 +84,7 @@ func (a *app) scoreRequest() score.Request {
 	o := &r.Options
 	o.BeatMethod, o.KeyProfile, o.ChordVocab = keyOf(score.BeatMethods, s.beatTitle), keyOf(score.KeyProfiles, s.profileTitle), keyOf(score.ChordVocabs, s.vocabTitle)
 	o.KeySegmentS, o.ChordSelfProb, o.ChordMinBeats, o.Emotion = s.keySegment, s.selfProb, int(s.minBeats), s.emotion
+	o.SlurModel = keyOf(score.SlurModels, s.slurTitle)
 	if s.fold {
 		o.TempoMin, o.TempoMax = s.foldMin, s.foldMax
 	}
@@ -117,14 +123,21 @@ func (a *app) scorePage(c *ui.Context, tk *fluent.Tokens) {
 	}
 }
 
-// scoreModelsCard 显示分析模型的下载状态。
+// scoreModelsCard 显示分析模型的下载状态。歌词对齐模型较大（约 1.3 GB）且只在给了歌词时使用，
+// 只有当前选了歌词才列出；GAME 只在专业模式选了 GAME 连音时列出。
 func (a *app) scoreModelsCard(c *ui.Context, tk *fluent.Tokens) {
 	t := c.Theme()
 	s := &a.score
 	l := a.be.layout
+	groups := score.ModelGroups
+	lyrics := s.melody && s.lyrics != ""
+	game := lyrics && a.scoreRequest().Options.SlurModel == "game"
+	groups = slices.DeleteFunc(slices.Clone(groups), func(g score.ModelGroup) bool {
+		return g.Key == "lyrics" && !lyrics || g.Key == "game" && !game
+	})
 	var missing []any
 	mb := 0
-	for _, g := range score.ModelGroups {
+	for _, g := range groups {
 		if !g.Installed(l) {
 			missing, mb = append(missing, g.Key), mb+g.SizeMB
 		}
@@ -134,7 +147,7 @@ func (a *app) scoreModelsCard(c *ui.Context, tk *fluent.Tokens) {
 		return
 	}
 	card(c, tk, "模型", func() {
-		for _, g := range score.ModelGroups {
+		for _, g := range groups {
 			ui.Row(c.Key("score-model-" + g.Key)).Gap(12).AlignItems(ui.Center).Children(func() {
 				ui.Text(c, g.Title).Width(160)
 				if g.Installed(l) {
@@ -175,6 +188,24 @@ func (a *app) scoreRunCard(c *ui.Context, tk *fluent.Tokens) {
 		a.audioPicker(c, "歌曲", &s.input, anyAudioExts())
 		ui.Checkbox(c, &s.separate, "先分离伴奏再分析调号与和弦（人声会干扰和弦判断）")
 		ui.Checkbox(c, &s.melody, "识别旋律线（分离出主唱后转写成音符，显示在五线谱上）")
+		if s.input != s.lyricsFor {
+			s.lyricsFor, s.lyrics = s.input, ""
+			if lrc := strings.TrimSuffix(s.input, filepath.Ext(s.input)) + ".lrc"; s.input != "" {
+				if st, err := os.Stat(lrc); err == nil && !st.IsDir() {
+					s.lyrics = lrc
+				}
+			}
+		}
+		if s.melody {
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Box(c).Grow(1).Children(func() { a.filePicker(c, "歌词（LRC）", "LRC 歌词", &s.lyrics, []string{"lrc"}) })
+				if s.lyrics != "" && ui.Button(c, "不用歌词").Clicked() {
+					s.lyrics = ""
+				}
+			})
+			ui.Text(c, "有逐行时间的歌词时，旋律音符会按字分组：一个字唱多个音（连音、转音）在五线谱与 MIDI 中归同一个字。"+
+				"默认使用与歌曲同名的 .lrc。").FontSize(12).TextColor(t.TextMuted)
+		}
 		if s.separate || s.melody {
 			var steps []string
 			if s.separate {
@@ -272,6 +303,13 @@ func (a *app) scoreProParams(c *ui.Context) {
 	labeledSlider(c, "和弦平滑", &s.selfProb, 0.5, 0.99, "%.2f")
 	ui.Text(c, "平滑越大，和弦越不容易切换（减少逐拍抖动，但可能漏掉快速换和弦）。").FontSize(12).TextColor(t.TextMuted)
 	ui.Checkbox(c, &s.emotion, "情绪识别（CLAP，首次需下载约 615 MB）")
+	if s.melody && s.lyrics != "" {
+		ui.Field(c, "连音方法（有歌词时字与音符的对应）", func() { ui.Select(c, &s.slurTitle, titlesOf(score.SlurModels)).Width(260) })
+		if keyOf(score.SlurModels, s.slurTitle) == "game" {
+			ui.Text(c, "GAME 在每个字内部切分音符，每个唱出的字至少一个音；首次需下载约 185 MB。"+
+				"其权重为 CC BY-NC-SA 4.0 许可，仅限非商业用途。").FontSize(12).TextColor(t.TextMuted)
+		}
+	}
 }
 
 // scoreSummary 是结果概览：调号、拍号、BPM、情绪，以及导出按钮。

@@ -35,6 +35,7 @@ type record struct {
 	InputMod   time.Time         `json:"input_mod"`
 	Separate   bool              `json:"separate"`
 	Melody     bool              `json:"melody"`
+	Lyrics     string            `json:"lyrics,omitempty"` // LRC 歌词的路径（原位置，不复制）
 	StemModels map[string]string `json:"stem_models,omitempty"`
 	Options    Options           `json:"options"`
 	// Files 是分析产物：analysis、chords、audio。
@@ -115,7 +116,7 @@ func save(root string, r Request, created time.Time, files, stems map[string]str
 		dir = fmt.Sprintf("%s-%d", base, i)
 	}
 	rec := record{Version: 1, Created: created, Input: r.Input, Separate: r.Separate, Melody: r.Melody,
-		StemModels: r.StemModels, Options: r.Options, Files: map[string]string{}, Stems: map[string]string{}}
+		Lyrics: r.Lyrics, StemModels: r.StemModels, Options: r.Options, Files: map[string]string{}, Stems: map[string]string{}}
 	if st, err := os.Stat(r.Input); err == nil {
 		rec.InputSize, rec.InputMod = st.Size(), st.ModTime()
 	}
@@ -218,7 +219,8 @@ func LoadHistory(root string) []*Run {
 		if f := rec.Files["audio"]; f != "" {
 			audio = filepath.Join(dir, f)
 		}
-		req := Request{Input: rec.Input, Separate: rec.Separate, Melody: rec.Melody, StemModels: rec.StemModels, Options: rec.Options}
+		req := Request{Input: rec.Input, Separate: rec.Separate, Melody: rec.Melody, Lyrics: rec.Lyrics,
+			StemModels: rec.StemModels, Options: rec.Options}
 		runs = append(runs, &Run{Request: req, stage: StageDone, result: res, audio: audio, files: files,
 			skipSep: !rec.Separate && !rec.Melody, dir: dir, created: rec.Created, cancel: func() {}, onChange: func() {}})
 	}

@@ -18,6 +18,9 @@ import (
 //     不足 1/4 拍的前奏空白直接并入第一小节（偏移小于 1/4 拍）。
 //   - 匀速的歌（Tempo.Stable）只写一个速度，便于在编辑器中按网格编辑；
 //     有变速的歌每拍写一个速度，逐拍对齐原曲。
+//
+// 有歌词时旋律轨在每个音的按下处写歌词事件（FF 05，UTF-8）：字写在字的第一个音上，连音写 "-"
+// （Synthesizer V、ACE Studio、VOCALOID 的延音记号），导入后连音 / 转音仍归同一个字。
 
 // midiPPQ 是每四分音符的 tick 数：480 是 DAW 与 Synthesizer V 常用的分辨率。
 const midiPPQ = 480
@@ -173,9 +176,21 @@ func (a *Analysis) MIDI() ([]byte, error) {
 	for i := 0; i+1 < len(melody); i++ {
 		melody[i].End = min(melody[i].End, melody[i+1].Start)
 	}
+	melodyTrack := noteTrack("Melody", midiMelodyChannel, melody, tm)
+	if a.Melody != nil {
+		for _, n := range a.Melody.Notes {
+			text := n.Lyric
+			if text == "" && n.Slur {
+				text = "-"
+			}
+			if text != "" {
+				melodyTrack = append(melodyTrack, lyricEvent(tm.tick(n.Start), text))
+			}
+		}
+	}
 	tracks := [][]midiEvent{
 		conductor,
-		noteTrack("Melody", midiMelodyChannel, melody, tm),
+		melodyTrack,
 		noteTrack("Chords", midiChordChannel, chords, tm),
 	}
 
@@ -219,6 +234,15 @@ func noteTrack(name string, ch int, notes []PianoNote, tm *midiTimeMap) []midiEv
 		}
 	}
 	return ev
+}
+
+// lyricEvent 是 tick 处的歌词元事件。order 与音符松开相同、早于按下，读取方把它归给同一 tick 按下的音。
+func lyricEvent(tick int, text string) midiEvent {
+	var b bytes.Buffer
+	b.Write([]byte{0xFF, 0x05})
+	writeVLQ(&b, uint32(len(text)))
+	b.WriteString(text)
+	return midiEvent{tick: tick, order: 2, data: b.Bytes()}
 }
 
 // writeTrack 写一个 MTrk 块：事件按 tick 与 order 排序，时间差用变长数量编码，末尾为音轨结束事件。

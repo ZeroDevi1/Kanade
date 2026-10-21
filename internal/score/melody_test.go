@@ -9,10 +9,10 @@ func TestMelodyLayout(t *testing.T) {
 		a.Beats = append(a.Beats, float64(i)*0.5)
 	}
 	a.Melody = &Melody{Notes: []MelodyNote{
-		{0.0, 0.5, 60.2},  // 第 1 拍：四分音符 C4（音高四舍五入）
-		{0.5, 0.74, 61.9}, // 第 2 拍前半：八分音符 D4
+		{Start: 0.0, End: 0.5, Pitch: 60.2},  // 第 1 拍：四分音符 C4（音高四舍五入）
+		{Start: 0.5, End: 0.74, Pitch: 61.9}, // 第 2 拍前半：八分音符 D4
 		// 第 2 拍后半空：八分休止
-		{1.0, 2.5, 63.0}, // 第 3 拍起 3 拍，跨小节：二分音符连到下一小节的四分音符
+		{Start: 1.0, End: 2.5, Pitch: 63.0}, // 第 3 拍起 3 拍，跨小节：二分音符连到下一小节的四分音符
 	}}
 	ms := a.Measures()
 	lay := a.MelodyLayout(ms, 0, true)
@@ -65,5 +65,46 @@ func TestBeamGroups(t *testing.T) {
 	mm = MelodyMeasure{Slots: 6, Items: []MelodyItem{note(0, 1), note(1, 1), note(2, 1), note(3, 1), note(4, 2)}}
 	if got := mm.BeamGroups(); len(got) != 2 || len(got[0]) != 2 || got[1][0] != 2 {
 		t.Errorf("3/4 groups %v", got)
+	}
+}
+
+// 歌词：字只写在音的第一段（跨小节的后续段不重复），连音标记保留；量化到同一格时被丢掉的音若带字，字移到留下的音上。
+func TestMelodyLayoutLyrics(t *testing.T) {
+	a := &Analysis{Duration: 4, Downbeats: []float64{0, 2}}
+	for i := 0; i < 8; i++ {
+		a.Beats = append(a.Beats, float64(i)*0.5)
+	}
+	a.Melody = &Melody{Notes: []MelodyNote{
+		{Start: 0.0, End: 0.25, Pitch: 72, Lyric: "秋"},
+		{Start: 0.25, End: 0.5, Pitch: 74, Slur: true}, // 连音：秋的第二个音
+		{Start: 0.5, End: 0.55, Pitch: 76, Slur: true}, // 与下一个带字的音量化到同一格，被丢掉
+		{Start: 0.52, End: 1.0, Pitch: 77, Lyric: "天"},
+		{Start: 1.5, End: 2.5, Pitch: 79, Lyric: "满"}, // 跨小节
+	}}
+	lay := a.MelodyLayout(a.Measures(), 0, true)
+	var lyr, names []string
+	var slur []bool
+	for _, mm := range lay {
+		for _, it := range mm.Items {
+			if !it.Rest {
+				lyr, slur, names = append(lyr, it.Lyric), append(slur, it.Slur), append(names, it.Note.String())
+			}
+		}
+	}
+	want := []string{"秋", "", "天", "满", ""}
+	if len(lyr) != len(want) {
+		t.Fatalf("lyrics %q", lyr)
+	}
+	for i := range want {
+		if lyr[i] != want[i] {
+			t.Errorf("lyrics %q, want %q", lyr, want)
+			break
+		}
+	}
+	if names[2] != "F5" {
+		t.Errorf("kept note %s, want the lyric note F5", names[2])
+	}
+	if !slur[1] || slur[2] || slur[4] {
+		t.Errorf("slur flags %v", slur)
 	}
 }

@@ -448,6 +448,11 @@ func anyAudioExts() []string {
 // audioPicker 显示已选文件并提供选择按钮，也可以把文件从 Finder / 资源管理器拖到这一行上。
 // 对话框在后台 goroutine 中打开，选择结果经 post 写回 *path。exts 是可接受的扩展名（directAudioExts 或 anyAudioExts()）。
 func (a *app) audioPicker(c *ui.Context, label string, path *string, exts []string) {
+	a.filePicker(c, label, "音频", path, exts)
+}
+
+// filePicker 同 audioPicker，kind 是对话框文件类型筛选的名称（如「音频」「LRC 歌词」）。
+func (a *app) filePicker(c *ui.Context, label, kind string, path *string, exts []string) {
 	t := c.Theme()
 	tk := fluent.For(t)
 	key := "pick-" + label
@@ -467,7 +472,7 @@ func (a *app) audioPicker(c *ui.Context, label string, path *string, exts []stri
 			go func() {
 				files, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
 					Parent: win, Title: "选择" + label,
-					Filters: []mygo.FileFilter{{Name: "音频", Extensions: exts}},
+					Filters: []mygo.FileFilter{{Name: kind, Extensions: exts}},
 				})
 				if err != nil || len(files) == 0 {
 					return

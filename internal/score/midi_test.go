@@ -155,3 +155,24 @@ func TestMIDIEmpty(t *testing.T) {
 		t.Error("empty analysis exported")
 	}
 }
+
+// 歌词：字写在字的第一个音按下处，连音写 "-"。
+func TestMIDILyrics(t *testing.T) {
+	a := midiSample(true)
+	a.Melody.Notes[0].Lyric = "天"
+	a.Melody.Notes[1].Slur = true
+	data, err := a.MIDI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, tracks := parseMIDI(t, data)
+	got := map[int]string{}
+	for _, e := range tracks[1] {
+		if e.data[0] == 0xFF && e.data[1] == 0x05 {
+			got[e.tick] = string(e.data[3:])
+		}
+	}
+	if len(got) != 2 || got[480] != "天" || got[960] != "-" {
+		t.Errorf("lyric events %v", got)
+	}
+}
