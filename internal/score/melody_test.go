@@ -43,3 +43,27 @@ func TestMelodyLayout(t *testing.T) {
 		t.Errorf("low melody should be written an octave up")
 	}
 }
+
+func TestBeamGroups(t *testing.T) {
+	note := func(slot, l int) MelodyItem { return MelodyItem{Slot: slot, Len: l} }
+	rest := func(slot, l int) MelodyItem { return MelodyItem{Slot: slot, Len: l, Rest: true} }
+	// 4/4：前半小节 4 个八分连成一组；后半小节八分、八分休止、八分、八分 → 休止打断，后两个成组；
+	mm := MelodyMeasure{Slots: 8, Items: []MelodyItem{
+		note(0, 1), note(1, 1), note(2, 1), note(3, 1),
+		note(4, 1), rest(5, 1), note(6, 1), note(7, 1),
+	}}
+	got := mm.BeamGroups()
+	if len(got) != 2 || len(got[0]) != 4 || got[1][0] != 6 || got[1][1] != 7 {
+		t.Errorf("4/4 groups %v", got)
+	}
+	// 跨半小节不连：第 2 拍后半与第 3 拍前半各自独立（单个八分保留符尾）。
+	mm = MelodyMeasure{Slots: 8, Items: []MelodyItem{note(0, 3), note(3, 1), note(4, 1), note(5, 3)}}
+	if got := mm.BeamGroups(); len(got) != 0 {
+		t.Errorf("cross half-bar %v", got)
+	}
+	// 3/4：按单拍分组。
+	mm = MelodyMeasure{Slots: 6, Items: []MelodyItem{note(0, 1), note(1, 1), note(2, 1), note(3, 1), note(4, 2)}}
+	if got := mm.BeamGroups(); len(got) != 2 || len(got[0]) != 2 || got[1][0] != 2 {
+		t.Errorf("3/4 groups %v", got)
+	}
+}

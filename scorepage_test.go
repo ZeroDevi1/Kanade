@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -120,5 +121,84 @@ func TestScoreSheet(t *testing.T) {
 	}
 	if !tt.HasText("𝄞") || !tt.HasText("𝄢") {
 		t.Errorf("staff texts %q", tt.Texts())
+	}
+}
+
+// writeTestWav 写一段静音的 16 bit 立体声 WAV。
+func writeTestWav(t *testing.T, path string, rate, frames int) {
+	t.Helper()
+	data := make([]byte, 44+frames*4)
+	copy(data, "RIFF")
+	binary.LittleEndian.PutUint32(data[4:], uint32(36+frames*4))
+	copy(data[8:], "WAVEfmt ")
+	binary.LittleEndian.PutUint32(data[16:], 16)
+	binary.LittleEndian.PutUint16(data[20:], 1)
+	binary.LittleEndian.PutUint16(data[22:], 2)
+	binary.LittleEndian.PutUint32(data[24:], uint32(rate))
+	binary.LittleEndian.PutUint32(data[28:], uint32(rate*4))
+	binary.LittleEndian.PutUint16(data[32:], 4)
+	binary.LittleEndian.PutUint16(data[34:], 16)
+	copy(data[36:], "data")
+	binary.LittleEndian.PutUint32(data[40:], uint32(frames*4))
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// artifactJobs 让分析流水线直接返回给定的产物。
+type artifactJobs struct{ arts []string }
+
+func (f artifactJobs) Submit(string, string, map[string]any) (string, error) { return "j", nil }
+func (f artifactJobs) Wait(context.Context, string) (conductor.Job, error) {
+	return conductor.Job{State: conductor.JobDone, Artifacts: f.arts}, nil
+}
+func (artifactJobs) Cancel(string) {}
+
+// 分轨混音：独奏旋律时合成钢琴并切到混音结果；取消独奏后回到只播放原曲（原文件的播放器）。
+func TestScoreTrackMixer(t *testing.T) {
+	dir := t.TempDir()
+	wav, js := filepath.Join(dir, "audio.wav"), filepath.Join(dir, "analysis.json")
+	writeTestWav(t, wav, 8000, 16000)
+	os.WriteFile(js, []byte(`{"duration": 2, "beats": [0,0.5,1,1.5], "downbeats": [0],
+		"key": {"label": "C 大调", "tonic_pc": 0, "mode": "major"},
+		"chords": [{"start":0,"end":2,"label":"C","root":0,"quality":"maj"}],
+		"melody": {"notes": [{"start":0,"end":0.5,"pitch":64},{"start":0.5,"end":1,"pitch":67}], "source": "lead_vocal"}}`), 0o644)
+	l := paths.New(t.TempDir())
+	cond, _ := conductor.New(l, engines.FS, nil)
+	a := newApp()
+	a.be, a.current = backend{layout: l, cond: cond}, "score"
+	updates := make(chan func(), 64)
+	a.post = func(fn func()) { updates <- fn }
+	run, _ := score.Start(artifactJobs{[]string{wav, js}}, score.Request{Input: "/x/歌.flac", Options: score.DefaultOptions()}, nil)
+	for run.Snapshot().Running() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	a.score.runs = []*score.Run{run}
+	tt := ui.NewTester(a.view, 1200, 4000)
+	pv := &a.score.preview
+	drain := func(until func() bool) {
+		t.Helper()
+		deadline := time.After(10 * time.Second)
+		for !until() {
+			select {
+			case fn := <-updates:
+				fn()
+				tt.Frame()
+			case <-deadline:
+				t.Fatal("timed out")
+			}
+		}
+	}
+	drain(func() bool { return pv.player != nil })
+	if !tt.HasText("钢琴 · 旋律") || tt.HasText("未识别旋律（分析时勾选「识别旋律线」）") {
+		t.Fatalf("texts %q", tt.Texts())
+	}
+	a.score.sheet.mix.Solo = [score.TrackCount]bool{false, false, true}
+	a.applyMix(run.Snapshot().Result)
+	drain(func() bool { return pv.player != pv.original && a.score.sheet.melodyPCM != nil })
+	a.score.sheet.mix.Solo = [score.TrackCount]bool{}
+	a.applyMix(run.Snapshot().Result)
+	if pv.player != pv.original {
+		t.Error("original-only mix should play the original player")
 	}
 }

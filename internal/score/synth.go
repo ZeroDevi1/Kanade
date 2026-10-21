@@ -14,8 +14,8 @@ const (
 // 旋律的力度：比铺底明显，作为主奏。
 const melodyVelocity = 0.55
 
-// Accompaniment 返回钢琴要弹的音：和弦铺底，withMelody 为 true 且有旋律线时再加上旋律（按识别出的音高与时间）。
-func (a *Analysis) Accompaniment(withMelody bool) []PianoNote {
+// ChordPad 返回和弦铺底要弹的音。
+func (a *Analysis) ChordPad() []PianoNote {
 	var out []PianoNote
 	var prev []int
 	for _, c := range a.Chords {
@@ -42,15 +42,27 @@ func (a *Analysis) Accompaniment(withMelody bool) []PianoNote {
 			}
 		}
 	}
-	if withMelody && a.Melody != nil {
-		for _, n := range a.Melody.Notes {
-			out = append(out, PianoNote{MIDI: int(n.Pitch + 0.5), Start: n.Start, End: n.End, Velocity: melodyVelocity})
-		}
+	return out
+}
+
+// MelodyPiano 返回旋律要弹的音（按识别出的音高与时间）；没有旋律线时为 nil。
+func (a *Analysis) MelodyPiano() []PianoNote {
+	if a.Melody == nil {
+		return nil
+	}
+	out := make([]PianoNote, 0, len(a.Melody.Notes))
+	for _, n := range a.Melody.Notes {
+		out = append(out, PianoNote{MIDI: int(n.Pitch + 0.5), Start: n.Start, End: n.End, Velocity: melodyVelocity})
 	}
 	return out
 }
 
-// SynthPiano 合成全曲的钢琴（和弦铺底，可选加旋律），返回单声道采样（rate Hz），长度与 Duration 一致。
-func (a *Analysis) SynthPiano(rate int, withMelody bool) []float32 {
-	return RenderPiano(a.Accompaniment(withMelody), rate, a.Duration)
+// PianoTracks 分别合成和弦铺底与旋律两条钢琴音轨（单声道，rate Hz，长度与 Duration 一致），供分轨静音 / 独奏混音；
+// 没有旋律线时 melody 为 nil。两条音轨各自按峰值归一化前的同一增益合成，相加时电平关系与一起合成一致。
+func (a *Analysis) PianoTracks(rate int) (chords, melody []float32) {
+	chords = renderRaw(a.ChordPad(), rate, a.Duration)
+	if notes := a.MelodyPiano(); len(notes) > 0 {
+		melody = renderRaw(notes, rate, a.Duration)
+	}
+	return chords, melody
 }

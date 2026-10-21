@@ -379,7 +379,7 @@ func (a *app) scorePlayer(c *ui.Context, tk *fluent.Tokens, res *score.Analysis)
 	t := c.Theme()
 	s := &a.score
 	s.preview.show(c, tk, "", nil)
-	a.scorePlaySource(c, res)
+	a.scoreTracks(c, tk, res)
 	pos, seek := a.scorePosition()
 	bar, beat := res.BarAt(pos)
 	cur, next := "—", ""

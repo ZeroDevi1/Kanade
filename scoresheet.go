@@ -18,12 +18,6 @@ const (
 	sheetStaff        // 五线谱
 )
 
-const (
-	playOriginal = iota // 原曲
-	playChords          // 钢琴（和弦铺底，可加旋律）
-	playBoth            // 原曲 + 钢琴
-)
-
 // symbolStyles 是和弦记号写法的选项（标题 → score.Symbol* 键）。
 var symbolStyles = []struct{ Key, Title string }{
 	{score.SymbolJazz, "爵士记号（CΔ7、C-7）"},
@@ -39,23 +33,26 @@ type sheetState struct {
 	view     int
 	style    string // symbolStyles 的 Title
 	follow   bool   // 播放时自动滚动到当前行
-	play     int    // playOriginal / playChords / playBoth
 	lastRow  int    // 上一帧所在的行，用于只在换行时滚动
 	lastView int    // 上一帧的视图；切换视图后立即滚到当前行
 
-	// melody 为 true 时钢琴同时弹旋律（有旋律线时才可选）。
-	melody bool
-
-	synthFor   *score.Analysis
-	synthMelod bool // 缓存的合成是否含旋律
-	synthBusy  bool
-	chords     *audio.Sound // 和弦伴奏
-	both       *audio.Sound // 原曲 + 和弦伴奏
-	synthErr   string
+	// mix 是试听的分轨混音设置（原曲、钢琴和弦、钢琴旋律）。
+	mix score.TrackMix
+	// pianoFor 是已合成钢琴音轨所对应的分析结果；chordsPCM / melodyPCM 为单声道采样（pianoRate Hz）。
+	pianoFor             *score.Analysis
+	chordsPCM, melodyPCM []float32
+	pianoRate            int
+	pianoBusy            bool
+	// mixVer 在每次请求混音时递增，后台混音完成时只应用最新一次的结果。
+	mixVer int
+	// mixApplied 是混音结果所基于的原曲播放器：原曲重新载入（播放器变化）后需要重新混音。
+	mixApplied *audio.Player
+	mixPending bool // 后台混音进行中
+	mixErr     string
 }
 
 func newSheetState() sheetState {
-	return sheetState{style: symbolStyles[0].Title, follow: true, lastRow: -1, melody: true}
+	return sheetState{style: symbolStyles[0].Title, follow: true, lastRow: -1, mix: score.DefaultTrackMix()}
 }
 
 func (s *sheetState) styleKey() string {
@@ -67,96 +64,149 @@ func (s *sheetState) styleKey() string {
 	return score.SymbolJazz
 }
 
-// scorePlaySource 是试听卡片中的音源切换：钢琴在后台合成，完成后保持播放位置切换过去。
-func (a *app) scorePlaySource(c *ui.Context, res *score.Analysis) {
+// trackTitles 是三条音轨的名称。
+var trackTitles = [score.TrackCount]string{"原曲", "钢琴 · 和弦", "钢琴 · 旋律"}
+
+// scoreTracks 是试听卡片中的分轨混音：每条音轨的静音（M）、独奏（S）与音量，规则与混音台一致；
+// 改动后在后台重新混合并保持播放位置切换过去。钢琴音轨首次发声时先合成（模态钢琴模型）。
+func (a *app) scoreTracks(c *ui.Context, tk *fluent.Tokens, res *score.Analysis) {
 	t := c.Theme()
 	s := &a.score.sheet
 	pv := &a.score.preview
-	hasMelody := res.Melody != nil && len(res.Melody.Notes) > 0
-	ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-		if ui.Segmented(c, &s.play, "原曲", "钢琴", "原曲 + 钢琴").Label("播放音源").Changed() {
-			a.applyPlaySource(res)
-		}
-		if hasMelody && ui.Checkbox(c, &s.melody, "钢琴弹旋律").Changed() && s.play != playOriginal {
-			a.applyPlaySource(res)
-		}
-		switch {
-		case s.synthBusy:
-			ui.Spinner(c)
-			ui.Text(c, "正在合成钢琴…").FontSize(12).TextColor(t.TextMuted)
-		case s.synthErr != "":
-			ui.Text(c, s.synthErr).FontSize(12).TextColor(t.Danger)
-		case s.play != playOriginal:
-			ui.Text(c, "钢琴以弱力度的柱式和弦铺底（模态钢琴模型），每小节重新弹奏。").FontSize(12).TextColor(t.TextMuted)
+	available := trackAvailable(res)
+	audible := s.mix.Audible(available)
+	changed := false
+	ui.Column(c).Gap(4).AlignItems(ui.Stretch).Children(func() {
+		for i := range score.TrackCount {
+			ui.Row(c.Key(fmt.Sprintf("track-%d", i))).Gap(10).AlignItems(ui.Center).Children(func() {
+				name := ui.Text(c, trackTitles[i]).FontSize(13).Width(96)
+				if !audible[i] {
+					name.TextColor(t.TextMuted)
+				}
+				if !available[i] {
+					ui.Text(c, "未识别旋律（分析时勾选「识别旋律线」）").FontSize(12).TextColor(t.TextMuted)
+					return
+				}
+				if trackButton(c, tk, "M", "静音"+trackTitles[i], s.mix.Mute[i], t.Warning) {
+					s.mix.Mute[i], changed = !s.mix.Mute[i], true
+				}
+				if trackButton(c, tk, "S", "独奏"+trackTitles[i], s.mix.Solo[i], t.Accent) {
+					s.mix.Solo[i], changed = !s.mix.Solo[i], true
+				}
+				if ui.Slider(c, &s.mix.Gain[i], 0, 2).Label(trackTitles[i] + "音量").Width(200).Changed() {
+					changed = true
+				}
+				ui.Textf(c, "%.0f%%", s.mix.Gain[i]*100).FontSize(12).Font("monospace").TextColor(t.TextMuted).Width(44)
+			})
 		}
 	})
-	// 切换到别的分析结果后，合成缓存失效，回到原曲。
-	if s.synthFor != nil && s.synthFor != res {
-		s.synthFor, s.chords, s.both = nil, nil, nil
-		if s.play != playOriginal {
-			a.applyPlaySource(res)
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		switch {
+		case s.pianoBusy:
+			ui.Spinner(c)
+			ui.Text(c, "正在合成钢琴…").FontSize(12).TextColor(t.TextMuted)
+		case s.mixErr != "":
+			ui.Text(c, s.mixErr).FontSize(12).TextColor(t.Danger)
+		case s.mix.NeedsPiano(available):
+			ui.Text(c, "钢琴为模态钢琴模型：和弦以弱力度柱式和弦铺底（每小节重新弹奏），旋律按识别出的音高弹奏。").
+				FontSize(12).TextColor(t.TextMuted).Grow(1)
 		}
+	})
+	// 切换到别的分析结果后，钢琴缓存失效。
+	if s.pianoFor != nil && s.pianoFor != res {
+		s.pianoFor, s.chordsPCM, s.melodyPCM = nil, nil, nil
+		changed = true
 	}
-	if pv.player == pv.original && s.play != playOriginal && !s.synthBusy && s.chords != nil {
-		a.applyPlaySource(res) // 原曲刚被重新载入
+	// 原曲（重新）载入后还没有为它混过音：混音不是「只有原曲」时需要应用。混音进行中或失败时不重复触发。
+	if pv.player != nil && pv.player == pv.original && s.mixApplied != pv.original && !s.mix.OriginalOnly(available) &&
+		!s.pianoBusy && !s.mixPending && s.mixErr == "" {
+		changed = true
+	}
+	if changed {
+		a.applyMix(res)
 	}
 }
 
-// applyPlaySource 按 sheet.play 切换播放器音源；需要时先在后台合成。
-func (a *app) applyPlaySource(res *score.Analysis) {
+// trackAvailable 报告各音轨是否可用：旋律轨需要识别出的旋律线。
+func trackAvailable(res *score.Analysis) [score.TrackCount]bool {
+	return [score.TrackCount]bool{true, true, res.Melody != nil && len(res.Melody.Notes) > 0}
+}
+
+// trackButton 是音轨的 M / S 按钮，on 时以 color 填充；返回是否被点击。
+func trackButton(c *ui.Context, tk *fluent.Tokens, text, label string, on bool, color ui.Color) bool {
+	t := c.Theme()
+	b := ui.ButtonBase(c.Key(label)).Size(28, 24).Radius(fluent.ControlRadius).Center().Label(label).
+		Border(1, tk.CardStroke)
+	switch {
+	case on:
+		b.Background(color)
+	case b.Hovered():
+		b.Background(tk.SubtleHover)
+	}
+	b.Children(func() {
+		txt := ui.Text(c, text).FontSize(12).FontWeight(600)
+		if on {
+			txt.TextColor(t.AccentText)
+		}
+	})
+	return b.Clicked()
+}
+
+// applyMix 按当前混音设置切换播放器音源：只有原曲时直接播放原文件；需要钢琴时先在后台合成；
+// 然后在后台混合并保持播放位置切换。连续改动时只应用最后一次的结果。
+func (a *app) applyMix(res *score.Analysis) {
 	s := &a.score.sheet
 	pv := &a.score.preview
-	if s.play == playOriginal {
+	available := trackAvailable(res)
+	s.mixErr = ""
+	if s.mix.OriginalOnly(available) {
+		s.mixVer++ // 作废进行中的混音
+		s.mixPending = false
 		pv.swap(nil)
 		return
 	}
-	withMelody := s.melody && res.Melody != nil
-	if s.synthFor == res && s.synthMelod == withMelody && s.chords != nil {
-		if s.play == playChords {
-			pv.swap(s.chords)
-		} else {
-			pv.swap(s.both)
-		}
+	if pv.player == nil {
 		return
 	}
-	if s.synthBusy || pv.player == nil {
-		return
-	}
-	s.synthBusy, s.synthErr = true, ""
-	orig, rate, ch := pv.samples, pv.rate, pv.ch
+	rate := pv.rate
 	if rate == 0 {
 		rate = 44100
 	}
-	go func() {
-		pcm := res.SynthPiano(rate, withMelody)
-		var both []float32
-		if orig != nil && ch > 0 {
-			// 叠加：原曲略降 1.5 dB 给钢琴留出空间；钢琴为单声道，两个声道各加一份。
-			frames := len(orig) / ch
-			both = make([]float32, len(orig))
-			for i := 0; i < frames; i++ {
-				syn := float32(0)
-				if i < len(pcm) {
-					syn = pcm[i] * 0.9
-				}
-				for k := 0; k < ch; k++ {
-					v := orig[i*ch+k]*0.84 + syn
-					both[i*ch+k] = max(-1, min(1, v))
-				}
-			}
+	if s.mix.NeedsPiano(available) && (s.pianoFor != res || s.pianoRate != rate) {
+		if s.pianoBusy {
+			return // 合成完成后会再次调用
 		}
+		s.pianoBusy = true
+		go func() {
+			chords, melody := res.PianoTracks(rate)
+			a.post(func() {
+				s.pianoBusy = false
+				s.pianoFor, s.chordsPCM, s.melodyPCM, s.pianoRate = res, chords, melody, rate
+				a.applyMix(res)
+			})
+		}()
+		return
+	}
+	if pv.samples == nil || pv.ch == 0 {
+		s.mixErr = "该音频的声道数不支持混音，只能播放原曲"
+		return
+	}
+	s.mixVer++
+	s.mixPending = true
+	ver, mix, orig, ch, original := s.mixVer, s.mix, pv.samples, pv.ch, pv.original
+	chords, melody := s.chordsPCM, s.melodyPCM
+	go func() {
+		out := score.MixTracks(orig, ch, chords, melody, mix, available)
 		a.post(func() {
-			s.synthBusy = false
-			if len(pcm) == 0 {
-				s.synthErr = "没有可合成的和弦"
+			// 期间又改了设置或换了文件时丢弃这次结果（更新的请求会自己完成）。
+			if ver != s.mixVer {
 				return
 			}
-			s.synthFor, s.synthMelod, s.chords = res, withMelody, audio.NewSound(rate, 1, pcm)
-			s.both = s.chords
-			if both != nil {
-				s.both = audio.NewSound(rate, ch, both)
+			s.mixPending = false
+			if pv.original == original {
+				pv.swap(audio.NewSound(rate, ch, out))
+				s.mixApplied = original
 			}
-			a.applyPlaySource(res)
 		})
 	}()
 }
@@ -526,33 +576,115 @@ func drawStaffLines(p *ui.Painter, x, y, w float32, color ui.Color) {
 	}
 }
 
-// drawMelody 画一个小节的旋律：音符（符头、符干、符尾、附点、加线）、休止符与连音线。
+// 符干与符杠的尺寸。
+const (
+	stemLen     = float32(3.5 * staffGap) // 标准符干长度（三个半线距）
+	minStemLen  = float32(2.5 * staffGap) // 成组时的最短符干
+	beamWidth   = float32(4)              // 符杠粗细
+	maxBeamRise = float32(staffGap)       // 符杠首尾的最大高差
+)
+
+// stemSpec 是一个音的符干：方向、符干末端的纵坐标（绝对坐标），以及是否在符杠组内（组内不画符尾）。
+type stemSpec struct {
+	up     bool
+	endY   float32
+	beamed bool
+}
+
+// drawMelody 画一个小节的旋律：音符（符头、符干、符尾或符杠、附点、加线）、休止符与连音线。
 // tieOut 为 false 时（行末）跨小节的连音线只画到小节线。
 func drawMelody(p *ui.Painter, rc ui.Rect, x0, mw float32, mm score.MelodyMeasure, pos float64, theme *ui.Theme,
 	faint ui.Color, tieOut bool) {
-	for idx, it := range mm.Items {
-		x := x0 + mw*melodyX(it, mm)
+	xOf := func(it score.MelodyItem) float32 { return x0 + mw*melodyX(it, mm) }
+	yOf := func(it score.MelodyItem) float32 { return rc.Y + stepY(it.Note.Step, true) }
+	playing := func(it score.MelodyItem) bool { return pos >= it.Start && pos < it.End }
+
+	// 1. 符干：成组的八分音符按符杠统一方向与末端，其余各自按音高决定方向。
+	stems := make([]stemSpec, len(mm.Items))
+	for k, it := range mm.Items {
+		up := it.Note.Step < 34 // 第三线（B4）以下符干朝上
+		end := yOf(it) + stemLen
+		if up {
+			end = yOf(it) - stemLen
+		}
+		stems[k] = stemSpec{up: up, endY: end}
+	}
+	for _, g := range mm.BeamGroups() {
+		sum := 0
+		for _, k := range g {
+			sum += mm.Items[k].Note.Step
+		}
+		up := float32(sum)/float32(len(g)) < 34
+		first, last := mm.Items[g[0]], mm.Items[g[len(g)-1]]
+		sx := func(it score.MelodyItem) float32 {
+			if up {
+				return xOf(it) + headW/2 - 0.6
+			}
+			return xOf(it) - headW/2 + 0.6
+		}
+		dir := float32(1) // 符干从符头延伸的方向：朝下为 +1
+		if up {
+			dir = -1
+		}
+		// 符杠斜率跟随首尾音的高低，高差限制在 maxBeamRise 以内。
+		xf, xl := sx(first), sx(last)
+		yf, yl := yOf(first)+dir*stemLen, yOf(last)+dir*stemLen
+		rise := max(-maxBeamRise, min(maxBeamRise, yl-yf))
+		slope := float32(0)
+		if xl > xf {
+			slope = rise / (xl - xf)
+		}
+		beamY := func(x float32) float32 { return yf + slope*(x-xf) }
+		// 整体平移符杠，保证每根符干不短于 minStemLen。
+		shift := float32(0)
+		for _, k := range g {
+			it := mm.Items[k]
+			// 符干末端至少要到 need；v > 0 表示符杠离符头太近（朝上时太低、朝下时太高），需要再移开 v。
+			need := yOf(it) + dir*minStemLen
+			if v := (beamY(sx(it)) - need) * -dir; v > 0 {
+				shift = max(shift, v)
+			}
+		}
+		for _, k := range g {
+			it := mm.Items[k]
+			stems[k] = stemSpec{up: up, endY: beamY(sx(it)) + dir*shift, beamed: true}
+		}
 		color := theme.Text
-		if pos >= it.Start && pos < it.End {
+		for _, k := range g {
+			if playing(mm.Items[k]) {
+				color = theme.Accent
+			}
+		}
+		// 符杠：符干末端连成的平行四边形，粗细朝符头一侧。
+		y1, y2 := beamY(xf)+dir*shift, beamY(xl)+dir*shift
+		t := -dir * beamWidth
+		beam := (&ui.Path{}).MoveTo(xf-0.6, y1).LineTo(xl+0.6, y2).LineTo(xl+0.6, y2+t).LineTo(xf-0.6, y1+t).Close()
+		p.FillPath(beam, color)
+	}
+
+	// 2. 音符、休止符与连音线。
+	for idx, it := range mm.Items {
+		x := xOf(it)
+		color := theme.Text
+		if playing(it) {
 			color = theme.Accent
 		}
 		if it.Rest {
 			drawRest(p, x, rc.Y, it.Len, color)
 			continue
 		}
-		drawMelodyNote(p, rc, x, it, color, faint)
+		drawMelodyNote(p, rc, x, it, stems[idx], color, faint)
 		if it.TieNext {
-			// 连音线画到下一个音符；它在下一小节时画到本小节末尾（行末）或下一小节第一个音符的位置。
+			// 连音线画到下一个音符；它在下一小节时画到下一小节第一个音符的位置，行末则画到小节线。
 			x1 := x0 + mw
 			if idx+1 < len(mm.Items) {
-				x1 = x0 + mw*melodyX(mm.Items[idx+1], mm)
+				x1 = xOf(mm.Items[idx+1])
 			} else if tieOut {
 				x1 = x0 + mw + mw*0.45/float32(max(mm.Slots, 1))
 			}
-			y := rc.Y + stepY(it.Note.Step, true)
-			up := it.Note.Step >= 34 // 符干朝下时连音线在上方
-			dy := float32(6)
-			if up {
+			y := yOf(it)
+			dy := float32(6) // 连音线在符干的另一侧
+			if !stems[idx].up {
 				dy = -6
 			}
 			path := (&ui.Path{}).MoveTo(x+3, y+dy*0.8).QuadTo((x+x1)/2, y+dy*2.2, x1-3, y+dy*0.8)
@@ -561,8 +693,8 @@ func drawMelody(p *ui.Painter, rc ui.Rect, x0, mw float32, mm score.MelodyMeasur
 	}
 }
 
-// drawMelodyNote 画一个旋律音：加线、符头（二分及以上空心）、附点、符干（低于第三线朝上）与八分音符的符尾。
-func drawMelodyNote(p *ui.Painter, rc ui.Rect, x float32, it score.MelodyItem, color, faint ui.Color) {
+// drawMelodyNote 画一个旋律音：加线、符头（二分及以上空心）、附点、符干，以及不在符杠组内的八分音符的符尾。
+func drawMelodyNote(p *ui.Painter, rc ui.Rect, x float32, it score.MelodyItem, st stemSpec, color, faint ui.Color) {
 	step := it.Note.Step
 	y := rc.Y + stepY(step, true)
 	for s := trebleBase - 2; s >= step; s -= 2 {
@@ -585,22 +717,20 @@ func drawMelodyNote(p *ui.Painter, rc ui.Rect, x float32, it score.MelodyItem, c
 	if it.Len >= 8 {
 		return
 	}
-	up := step < 34 // 第三线（B4）以下符干朝上
-	stemLen := float32(3.5 * staffGap)
-	if up {
-		sx := x + headW/2 - 0.6
-		p.Line(sx, y, sx, y-stemLen, 1.2, color)
-		if it.Len == 1 {
-			path := (&ui.Path{}).MoveTo(sx, y-stemLen).CubeTo(sx+2, y-stemLen+8, sx+9, y-stemLen+10, sx+6, y-stemLen+20)
-			p.StrokePath(path, 1.4, color)
+	sx := x - headW/2 + 0.6
+	if st.up {
+		sx = x + headW/2 - 0.6
+	}
+	p.Line(sx, y, sx, st.endY, 1.2, color)
+	if it.Len == 1 && !st.beamed {
+		// 符尾：从符干末端向符头方向弯出。
+		d := float32(1)
+		if !st.up {
+			d = -1
 		}
-	} else {
-		sx := x - headW/2 + 0.6
-		p.Line(sx, y, sx, y+stemLen, 1.2, color)
-		if it.Len == 1 {
-			path := (&ui.Path{}).MoveTo(sx, y+stemLen).CubeTo(sx+2, y+stemLen-8, sx+9, y+stemLen-10, sx+6, y+stemLen-20)
-			p.StrokePath(path, 1.4, color)
-		}
+		e := st.endY
+		path := (&ui.Path{}).MoveTo(sx, e).CubeTo(sx+2, e+8*d, sx+9, e+10*d, sx+6, e+20*d)
+		p.StrokePath(path, 1.4, color)
 	}
 }
 

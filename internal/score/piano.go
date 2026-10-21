@@ -127,11 +127,27 @@ func renderPianoNote(buf []float32, rate int, n PianoNote) {
 
 // RenderPiano 合成 notes（单声道，长度 duration 秒），多核并行，峰值超过 0.9 时整体衰减。
 func RenderPiano(notes []PianoNote, rate int, duration float64) []float32 {
+	out := renderRaw(notes, rate, duration)
+	peak := float32(0)
+	for _, x := range out {
+		peak = max(peak, x, -x)
+	}
+	if peak > 0.9 {
+		g := 0.9 / peak
+		for i := range out {
+			out[i] *= g
+		}
+	}
+	return out
+}
+
+// renderRaw 合成 notes，不做峰值处理（多条音轨分开合成后再混合时保持相对电平）。
+func renderRaw(notes []PianoNote, rate int, duration float64) []float32 {
 	n := int(duration * float64(rate))
 	if n <= 0 {
 		return nil
 	}
-	workers := max(1, runtime.NumCPU())
+	workers := max(1, min(runtime.NumCPU(), len(notes)))
 	parts := make([][]float32, workers)
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -150,16 +166,6 @@ func RenderPiano(notes []PianoNote, rate int, duration float64) []float32 {
 	for _, p := range parts[1:] {
 		for i, x := range p {
 			out[i] += x
-		}
-	}
-	peak := float32(0)
-	for _, x := range out {
-		peak = max(peak, x, -x)
-	}
-	if peak > 0.9 {
-		g := 0.9 / peak
-		for i := range out {
-			out[i] *= g
 		}
 	}
 	return out

@@ -183,3 +183,33 @@ func (a *Analysis) MelodyTranspose() int {
 	}
 	return 0
 }
+
+// BeamGroups 返回小节内需要用符杠相连的八分音符组（Items 的下标，每组至少 2 个）。
+// 规则：相邻的八分音符（Len == 1、非休止）连成一组，休止符或更长的音符打断；4 拍的小节按半小节（2 拍）分组，
+// 其余拍数按单拍分组，组不跨越分组边界。只有一个八分音符的组不返回（保留符尾）。
+func (mm MelodyMeasure) BeamGroups() [][]int {
+	span := MelodySubdiv // 分组单位（格）
+	if mm.Slots == 4*MelodySubdiv {
+		span = 2 * MelodySubdiv
+	}
+	var out [][]int
+	var cur []int
+	flush := func() {
+		if len(cur) >= 2 {
+			out = append(out, cur)
+		}
+		cur = nil
+	}
+	for i, it := range mm.Items {
+		if it.Rest || it.Len != 1 {
+			flush()
+			continue
+		}
+		if len(cur) > 0 && mm.Items[cur[0]].Slot/span != it.Slot/span {
+			flush()
+		}
+		cur = append(cur, i)
+	}
+	flush()
+	return out
+}

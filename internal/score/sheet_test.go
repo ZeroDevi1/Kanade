@@ -79,10 +79,13 @@ func TestKeySignature(t *testing.T) {
 	}
 }
 
-func TestSynthPiano(t *testing.T) {
+func TestPianoTracks(t *testing.T) {
 	a := &Analysis{Duration: 2, Downbeats: []float64{0, 1}}
 	a.Chords = []Segment{{0, 2, "C", ip(0), "maj"}}
-	pcm := a.SynthPiano(8000, false)
+	pcm, mel := a.PianoTracks(8000)
+	if mel != nil {
+		t.Error("melody track without melody")
+	}
 	if len(pcm) != 16000 {
 		t.Fatalf("len %d", len(pcm))
 	}
@@ -97,7 +100,7 @@ func TestSynthPiano(t *testing.T) {
 	for _, x := range pcm {
 		peak = max(peak, x, -x)
 	}
-	if peak == 0 || peak > 0.91 || energy(8000, 8800) <= energy(7200, 8000) {
+	if peak == 0 || peak > 1 || energy(8000, 8800) <= energy(7200, 8000) {
 		t.Errorf("peak %v, energy before %v after %v", peak, energy(7200, 8000), energy(8000, 8800))
 	}
 }
@@ -133,5 +136,32 @@ func TestPianoModel(t *testing.T) {
 	// 松键后迅速衰减：1.2 秒后的能量远小于按住期间。
 	if rms(soft[int(1.2*rate):]) > rms(soft[:rate])*0.01 {
 		t.Error("damper did not stop the note")
+	}
+}
+
+func TestTrackMix(t *testing.T) {
+	all := [TrackCount]bool{true, true, true}
+	m := DefaultTrackMix()
+	if !m.OriginalOnly(all) || m.NeedsPiano(all) {
+		t.Error("default should be original only")
+	}
+	// 独奏旋律：只有旋律发声，原曲与和弦即使未静音也不发声。
+	m.Mute = [TrackCount]bool{}
+	m.Solo[TrackMelody] = true
+	if a := m.Audible(all); a != [TrackCount]bool{false, false, true} {
+		t.Errorf("solo melody %v", a)
+	}
+	// 没有旋律轨时独奏它无效，回到未静音的音轨。
+	if a := m.Audible([TrackCount]bool{true, true, false}); a != [TrackCount]bool{true, true, false} {
+		t.Errorf("unavailable solo %v", a)
+	}
+	// 混音：原曲 ×0.5 + 和弦（静音旋律）。
+	m = TrackMix{Mute: [TrackCount]bool{false, false, true}, Gain: [TrackCount]float64{0.5, 1, 1}}
+	out := MixTracks([]float32{0.4, 0.4, 0.2, 0.2}, 2, []float32{0.1, 0.3}, []float32{0.9, 0.9}, m, all)
+	want := []float32{0.3, 0.3, 0.4, 0.4}
+	for i := range want {
+		if d := out[i] - want[i]; d > 1e-6 || d < -1e-6 {
+			t.Fatalf("mix %v, want %v", out, want)
+		}
 	}
 }
