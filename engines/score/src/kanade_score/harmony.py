@@ -5,7 +5,10 @@
 比例」。只用轮廓时，主调与属调（如 Db 与 Ab 大调）常常只差千分之几，和弦能区分：Ab 大调里没有 Ebm 与 Gb。
 分段用同样的打分估计，用于提示转调。
 
-和弦：在节拍同步的色度上，与各和弦的二值模板做余弦相似度，再用 HMM（自转移概率 self_prob）做 Viterbi 平滑，
+和弦（词汇 full，默认）：BTC 神经网络（见 btc 包）的逐帧概率在节拍上聚合，再用 HMM 做 Viterbi 平滑；
+伴奏低频里最低的强峰若是和弦的非根音，记为转位（如 C/E）。
+
+和弦（词汇 basic / extended）：在节拍同步的色度上，与各和弦的二值模板做余弦相似度，再用 HMM（自转移概率 self_prob）做 Viterbi 平滑，
 避免逐拍抖动。能量过低的拍记为 N（无和弦）。定调后再解码一次，给该调的自然音级和弦少量加分，修正大小三和弦的
 误判（三音被人声或乐器泛音掩盖时常见）。输入最好是去掉人声的伴奏（人声旋律音会干扰色度）。
 """
@@ -24,7 +27,8 @@ PROFILES = {
                   [5.0, 2.0, 3.5, 4.5, 2.0, 4.0, 2.0, 4.5, 3.5, 2.0, 1.5, 4.0]),
 }
 
-# 和弦性质：名称后缀与相对根音的音程。basic 只有大三 / 小三；extended 加七和弦、减三与挂四。
+# 和弦性质：名称后缀与相对根音的音程（与 Go 端 score.qualityIntervals 一致）。模板匹配的 basic 只有大三 / 小三，
+# extended 加七和弦、减三与挂四；其余性质只由 BTC（词汇 full）输出。
 QUALITIES = {
     "maj": ("", (0, 4, 7)),
     "min": ("m", (0, 3, 7)),
@@ -33,8 +37,17 @@ QUALITIES = {
     "min7": ("m7", (0, 3, 7, 10)),
     "dim": ("dim", (0, 3, 6)),
     "sus4": ("sus4", (0, 5, 7)),
+    "aug": ("aug", (0, 4, 8)),
+    "6": ("6", (0, 4, 7, 9)),
+    "min6": ("m6", (0, 3, 7, 9)),
+    "minmaj7": ("mmaj7", (0, 3, 7, 11)),
+    "dim7": ("dim7", (0, 3, 6, 9)),
+    "hdim7": ("m7b5", (0, 3, 6, 10)),
+    "sus2": ("sus2", (0, 2, 7)),
 }
 VOCABULARIES = {"basic": ("maj", "min"), "extended": ("maj", "min", "7", "maj7", "min7", "dim", "sus4")}
+# 全部可选的和弦词汇：full 为 BTC 神经网络（大词汇量），其余为模板匹配。
+CHORD_VOCABS = ("full", *VOCABULARIES)
 # 非三和弦的先验惩罚（余弦相似度上的减分）：四音模板与色度的重合更多，不惩罚会过度识别七和弦。经验值。
 COMPLEX_PENALTY = 0.04
 # 拍的色度能量低于整首中位数的该比例时视为无和弦（静音、前奏只有鼓等）。经验值。
@@ -55,7 +68,8 @@ SEGMENT_TOLERANCE = 0.1
 MIN_SEGMENT_WINDOWS = 4
 
 # 和弦性质归类为三和弦家族，用于判断是否为自然音级和弦。
-_FAMILY = {"maj": "maj", "7": "maj", "maj7": "maj", "sus4": "maj", "min": "min", "min7": "min", "dim": "dim"}
+_FAMILY = {"maj": "maj", "7": "maj", "maj7": "maj", "sus4": "maj", "6": "maj", "sus2": "maj", "min": "min", "min7": "min",
+           "min6": "min", "minmaj7": "min", "dim": "dim", "dim7": "dim", "hdim7": "dim", "aug": "aug"}
 # 自然音级三和弦（相对主音的根音, 家族）。小调用和声小调的 V（大三），与流行音乐的习惯一致。
 _DIATONIC = {
     "major": {(0, "maj"), (2, "min"), (4, "min"), (5, "maj"), (7, "maj"), (9, "min"), (11, "dim")},
@@ -213,11 +227,7 @@ def detect_chords(c: np.ndarray, sr: int, hop: int, beats: np.ndarray, duration:
     """
     import librosa
 
-    if len(beats) >= 4:
-        bounds = np.concatenate([[0.0], beats, [duration]])
-    else:
-        bounds = np.arange(0.0, duration + 0.5, 0.5)
-    bounds = np.unique(np.clip(bounds, 0, duration))
+    bounds = _beat_bounds(beats, duration)
     frames = np.unique(librosa.time_to_frames(bounds, sr=sr, hop_length=hop))
     frames = frames[frames < c.shape[1]]
     sync = librosa.util.sync(c, frames, aggregate=np.median)  # (12, 段数)
@@ -239,9 +249,29 @@ def detect_chords(c: np.ndarray, sr: int, hop: int, beats: np.ndarray, duration:
     trans = librosa.sequence.transition_loop(n + 1, self_prob)
     path = librosa.sequence.viterbi(prob, trans)
 
+    return _segments(path, times, ends, lambda st: (None, None, None) if st == n else (labels[st][1], labels[st][2], labels[st][0]),
+                     min_beats)
+
+
+def _beat_bounds(beats: np.ndarray, duration: float) -> np.ndarray:
+    """和弦分段的边界（秒）：0、各拍与结尾；拍少于 4 个时按 0.5 秒定长分段。"""
+    if len(beats) >= 4:
+        bounds = np.concatenate([[0.0], beats, [duration]])
+    else:
+        bounds = np.arange(0.0, duration + 0.5, 0.5)
+    return np.unique(np.clip(bounds, 0, duration))
+
+
+def _segments(path, times, ends, state_info, min_beats: int) -> list[dict]:
+    """把逐拍的状态序列合并为和弦段：相邻同名合并，短于 min_beats 的段并入前一段。
+
+    state_info(状态) 返回 (根音, 性质, 标签)；根音为 None 表示无和弦 N（此时标签忽略）。
+    """
     segs: list[dict] = []
     for i, state in enumerate(path):
-        label, root, q = ("N", None, None) if state == n else labels[state]
+        root, q, label = state_info(state)
+        if root is None:
+            label, q = "N", None
         if segs and segs[-1]["label"] == label:
             segs[-1]["end"] = float(ends[i])
             segs[-1]["beats"] += 1
@@ -261,3 +291,114 @@ def detect_chords(c: np.ndarray, sr: int, hop: int, beats: np.ndarray, duration:
         segs = merged
     return [{"start": round(s["start"], 3), "end": round(s["end"], 3), "label": s["label"], "root": s["root"],
              "quality": s["quality"]} for s in segs]
+
+
+def chord_label(root: int, quality: str, flats: bool) -> str:
+    return (NAMES_FLAT if flats else NAMES_SHARP)[root] + QUALITIES[quality][0]
+
+
+def decode_btc(probs: np.ndarray, frame_s: float, beats: np.ndarray, duration: float, flats: bool,
+               self_prob: float, min_beats: int, key: tuple[int, str] | None = None) -> list[dict]:
+    """把 BTC 的逐帧概率 (帧数, 170) 解码为节拍同步的和弦段（结构同 detect_chords）。
+
+    每拍把其中各帧的对数概率相加（各帧独立时即该拍的对数似然）作为发射分布，X（无法归类）不作为输出状态；
+    再用自转移概率 self_prob 的 HMM 做 Viterbi 平滑。拍内没有帧（拍比一帧短）时取最近的一帧。
+    key=(主音, 调式) 时，增三与减七这类对称和弦的根音按调性选择（见 _symmetric_root）。
+    """
+    import librosa
+
+    from . import btc
+
+    n_chords = len(btc.QUALITY_KEYS) * 12
+    p = np.concatenate([probs[:, :n_chords], probs[:, btc.N_INDEX:btc.N_INDEX + 1]], axis=1)  # 去掉 X
+    logp = np.log(np.maximum(p, 1e-8))
+    bounds = _beat_bounds(beats, duration)
+    times, ends = bounds[:-1], bounds[1:]
+    frame_t = np.arange(len(p)) * frame_s
+    emis = np.empty((p.shape[1], len(times)))
+    for i, (t0, t1) in enumerate(zip(times, ends)):
+        idx = np.nonzero((frame_t >= t0) & (frame_t < t1))[0]
+        if len(idx) == 0:
+            idx = [min(int(round(t0 / frame_s)), len(p) - 1)]
+        emis[:, i] = logp[idx].sum(axis=0)
+    emis = np.exp(emis - emis.max(axis=0))
+    emis /= emis.sum(axis=0)
+    path = librosa.sequence.viterbi(emis, librosa.sequence.transition_loop(p.shape[1], self_prob))
+
+    def info(state: int):
+        if state == n_chords:
+            return None, None, None
+        # Viterbi 路径是 numpy 整数：转成 int，结果才能写入 JSON。
+        root, q = int(state) // len(btc.QUALITY_KEYS), btc.QUALITY_KEYS[int(state) % len(btc.QUALITY_KEYS)]
+        if key is not None:
+            root = _symmetric_root(root, q, *key)
+        return root, q, chord_label(root, q, flats)
+
+    return _segments(path, times, ends, info, min_beats)
+
+
+# 调内音级（相对主音）：大调为自然大调，小调为和声小调（含导音，减七和弦常以它为根）。
+_SCALE = {"major": (0, 2, 4, 5, 7, 9, 11), "minor": (0, 2, 3, 5, 7, 8, 11)}
+
+
+def _symmetric_root(root: int, quality: str, tonic: int, mode: str) -> int:
+    """增三（大三度等分八度）与减七（小三度等分）和弦的各音都可作根音，模型给出的根音只是其中之一。
+
+    按功能挑选：减七和弦优先导音（vii°7），增三和弦优先主音（I+），否则取第一个调内音，都不在调内时保持原样。
+    """
+    step = {"aug": 4, "dim7": 3}.get(quality)
+    if step is None:
+        return root
+    cands = [(root + k * step) % 12 for k in range(12 // step)]
+    prefer = (tonic + 11) % 12 if quality == "dim7" else tonic
+    if prefer in cands:
+        return prefer
+    for r in cands:
+        if (r - tonic) % 12 in _SCALE[mode]:
+            return r
+    return root
+
+
+# 低音检测：E1（41.2 Hz，四弦贝斯最低音）起 30 个半音（到 A3），覆盖贝斯与钢琴左手的常用音域。
+BASS_FMIN_NOTE = "E1"
+BASS_BINS = 30
+# 段内平均频谱中，能量不低于最大值该比例的谱峰才算「强峰」；取其中最低的一个作为低音，避开根音的三次谐波（五音）。经验值。
+BASS_PEAK_RATIO = 0.6
+
+
+def bass_spectrum(y: np.ndarray, sr: int, hop: int = 512) -> np.ndarray:
+    """低音区的 CQT 幅度，形状 (BASS_BINS, 帧数)，第 0 个 bin 为 E1。"""
+    import librosa
+
+    mono = y.mean(axis=1) if y.ndim == 2 else y
+    return np.abs(librosa.cqt(mono, sr=sr, hop_length=hop, fmin=librosa.note_to_hz(BASS_FMIN_NOTE),
+                              n_bins=BASS_BINS, bins_per_octave=12))
+
+
+def add_inversions(chords: list[dict], spec: np.ndarray, sr: int, hop: int, flats: bool) -> list[dict]:
+    """给低音不是根音的和弦标注转位：低音为和弦内音（三音、五音、七音等）时改为「C/E」并写入 bass（音级）。
+
+    低音取段内平均频谱中最低的强峰；非和弦内音的低音（持续低音、经过音）不标注，避免误报。
+    """
+    names = NAMES_FLAT if flats else NAMES_SHARP
+    e1 = 4  # E 的音级
+    for c in chords:
+        if c["root"] is None:
+            continue
+        f0, f1 = int(c["start"] * sr / hop), int(c["end"] * sr / hop)
+        seg = spec[:, f0:max(f1, f0 + 1)]
+        if seg.size == 0:
+            continue
+        s = seg.mean(axis=1)
+        if s.max() <= 0:
+            continue
+        strong = [i for i in range(BASS_BINS) if s[i] >= BASS_PEAK_RATIO * s.max() and
+                  (i == 0 or s[i] >= s[i - 1]) and (i == BASS_BINS - 1 or s[i] >= s[i + 1])]
+        if not strong:
+            continue
+        pc = int(e1 + strong[0]) % 12
+        tones = {(c["root"] + iv) % 12 for iv in QUALITIES[c["quality"]][1]}
+        if pc != c["root"] and pc in tones:
+            c["bass"] = pc
+            c["label"] = f"{c['label']}/{names[pc]}"
+    return chords

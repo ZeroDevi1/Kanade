@@ -103,31 +103,52 @@ const (
 	SymbolRoman    = "roman"    // 相对调号的级数：I、vi7、IVΔ7
 )
 
-var jazzSuffix = map[string]string{"maj": "", "min": "-", "7": "7", "maj7": "Δ7", "min7": "-7", "dim": "°", "sus4": "sus4"}
-var standardSuffix = map[string]string{"maj": "", "min": "m", "7": "7", "maj7": "maj7", "min7": "m7", "dim": "dim", "sus4": "sus4"}
+var jazzSuffix = map[string]string{"maj": "", "min": "-", "7": "7", "maj7": "Δ7", "min7": "-7", "dim": "°", "sus4": "sus4",
+	"aug": "+", "6": "6", "min6": "-6", "minmaj7": "-Δ7", "dim7": "°7", "hdim7": "ø7", "sus2": "sus2"}
+var standardSuffix = map[string]string{"maj": "", "min": "m", "7": "7", "maj7": "maj7", "min7": "m7", "dim": "dim", "sus4": "sus4",
+	"aug": "aug", "6": "6", "min6": "m6", "minmaj7": "m(maj7)", "dim7": "dim7", "hdim7": "m7♭5", "sus2": "sus2"}
+
+// romanSuffix 是级数写法的后缀：小三度家族的和弦用小写级数表示，后缀不再重复「m」。
+var romanSuffix = map[string]string{"maj": "", "min": "", "7": "7", "maj7": "Δ7", "min7": "7", "dim": "°", "sus4": "sus4",
+	"aug": "+", "6": "6", "min6": "6", "minmaj7": "Δ7", "dim7": "°7", "hdim7": "ø7", "sus2": "sus2"}
+
+// minorFamily 是三音为小三度的性质，级数写成小写。
+var minorFamily = map[string]bool{"min": true, "min7": true, "dim": true, "min6": true, "minmaj7": true, "dim7": true, "hdim7": true}
 
 // romanDegree 是相对主音的半音数对应的级数（大调音阶为基准，变化音加升降号）。
 var romanDegree = []string{"I", "♭II", "II", "♭III", "III", "IV", "♯IV", "V", "♭VI", "VI", "♭VII", "VII"}
 
-// Symbol 返回和弦记号。style 为 Symbol* 之一；级数写法需要调号主音 tonic（音级）。
+// Symbol 返回和弦记号。style 为 Symbol* 之一；级数写法需要调号主音 tonic（音级）。转位和弦在后面加「/低音」。
 func Symbol(c Segment, style string, tonic int) string {
 	if c.Root == nil || c.Label == "" {
 		return c.Label
 	}
 	root := rootName(c.Label)
+	var s string
 	switch style {
 	case SymbolStandard:
-		return root + standardSuffix[c.Quality]
+		s = root + standardSuffix[c.Quality]
 	case SymbolRoman:
 		deg := romanDegree[((*c.Root-tonic)%12+12)%12]
-		if c.Quality == "min" || c.Quality == "min7" || c.Quality == "dim" {
+		if minorFamily[c.Quality] {
 			deg = strings.ToLower(deg)
 		}
-		suffix := map[string]string{"maj": "", "min": "", "7": "7", "maj7": "Δ7", "min7": "7", "dim": "°", "sus4": "sus4"}[c.Quality]
-		return deg + suffix
+		s = deg + romanSuffix[c.Quality]
 	default:
-		return root + jazzSuffix[c.Quality]
+		s = root + jazzSuffix[c.Quality]
 	}
+	if bass := bassName(c.Label); c.Bass != nil && bass != "" {
+		s += "/" + rootName(bass)
+	}
+	return s
+}
+
+// bassName 返回转位和弦名「/」之后的低音名（如 C/E 的 E）；不是转位时返回空串。
+func bassName(label string) string {
+	if i := strings.LastIndexByte(label, '/'); i >= 0 {
+		return label[i+1:]
+	}
+	return ""
 }
 
 // rootName 取和弦名开头的根音（字母加可选的 # / b），并把 # / b 换成 ♯ / ♭。
@@ -148,6 +169,8 @@ func rootName(label string) string {
 var qualityDegrees = map[string][]int{
 	"maj": {0, 2, 4}, "min": {0, 2, 4}, "7": {0, 2, 4, 6}, "maj7": {0, 2, 4, 6},
 	"min7": {0, 2, 4, 6}, "dim": {0, 2, 4}, "sus4": {0, 3, 4},
+	"aug": {0, 2, 4}, "6": {0, 2, 4, 5}, "min6": {0, 2, 4, 5}, "minmaj7": {0, 2, 4, 6},
+	"dim7": {0, 2, 4, 6}, "hdim7": {0, 2, 4, 6}, "sus2": {0, 1, 4},
 }
 
 // 字母 C D E F G A B 的自然音级。
@@ -210,8 +233,13 @@ func ChordVoicing(c Segment, prevUpper []int) (Voicing, bool) {
 	}
 	letter := rootLetter(c.Label)
 	root := *c.Root
-	bass := bassLow + ((root-bassLow)%12+12)%12
-	v := Voicing{Bass: spell(bass, letter)}
+	// 转位和弦的低音谱表写低音（按其音名拼写），否则写根音。
+	bassPC, bassLetter := root, letter
+	if b := bassName(c.Label); c.Bass != nil && b != "" {
+		bassPC, bassLetter = *c.Bass, rootLetter(b)
+	}
+	bass := bassLow + ((bassPC-bassLow)%12+12)%12
+	v := Voicing{Bass: spell(bass, bassLetter)}
 
 	best, bestCost := []int(nil), 1<<30
 	for inv := range ivs {

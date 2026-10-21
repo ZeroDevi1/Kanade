@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"unicode/utf8"
 
 	"github.com/egoist/mygo/audio"
 	"github.com/egoist/mygo/ui"
@@ -307,9 +308,16 @@ func (a *app) jazzMeasure(c *ui.Context, tk *fluent.Tokens, res *score.Analysis,
 			}
 			return
 		}
-		for j, bt := range m.Beats {
-			on := pos >= bt.Time && pos < bt.End
-			b := ui.ButtonBase(c.Key(fmt.Sprintf("jazz-b-%d-%d", i, j))).Grow(1).Basis(0).MinWidth(0).
+		for j := 0; j < len(m.Beats); j++ {
+			bt := m.Beats[j]
+			// 记号较长（转位、七和弦等）且下一拍延续同一和弦时，占两拍的宽度，避免被截断成「…」。
+			span, end := 1, bt.End
+			if bt.Starts && j+1 < len(m.Beats) && !m.Beats[j+1].Starts && m.Beats[j+1].Chord.Label == bt.Chord.Label &&
+				utf8.RuneCountInString(score.Symbol(bt.Chord, style, res.Key.TonicPC)) > longSymbol {
+				span, end = 2, m.Beats[j+1].End
+			}
+			on := pos >= bt.Time && pos < end
+			b := ui.ButtonBase(c.Key(fmt.Sprintf("jazz-b-%d-%d", i, j))).Grow(float32(span)).Basis(0).MinWidth(0).
 				AlignItems(ui.Center).Justify(ui.Center)
 			if on {
 				b.Background(t.Accent.Alpha(0.18))
@@ -328,7 +336,11 @@ func (a *app) jazzMeasure(c *ui.Context, tk *fluent.Tokens, res *score.Analysis,
 			b.Children(func() {
 				txt := ui.Text(c, label).SingleLine()
 				if sym != "" {
-					txt.FontSize(17).FontWeight(600)
+					size := float32(17)
+					if span == 1 && utf8.RuneCountInString(sym) > longSymbol {
+						size = 13 // 只占一拍的长记号缩小字号
+					}
+					txt.FontSize(size).FontWeight(600)
 					if on {
 						txt.TextColor(t.Accent)
 					}
@@ -339,9 +351,14 @@ func (a *app) jazzMeasure(c *ui.Context, tk *fluent.Tokens, res *score.Analysis,
 			if b.Clicked() {
 				seek(bt.Time)
 			}
+			j += span - 1
 		}
 	})
 }
+
+// longSymbol 是一拍宽的格子稳妥能完整显示的和弦记号字符数：17 号字、四小节一行、窗口约 1100 DIP 宽时，
+// 「D♭Δ7」这样的 4 个字符已会被截断。超过时占两拍或缩小字号。
+const longSymbol = 3
 
 // 五线谱的版面（像素）：线距、两谱表的位置与系统高度。
 const (

@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"kanade/internal/conductor"
 	"kanade/internal/paths"
@@ -36,12 +38,14 @@ type Options struct {
 var (
 	BeatMethods = []struct{ Key, Title string }{{"beat_this", "beat_this（神经网络，推荐）"}, {"librosa", "librosa（快速，无需下载）"}}
 	KeyProfiles = []struct{ Key, Title string }{{"krumhansl", "Krumhansl–Kessler"}, {"temperley", "Temperley"}}
-	ChordVocabs = []struct{ Key, Title string }{{"basic", "大小三和弦"}, {"extended", "含七和弦、减三、挂四"}}
+	ChordVocabs = []struct{ Key, Title string }{
+		{"full", "完整和弦（神经网络，推荐）"}, {"basic", "大小三和弦（模板匹配）"}, {"extended", "含七和弦、减三、挂四（模板匹配）"},
+	}
 )
 
 // DefaultOptions 是智能模式使用的参数（引擎默认值）。
 func DefaultOptions() Options {
-	return Options{BeatMethod: "beat_this", KeyProfile: "krumhansl", KeySegmentS: 30, ChordVocab: "basic",
+	return Options{BeatMethod: "beat_this", KeyProfile: "krumhansl", KeySegmentS: 30, ChordVocab: "full",
 		ChordSelfProb: 0.9, ChordMinBeats: 1, Emotion: true}
 }
 
@@ -84,6 +88,8 @@ type Request struct {
 	Melody     bool
 	StemModels map[string]string // 分离伴奏用的模型，见 stems.Recommended
 	Options    Options
+	// History 非空时，成功的分析保存为该目录下的记录（见 HistoryDir），并复用同一首歌已分离的分轨。
+	History string
 }
 
 // Params 返回 score.analyze 的任务参数；harmonic 为分离出的伴奏、melody 为分离出的主唱（均可为空）。
@@ -120,6 +126,7 @@ var ModelGroups = []ModelGroup{
 	{"beat_this", "节拍（beat_this）", []string{"beat_this/final0.ckpt"}, 81},
 	{"clap", "情绪（CLAP）", []string{"clap/clap-htsat-unfused/pytorch_model.bin", "clap/clap-htsat-unfused/config.json"}, 615},
 	{"some", "旋律（SOME）", []string{"some/0119_continuous256_5spk/model_ckpt_steps_100000_simplified.ckpt"}, 435},
+	{"btc", "和弦（BTC）", []string{"btc/btc_model_large_voca.pt"}, 12},
 }
 
 // Installed 报告模型组是否已下载。
@@ -164,6 +171,11 @@ type Run struct {
 	audio   string // 预览用的解码 WAV
 	files   map[string]string
 	skipSep bool
+	reused  bool // 分轨全部复用自已有记录，没有运行分离
+	// dir 是保存的记录目录（未保存时为空）；created 是记录的创建时间（运行中的分析为启动时间）。
+	dir     string
+	created time.Time
+	saveErr string
 }
 
 // RunState 是 Run 的快照。
@@ -172,10 +184,15 @@ type RunState struct {
 	Job     string
 	Err     string
 	Skipped bool // 未分离伴奏
+	Reused  bool // 分轨复用自已有记录
 	Result  *Analysis
 	Audio   string
 	// Files 是导出用的文件：analysis（JSON）与 chords（.lab）。
 	Files map[string]string
+	// Saved 报告结果是否已保存为记录；SaveErr 是保存失败的原因（结果仍在暂存区，可查看与导出）。
+	Saved   bool
+	SaveErr string
+	Created time.Time
 }
 
 // Running 报告流水线是否仍在进行。
@@ -190,7 +207,8 @@ func Start(jobs Jobs, r Request, onChange func()) (*Run, error) {
 		onChange = func() {}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	run := &Run{Request: r, jobs: jobs, onChange: onChange, cancel: cancel, files: map[string]string{}, skipSep: !r.Separate && !r.Melody}
+	run := &Run{Request: r, jobs: jobs, onChange: onChange, cancel: cancel, files: map[string]string{},
+		skipSep: !r.Separate && !r.Melody, created: time.Now()}
 	go run.run(ctx)
 	return run, nil
 }
@@ -203,7 +221,8 @@ func (r *Run) Snapshot() RunState {
 	for k, v := range r.files {
 		files[k] = v
 	}
-	return RunState{Stage: r.stage, Job: r.job, Err: r.err, Skipped: r.skipSep, Result: r.result, Audio: r.audio, Files: files}
+	return RunState{Stage: r.stage, Job: r.job, Err: r.err, Skipped: r.skipSep, Reused: r.reused, Result: r.result,
+		Audio: r.audio, Files: files, Saved: r.dir != "", SaveErr: r.saveErr, Created: r.created}
 }
 
 // Cancel 取消当前任务并停止流水线。
@@ -250,14 +269,22 @@ func (r *Run) step(ctx context.Context, stage int, engine, task string, params m
 func (r *Run) run(ctx context.Context) {
 	fail := func(err error) { r.set(func() { r.err = err.Error() }) }
 	// 分离：伴奏（调号与和弦）与主唱（旋律）在同一次分轨任务中完成；主唱取去和声后的 _vocals_karaoke。
+	// 已有记录分离过同一首歌时直接复用，只分离缺少的部分。
+	reuse := findStems(r.Request.History, r.Request)
 	harmonic, melody := "", ""
 	var steps []string
 	if r.Request.Separate {
-		steps = append(steps, "other")
+		if harmonic = reuse.harmonic; harmonic == "" {
+			steps = append(steps, "other")
+		}
 	}
 	if r.Request.Melody {
-		steps = append(steps, "karaoke")
+		if melody = reuse.melody; melody == "" {
+			steps = append(steps, "karaoke")
+		}
 	}
+	// separated 是本次新分离出的分轨，保存记录时一并移入。
+	separated := map[string]string{}
 	if len(steps) > 0 {
 		params, _ := stems.ChainParams(r.Request.Input, steps, r.Request.StemModels)
 		arts, err := r.step(ctx, StageSeparate, stems.Engine, "stems.chain", params)
@@ -268,16 +295,22 @@ func (r *Run) run(ctx context.Context) {
 		for _, a := range arts {
 			switch {
 			case strings.HasSuffix(a, "_vocals_karaoke.wav"):
-				melody = a
+				if melody == "" {
+					melody, separated["melody"] = a, a
+				}
 			case strings.HasSuffix(a, "_vocals_other.wav"): // 和声，不用
 			case strings.HasSuffix(a, "_other.wav"):
-				harmonic = a
+				if harmonic == "" {
+					harmonic, separated["harmonic"] = a, a
+				}
 			}
 		}
 		if r.Request.Separate && harmonic == "" || r.Request.Melody && melody == "" {
 			fail(errors.New("分轨结果缺少伴奏或主唱"))
 			return
 		}
+	} else if !r.skipSep {
+		r.set(func() { r.reused = true })
 	}
 	params, err := r.Request.Params(harmonic, melody)
 	if err != nil {
@@ -306,7 +339,25 @@ func (r *Run) run(ctx context.Context) {
 		fail(fmt.Errorf("读取分析结果：%w", err))
 		return
 	}
-	r.set(func() { r.result, r.audio, r.files, r.stage, r.job = res, audio, files, StageDone, "" })
+	// 保存记录：失败不影响本次结果（仍在暂存区），只提示原因。
+	dir, saveErr := "", ""
+	if r.Request.History != "" {
+		all := maps.Clone(files)
+		if audio != "" {
+			all["audio"] = audio
+		}
+		d, moved, _, err := save(r.Request.History, r.Request, r.created, all, separated)
+		if err != nil {
+			saveErr = "保存分析记录失败：" + err.Error()
+		} else {
+			dir, audio = d, moved["audio"]
+			delete(moved, "audio")
+			files = moved
+		}
+	}
+	r.set(func() {
+		r.result, r.audio, r.files, r.stage, r.job, r.dir, r.saveErr = res, audio, files, StageDone, "", dir, saveErr
+	})
 }
 
 // Analysis 是引擎 analysis.json 的内容。
@@ -364,6 +415,8 @@ type Segment struct {
 	Label   string  `json:"label"`
 	Root    *int    `json:"root,omitempty"`    // 根音音级，0 = C
 	Quality string  `json:"quality,omitempty"` // 和弦性质，见引擎 harmony.QUALITIES
+	// Bass 是转位和弦的低音音级（Label 形如 C/E）；为 nil 时低音即根音。
+	Bass *int `json:"bass,omitempty"`
 }
 
 // ReadAnalysis 读取并解析 analysis.json。

@@ -28,7 +28,7 @@ func TestScorePage(t *testing.T) {
 	a.be = backend{layout: l, cond: cond}
 	a.current = "score"
 	tt := ui.NewTester(a.view, 1200, 2400)
-	if !tt.HasText("下载缺少的模型（约 1131 MB）") || tt.HasText("和弦词汇") {
+	if !tt.HasText("下载缺少的模型（约 1143 MB）") || tt.HasText("和弦词汇") {
 		t.Errorf("smart texts %q", tt.Texts())
 	}
 	if err := tt.Click("专业"); err != nil {
@@ -40,7 +40,7 @@ func TestScorePage(t *testing.T) {
 		}
 	}
 	// 默认识别旋律：先提交分轨（干声 → 去和声）。
-	a.score.input, a.score.separate, a.score.vocabTitle = "/music/song.flac", false, "含七和弦、减三、挂四"
+	a.score.input, a.score.separate, a.score.vocabTitle = "/music/song.flac", false, score.ChordVocabs[2].Title
 	tt.Frame()
 	if err := tt.Click("开始分析"); err != nil {
 		t.Fatal(err)
@@ -200,5 +200,44 @@ func TestScoreTrackMixer(t *testing.T) {
 	a.applyMix(run.Snapshot().Result)
 	if pv.player != pv.original {
 		t.Error("original-only mix should play the original player")
+	}
+}
+
+// 分析记录：完成的分析保存到数据根目录；重新打开应用（新的 app）进入页面时读回，删除需要二次确认。
+func TestScoreHistory(t *testing.T) {
+	dir := t.TempDir()
+	wav, js := filepath.Join(dir, "audio.wav"), filepath.Join(dir, "analysis.json")
+	writeTestWav(t, wav, 8000, 16000)
+	os.WriteFile(js, []byte(`{"duration": 2, "beats": [0,0.5,1,1.5], "downbeats": [0],
+		"key": {"label": "C 大调", "tonic_pc": 0, "mode": "major"},
+		"chords": [{"start":0,"end":2,"label":"C/E","root":0,"quality":"maj","bass":4}]}`), 0o644)
+	l := paths.New(t.TempDir())
+	run, _ := score.Start(artifactJobs{[]string{wav, js}}, score.Request{Input: "/x/歌.flac", Options: score.DefaultOptions(),
+		History: score.HistoryDir(l)}, nil)
+	for run.Snapshot().Running() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if st := run.Snapshot(); !st.Saved {
+		t.Fatalf("not saved: %+v", st)
+	}
+
+	cond, _ := conductor.New(l, engines.FS, nil)
+	a := newApp()
+	a.be, a.current = backend{layout: l, cond: cond}, "score"
+	tt := ui.NewTester(a.view, 1200, 4000)
+	if len(a.score.runs) != 1 || !tt.HasText("C/E") || !tt.HasText("删除记录") {
+		t.Fatalf("history not loaded: runs %d texts %q", len(a.score.runs), tt.Texts())
+	}
+	if err := tt.Click("删除记录"); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.score.runs) != 1 || !tt.HasText("确认删除") {
+		t.Fatal("delete without confirmation")
+	}
+	if err := tt.Click("确认删除"); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.score.runs) != 0 || len(score.LoadHistory(score.HistoryDir(l))) != 0 {
+		t.Errorf("record not deleted: runs %d", len(a.score.runs))
 	}
 }

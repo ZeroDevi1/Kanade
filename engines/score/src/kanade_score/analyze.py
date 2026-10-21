@@ -10,7 +10,8 @@
         tempo_range:   [lo, hi]，可选；BPM 按倍数折叠到区间内（半速 / 倍速误判时用）
         key_profile:   "krumhansl"（默认）| "temperley"
         key_segment_s: 分段估计调号的窗口（秒），默认 30，0 为不分段
-        chord_vocab:   "basic"（默认，大小三和弦）| "extended"（加七和弦、减三、挂四）
+        chord_vocab:   "full"（默认，BTC 神经网络：14 种和弦性质与转位）| "basic"（模板匹配，大小三和弦）
+                       | "extended"（模板匹配，加七和弦、减三、挂四）
         chord_self_prob: HMM 自转移概率（0.5–0.99，默认 0.9，越大和弦越不易切换）
         chord_min_beats: 最短和弦（拍），默认 1
         emotion:       是否做情绪识别，默认 true
@@ -32,9 +33,9 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from kanade_engine import Job
+from kanade_engine import Job, pick_device
 
-from . import emotion, harmony, melody, models, rhythm
+from . import btc, emotion, harmony, melody, models, rhythm
 
 SR = 44100
 HOP = 512
@@ -69,8 +70,8 @@ def run_analyze(job: Job) -> None:
     if beat_method not in ("beat_this", "librosa"):
         raise ValueError(f"未知的节拍算法：{beat_method}")
     profile = o.get("key_profile") or "krumhansl"
-    vocab = o.get("chord_vocab") or "basic"
-    if profile not in harmony.PROFILES or vocab not in harmony.VOCABULARIES:
+    vocab = o.get("chord_vocab") or "full"
+    if profile not in harmony.PROFILES or vocab not in harmony.CHORD_VOCABS:
         raise ValueError("调性轮廓或和弦词汇取值无效")
     self_prob = float(o.get("chord_self_prob") or 0.9)
     if not 0.5 <= self_prob <= 0.99:
@@ -82,7 +83,7 @@ def run_analyze(job: Job) -> None:
 
     # 1. 模型（按需下载）与解码。
     groups = (["beat_this"] if beat_method == "beat_this" else []) + (["clap"] if want_emotion else []) + \
-        (["some"] if mel_src else [])
+        (["some"] if mel_src else []) + (["btc"] if vocab == "full" else [])
     models.ensure(job, groups, 0.0, 0.15)
     out_dir = job.output_dir / job.id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -112,10 +113,21 @@ def run_analyze(job: Job) -> None:
     # 两遍：先按色度轮廓的初步调号识别和弦，用和弦与色度共同定调，再带调性先验重新识别和弦。
     job.progress(0.5, "和弦识别")
     t0, m0 = harmony.initial_key(c, profile)
-    rough = harmony.detect_chords(c, hsr, HOP, beats, duration, vocab, harmony.uses_flats(t0, m0), self_prob, min_beats)
-    key = harmony.detect_key(c, hsr, HOP, profile, segment_s, rough)
-    chords = harmony.detect_chords(c, hsr, HOP, beats, duration, vocab, key["flats"], self_prob, min_beats,
-                                   (key["tonic_pc"], key["mode"]))
+    if vocab == "full":
+        # BTC 的逐帧概率只算一次：两遍解码只差和弦名的升降号拼写。
+        d = pick_device(allow_mps=False)
+        job.progress(0.5, f"和弦识别（BTC，{d.label}）")
+        probs = btc.frame_probs(hy.mean(axis=1), hsr, str(models.path(models.BTC_CKPT)), d.name)
+        rough = harmony.decode_btc(probs, btc.FRAME_S, beats, duration, harmony.uses_flats(t0, m0), self_prob, min_beats)
+        key = harmony.detect_key(c, hsr, HOP, profile, segment_s, rough)
+        chords = harmony.decode_btc(probs, btc.FRAME_S, beats, duration, key["flats"], self_prob, min_beats,
+                                    (key["tonic_pc"], key["mode"]))
+        chords = harmony.add_inversions(chords, harmony.bass_spectrum(hy, hsr, HOP), hsr, HOP, key["flats"])
+    else:
+        rough = harmony.detect_chords(c, hsr, HOP, beats, duration, vocab, harmony.uses_flats(t0, m0), self_prob, min_beats)
+        key = harmony.detect_key(c, hsr, HOP, profile, segment_s, rough)
+        chords = harmony.detect_chords(c, hsr, HOP, beats, duration, vocab, key["flats"], self_prob, min_beats,
+                                       (key["tonic_pc"], key["mode"]))
     job.check_cancelled()
 
     # 4. 旋律（主唱）与情绪（原曲）。

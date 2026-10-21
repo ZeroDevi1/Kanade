@@ -7,8 +7,8 @@ import (
 
 func TestMeasuresAndEvents(t *testing.T) {
 	a := &Analysis{Duration: 6.5, Beats: []float64{0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6}, Downbeats: []float64{0.5, 2.5, 4.5}}
-	a.Chords = []Segment{{0.5, 1.5, "C", ip(0), "maj"}, {1.5, 2.5, "Am", ip(9), "min"}, {2.5, 3.5, "C", ip(0), "maj"},
-		{3.5, 4.5, "Am", ip(9), "min"}, {4.5, 5.5, "C", ip(0), "maj"}, {5.5, 6.5, "Am", ip(9), "min"}}
+	a.Chords = []Segment{{0.5, 1.5, "C", ip(0), "maj", nil}, {1.5, 2.5, "Am", ip(9), "min", nil}, {2.5, 3.5, "C", ip(0), "maj", nil},
+		{3.5, 4.5, "Am", ip(9), "min", nil}, {4.5, 5.5, "C", ip(0), "maj", nil}, {5.5, 6.5, "Am", ip(9), "min", nil}}
 	ms := a.Measures()
 	if len(ms) != 3 {
 		t.Fatalf("measures %+v", ms)
@@ -81,7 +81,7 @@ func TestKeySignature(t *testing.T) {
 
 func TestPianoTracks(t *testing.T) {
 	a := &Analysis{Duration: 2, Downbeats: []float64{0, 1}}
-	a.Chords = []Segment{{0, 2, "C", ip(0), "maj"}}
+	a.Chords = []Segment{{0, 2, "C", ip(0), "maj", nil}}
 	pcm, mel := a.PianoTracks(8000)
 	if mel != nil {
 		t.Error("melody track without melody")
@@ -163,5 +163,35 @@ func TestTrackMix(t *testing.T) {
 		if d := out[i] - want[i]; d > 1e-6 || d < -1e-6 {
 			t.Fatalf("mix %v, want %v", out, want)
 		}
+	}
+}
+
+// 转位和弦与 BTC 的扩展性质：记号加「/低音」，低音谱表写低音而不是根音。
+func TestSlashAndExtendedSymbols(t *testing.T) {
+	slash := Segment{Label: "Db/F", Root: ip(1), Quality: "maj", Bass: ip(5)}
+	if got := Symbol(slash, SymbolJazz, 1); got != "D♭/F" {
+		t.Errorf("jazz slash %q", got)
+	}
+	if got := Symbol(slash, SymbolRoman, 1); got != "I/F" {
+		t.Errorf("roman slash %q", got)
+	}
+	for _, c := range []struct {
+		seg       Segment
+		jazz, std string
+	}{
+		{Segment{Label: "Bm7b5", Root: ip(11), Quality: "hdim7"}, "Bø7", "Bm7♭5"},
+		{Segment{Label: "Gbm6", Root: ip(6), Quality: "min6"}, "G♭-6", "G♭m6"},
+		{Segment{Label: "Caug", Root: ip(0), Quality: "aug"}, "C+", "Caug"},
+	} {
+		if j, s := Symbol(c.seg, SymbolJazz, 0), Symbol(c.seg, SymbolStandard, 0); j != c.jazz || s != c.std {
+			t.Errorf("%s: jazz %q standard %q", c.seg.Label, j, s)
+		}
+	}
+	v, ok := ChordVoicing(slash, nil)
+	if !ok || v.Bass.MIDI%12 != 5 || len(v.Upper) != 3 {
+		t.Fatalf("voicing %+v", v)
+	}
+	if v, ok := ChordVoicing(Segment{Label: "Ebm7", Root: ip(3), Quality: "min7"}, nil); !ok || len(v.Upper) != 4 {
+		t.Errorf("min7 voicing %+v", v)
 	}
 }

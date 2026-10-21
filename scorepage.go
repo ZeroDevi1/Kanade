@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -31,13 +32,17 @@ type scoreState struct {
 	minBeats                            float64
 	emotion                             bool
 
-	// runs 是本次运行的分析，最新在前；shown 是正在显示的一项。切换页面不丢失。
-	runs    []*score.Run
-	shown   int
-	preview audioPreview
-	sheet   sheetState
-	dlJob   string
-	err     string
+	// runs 是本次运行的分析与已保存的记录，最新在前；shown 是正在显示的一项。切换页面不丢失。
+	// historyLoaded 在首次进入页面（后端布局可用）时读入记录后置为 true。
+	runs          []*score.Run
+	historyLoaded bool
+	shown         int
+	preview       audioPreview
+	sheet         sheetState
+	// confirmDelete 为 true 时删除按钮处于二次确认状态（针对正在显示的记录）。
+	confirmDelete bool
+	dlJob         string
+	err           string
 }
 
 func newScoreState() scoreState {
@@ -60,7 +65,8 @@ func keyOf(list []struct{ Key, Title string }, title string) string {
 // request 按当前模式组装分析请求：智能模式只有「分离伴奏」一项，其余用引擎默认。
 func (a *app) scoreRequest() score.Request {
 	s := &a.score
-	r := score.Request{Input: s.input, Separate: s.separate, Melody: s.melody, StemModels: stems.Recommended, Options: score.DefaultOptions()}
+	r := score.Request{Input: s.input, Separate: s.separate, Melody: s.melody, StemModels: stems.Recommended,
+		Options: score.DefaultOptions(), History: score.HistoryDir(a.be.layout)}
 	if s.mode == modeSmart {
 		return r
 	}
@@ -86,6 +92,10 @@ func (a *app) scorePage(c *ui.Context, tk *fluent.Tokens) {
 		return
 	}
 	s := &a.score
+	if !s.historyLoaded {
+		s.historyLoaded = true
+		s.runs = append(s.runs, score.LoadHistory(score.HistoryDir(a.be.layout))...)
+	}
 	a.scoreModelsCard(c, tk)
 	a.scoreRunCard(c, tk)
 	if len(s.runs) == 0 {
@@ -198,6 +208,8 @@ func (a *app) scoreRunCard(c *ui.Context, tk *fluent.Tokens) {
 				switch {
 				case i == score.StageSeparate && st.Skipped:
 					mark, title = "–", title+"（跳过）"
+				case i == score.StageSeparate && st.Reused:
+					mark, color, title = "✓", t.Success, title+"（复用已保存的分轨）"
 				case st.Err != "" && i == st.Stage:
 					mark, color = "✕", t.Danger
 				case i < st.Stage:
@@ -217,23 +229,15 @@ func (a *app) scoreRunCard(c *ui.Context, tk *fluent.Tokens) {
 				ui.Text(c, st.Err).FontSize(12).TextColor(t.Danger).Selectable()
 			}
 		}
+		if cur != nil && st.SaveErr != "" {
+			ui.Text(c, st.SaveErr+"。结果仍可查看与导出，退出应用后会被删除。").FontSize(12).TextColor(t.Warning).Selectable()
+		}
 		if s.err != "" {
 			ui.Text(c, s.err).FontSize(12).TextColor(t.Danger)
 		}
-		// 本次运行分析过的歌曲，可切换查看。
-		if len(s.runs) > 1 {
-			names := make([]string, len(s.runs))
-			for i, r := range s.runs {
-				names[i] = fmt.Sprintf("%d. %s", len(s.runs)-i, filepath.Base(r.Request.Input))
-			}
-			sel := names[s.shown]
-			if ui.Select(c, &sel, names).Label("查看结果").Width(420).Changed() {
-				for i, n := range names {
-					if n == sel {
-						s.shown = i
-					}
-				}
-			}
+		// 分析记录（含本次运行的分析），可切换查看与删除。
+		if len(s.runs) > 0 {
+			a.scoreHistoryRow(c)
 		}
 	})
 }
@@ -507,4 +511,63 @@ func timeline(c *ui.Context, key string, segs []score.Segment, duration, pos, wi
 			ui.Box(c.Key(key + "-tail")).Grow(float32(v1 - cursor)).Basis(0)
 		}
 	})
+}
+
+// scoreHistoryRow 是分析记录的选择框与删除按钮：本次运行的分析与已保存的记录按时间排列，最新在前。
+func (a *app) scoreHistoryRow(c *ui.Context) {
+	t := c.Theme()
+	s := &a.score
+	names := make([]string, len(s.runs))
+	for i, r := range s.runs {
+		st := r.Snapshot()
+		note := ""
+		switch {
+		case st.Running():
+			note = "（进行中）"
+		case st.Err != "":
+			note = "（失败）"
+		case !st.Saved:
+			note = "（未保存）"
+		}
+		// 序号保证同一首歌在同一分钟内的多次分析名称不重复。
+		names[i] = fmt.Sprintf("%d. %s · %s%s", len(s.runs)-i, st.Created.Format("01-02 15:04"), filepath.Base(r.Request.Input), note)
+	}
+	shown := s.runs[s.shown]
+	saved := shown.Snapshot().Saved
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		sel := names[s.shown]
+		if ui.Select(c, &sel, names).Label("分析记录").Width(480).Changed() {
+			if i := slices.Index(names, sel); i >= 0 {
+				s.shown, s.confirmDelete = i, false
+			}
+		}
+		if !saved {
+			return
+		}
+		// 删除不可撤销（连同记录中的分轨）：第一次点击进入确认状态。
+		if !s.confirmDelete {
+			if ui.Button(c, "删除记录").Clicked() {
+				s.confirmDelete = true
+			}
+			return
+		}
+		if ui.Button(c, "取消").Clicked() {
+			s.confirmDelete = false
+		}
+		if ui.Button(c, "确认删除").TextColor(t.Danger).Clicked() {
+			s.confirmDelete = false
+			if err := shown.Delete(); err != nil {
+				s.err = err.Error()
+				return
+			}
+			if s.preview.path != "" && strings.HasPrefix(s.preview.path, filepath.Dir(shown.Snapshot().Audio)) {
+				s.preview.reset()
+			}
+			s.runs = slices.Delete(s.runs, s.shown, s.shown+1)
+			s.shown = 0
+		}
+	})
+	if saved {
+		ui.Text(c, "记录保存在 "+score.HistoryDir(a.be.layout)+"；再次分析同一首歌时复用其中已分离的分轨。").FontSize(12).TextColor(t.TextMuted).Selectable()
+	}
 }

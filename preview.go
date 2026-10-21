@@ -111,6 +111,17 @@ func (pv *audioPreview) show(c *ui.Context, tk *fluent.Tokens, empty string, act
 		Border(1, tk.CardStroke).Radius(fluent.OverlayRadius)
 }
 
+// reset 停止播放并清空预览（显示的文件已被删除时使用）；正在后台解码的结果会因 path 不符而被丢弃。
+func (pv *audioPreview) reset() {
+	if pv.player != nil {
+		pv.player.Stop()
+	}
+	if pv.original != nil && pv.original != pv.player {
+		pv.original.Stop()
+	}
+	*pv = audioPreview{handle: pv.handle, title: pv.title}
+}
+
 // swap 把播放的音源换成 snd（例如合成的和弦伴奏），保留播放位置与播放状态；波形仍显示原文件。
 // snd 为 nil 时换回原文件。
 func (pv *audioPreview) swap(snd *audio.Sound) {

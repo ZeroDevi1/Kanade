@@ -5,6 +5,8 @@
 - clap：laion/clap-htsat-unfused（Apache-2.0，LAION 官方转换的 CLAP），约 615 MB；固定到提交以保证可复现，
   经 KANADE_HF_ENDPOINT 可走镜像。未用音乐专用的 laion/larger_clap_music：它在 transformers 中的权重 logit_scale
   约为 1、音频与文本嵌入几乎正交（2026-10-21 用真实歌曲实测相似度均在 ±0.02 内），零样本分类退化为均匀分布。
+- btc：BTC-ISMIR19 的大词汇量和弦模型 btc_model_large_voca.pt（MIT），约 12 MB，固定到上游提交；
+  经 KANADE_GITHUB_MIRROR 可走镜像。
 - some：openvpi/SOME 的 v1.0.0-baseline 权重（MIT），GitHub release 上的 zip（约 435 MB），下载后解压并删除 zip；
   经 KANADE_GITHUB_MIRROR 可走镜像。
 """
@@ -49,7 +51,11 @@ SOME_CKPT = "some/0119_continuous256_5spk/model_ckpt_steps_100000_simplified.ckp
 SOME = [Asset("https://github.com/openvpi/SOME/releases/download/v1.0.0-baseline/0119_continuous128_5spk.zip",
               "some/some.zip", 435401333, unpacks=SOME_CKPT)]
 
-GROUPS = {"beat_this": BEAT_THIS, "clap": CLAP, "some": SOME}
+BTC_CKPT = "btc/btc_model_large_voca.pt"
+BTC = [Asset("https://github.com/jayg996/BTC-ISMIR19/raw/2682317be668032e6e4b269ded36adaa2ad57df0/test/btc_model_large_voca.pt",
+             BTC_CKPT, 12229576)]
+
+GROUPS = {"beat_this": BEAT_THIS, "clap": CLAP, "some": SOME, "btc": BTC}
 
 
 def path(asset_local: str) -> Path:

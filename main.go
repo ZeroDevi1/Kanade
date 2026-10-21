@@ -78,6 +78,7 @@ func main() {
 			opts.TrafficLightPosition = &mygo.Point{X: 18, Y: (titleBarHeight-16)/2 + 1}
 		}
 		a.win = mygo.NewWindow(opts)
+		clearCaptionAccent(a.win.NativeHandle())
 		a.post = a.win.Update
 		// Conductor 的状态变化来自后台 goroutine：经 Update 回到 UI 线程重建视图（视图读取的是快照）。
 		a.be = startBackend(func() { a.post(func() {}) })

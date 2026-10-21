@@ -30,7 +30,7 @@ func TestColorOrientationAndSteps(t *testing.T) {
 	a := &Analysis{Duration: 8, Downbeats: []float64{0, 4}}
 	a.Key.TonicPC, a.Key.Mode = 0, "major"
 	a.Chords = []Segment{
-		{0, 2, "C", ip(0), "maj"}, {2, 4, "G", ip(7), "maj"}, {4, 6, "F", ip(5), "maj"}, {6, 7, "N", nil, ""}, {7, 8, "C", ip(0), "maj"},
+		{0, 2, "C", ip(0), "maj", nil}, {2, 4, "G", ip(7), "maj", nil}, {4, 6, "F", ip(5), "maj", nil}, {6, 7, "N", nil, "", nil}, {7, 8, "C", ip(0), "maj", nil},
 	}
 	ca := a.ColorAnalysis()
 	if len(ca.Points) != 4 || len(ca.Steps) != 3 {
@@ -61,7 +61,7 @@ func TestSpotsMergeAndSmooth(t *testing.T) {
 	a := &Analysis{Duration: 6}
 	a.Key.TonicPC, a.Key.Mode = 1, "major"
 	// Db 与 Ebm 的 f₅ 相同，合并为一个点；时长长的排在前面。
-	a.Chords = []Segment{{0, 1, "Ebm", ip(3), "min"}, {1, 4, "Db", ip(1), "maj"}, {4, 6, "Ab", ip(8), "maj"}}
+	a.Chords = []Segment{{0, 1, "Ebm", ip(3), "min", nil}, {1, 4, "Db", ip(1), "maj", nil}, {4, 6, "Ab", ip(8), "maj", nil}}
 	sp := a.ColorAnalysis().Spots()
 	if len(sp) != 2 || sp[0].Label != "Db / Ebm" || sp[0].Seconds != 4 {
 		t.Errorf("spots %+v", sp)
