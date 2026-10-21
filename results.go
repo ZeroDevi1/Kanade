@@ -83,7 +83,12 @@ func (rs *resultSet) show(c *ui.Context, tk *fluent.Tokens, a *app, empty string
 	if len(rs.items) < 2 {
 		return
 	}
-	ui.Text(c, fmt.Sprintf("本次生成（%d）", len(rs.items))).FontSize(12).TextColor(t.TextMuted)
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, fmt.Sprintf("本次生成（%d）", len(rs.items))).FontSize(12).TextColor(t.TextMuted).Grow(1)
+		if ui.Button(c, "全部保存…").Tooltip("选择一个文件夹，把列表中的全部结果按建议文件名复制进去").Clicked() {
+			a.saveAllResults(rs)
+		}
+	})
 	for _, r := range rs.items {
 		label := r.title
 		if label == "" {
@@ -110,6 +115,54 @@ func (a *app) saveResult(rs *resultSet, r *result) {
 			r.saved = dst
 		}
 	})
+}
+
+// saveAllResults 选择一个文件夹，把 rs 中的全部结果复制进去；文件名为各自的建议名，与已有文件重名时加序号，不覆盖。
+// 逐个复制，某个失败时继续其余文件，最后在 rs.err 汇总失败项；已成功的项记录保存位置。
+func (a *app) saveAllResults(rs *resultSet) {
+	type job struct {
+		r              *result
+		src, name, dst string
+		err            error
+	}
+	jobs := make([]*job, len(rs.items))
+	for i, r := range rs.items {
+		jobs[i] = &job{r: r, src: r.path, name: safeFileName(r.name) + filepath.Ext(r.path)}
+	}
+	dir := a.saveDir
+	if dir == "" {
+		dir = a.be.layout.Outputs
+	}
+	win := a.win
+	go func() {
+		dirs, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
+			Parent: win, Title: "全部保存到文件夹", DefaultPath: dir, Directory: true, CreateDirectories: true,
+		})
+		if err != nil || len(dirs) == 0 {
+			return
+		}
+		dst := dirs[0]
+		var failed []string
+		for _, j := range jobs {
+			// uniquePath 依据磁盘现状去重，须在上一个文件写完后再算下一个，同名结果才不会互相覆盖。
+			j.dst = uniquePath(dst, j.name)
+			if j.err = copyFileAtomic(j.src, j.dst); j.err != nil {
+				failed = append(failed, j.name+"："+j.err.Error())
+			}
+		}
+		a.post(func() {
+			a.saveDir = dst
+			for _, j := range jobs {
+				if j.err == nil {
+					j.r.saved = j.dst
+				}
+			}
+			rs.err = ""
+			if len(failed) > 0 {
+				rs.err = fmt.Sprintf("%d 个文件保存失败：\n%s", len(failed), strings.Join(failed, "\n"))
+			}
+		})
+	}()
 }
 
 // saveFileAs 打开保存对话框，把 src 复制到用户选择的位置；done 在 UI 线程调用（用户取消时不调用）。
