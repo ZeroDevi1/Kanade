@@ -24,6 +24,11 @@ type audioPreview struct {
 	err     string
 	peaks   *waveform.Peaks
 	player  *audio.Player
+	// samples / rate / ch 是当前文件解码后的采样（见 loadedAudio），供在其上叠加合成音；多声道文件为 nil。
+	samples  []float32
+	rate, ch int
+	// original 是文件本身的播放器；swap 换成其他音源后，restore 用它换回。
+	original *audio.Player
 }
 
 // load 开始在后台解码 path；与当前文件相同时不做任何事。
@@ -49,7 +54,11 @@ func (pv *audioPreview) load(a *app, path string) {
 			if pv.player != nil {
 				pv.player.Stop()
 			}
-			pv.peaks, pv.player = &la.peaks, la.player
+			if pv.original != nil && pv.original != pv.player {
+				pv.original.Stop()
+			}
+			pv.peaks, pv.player, pv.original = &la.peaks, la.player, la.player
+			pv.samples, pv.rate, pv.ch = la.samples, la.rate, la.ch
 		})
 	}()
 }
@@ -100,4 +109,29 @@ func (pv *audioPreview) show(c *ui.Context, tk *fluent.Tokens, empty string, act
 	}
 	waveform.Show(c, &pv.handle, pv.peaks, pb).Height(96).Background(tk.Card).
 		Border(1, tk.CardStroke).Radius(fluent.OverlayRadius)
+}
+
+// swap 把播放的音源换成 snd（例如合成的和弦伴奏），保留播放位置与播放状态；波形仍显示原文件。
+// snd 为 nil 时换回原文件。
+func (pv *audioPreview) swap(snd *audio.Sound) {
+	if pv.player == nil {
+		return
+	}
+	next := pv.original
+	if snd != nil {
+		next = snd.NewPlayer()
+	}
+	if next == pv.player {
+		return
+	}
+	pos, playing := pv.player.Position(), pv.player.Playing()
+	pv.player.Pause()
+	if pv.player != pv.original {
+		pv.player.Stop()
+	}
+	next.Seek(min(pos, next.Duration()))
+	if playing {
+		next.Play()
+	}
+	pv.player = next
 }

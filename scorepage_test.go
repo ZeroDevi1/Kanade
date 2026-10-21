@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -9,6 +12,7 @@ import (
 	"kanade/engines"
 	"kanade/internal/conductor"
 	"kanade/internal/paths"
+	"kanade/internal/score"
 )
 
 // 音乐分析：智能模式只有歌曲与「分离伴奏」；专业模式出现全部参数。不分离时直接提交 score.analyze。
@@ -48,4 +52,52 @@ func TestScorePage(t *testing.T) {
 		t.Fatalf("jobs %+v, err %q", jobs, a.score.err)
 	}
 	a.score.runs[0].Cancel()
+}
+
+// fileJobs 让分析流水线直接返回给定的 analysis.json。
+type fileJobs struct{ path string }
+
+func (f fileJobs) Submit(string, string, map[string]any) (string, error) { return "j", nil }
+func (f fileJobs) Wait(context.Context, string) (conductor.Job, error) {
+	return conductor.Job{State: conductor.JobDone, Artifacts: []string{f.path}}, nil
+}
+func (fileJobs) Cancel(string) {}
+
+// 乐谱：爵士谱按拍放置和弦记号与反复记号，级数记法相对调号；五线谱渲染谱号与和弦记号；和弦伴奏在后台合成。
+func TestScoreSheet(t *testing.T) {
+	js := filepath.Join(t.TempDir(), "analysis.json")
+	os.WriteFile(js, []byte(`{"duration": 8, "beats": [0,0.5,1,1.5,2,2.5,3,3.5,4,4.5,5,5.5,6,6.5,7,7.5],
+		"downbeats": [0,2,4,6], "key": {"label": "C 大调", "tonic_pc": 0, "mode": "major"},
+		"chords": [{"start":0,"end":1,"label":"C","root":0,"quality":"maj"},{"start":1,"end":2,"label":"Am7","root":9,"quality":"min7"},
+		{"start":2,"end":3,"label":"C","root":0,"quality":"maj"},{"start":3,"end":4,"label":"Am7","root":9,"quality":"min7"},
+		{"start":4,"end":8,"label":"Fmaj7","root":5,"quality":"maj7"}]}`), 0o644)
+	l := paths.New(t.TempDir())
+	cond, _ := conductor.New(l, engines.FS, nil)
+	a := newApp()
+	a.be, a.current = backend{layout: l, cond: cond}, "score"
+	run, err := score.Start(fileJobs{js}, score.Request{Input: "/x/歌.flac", Options: score.DefaultOptions()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for run.Snapshot().Running() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	a.score.runs = []*score.Run{run}
+	tt := ui.NewTester(a.view, 1200, 6000)
+	for _, want := range []string{"C", "A-7", "%", "FΔ7", "/"} {
+		if !tt.HasText(want) {
+			t.Errorf("jazz sheet missing %q", want)
+		}
+	}
+	a.score.sheet.style = symbolStyles[2].Title
+	tt.Frame()
+	if !tt.HasText("vi7") || !tt.HasText("IVΔ7") {
+		t.Errorf("roman texts %q", tt.Texts())
+	}
+	if err := tt.Click("五线谱"); err != nil {
+		t.Fatal(err)
+	}
+	if !tt.HasText("𝄞") || !tt.HasText("𝄢") {
+		t.Errorf("staff texts %q", tt.Texts())
+	}
 }

@@ -70,10 +70,13 @@ func startBackend(onChange func()) backend {
 // scratchDirName 是系统临时目录下的暂存区名称。
 const scratchDirName = "Kanade-scratch"
 
-// loadedAudio 是解码后的音频：用于波形的峰值与播放器。
+// loadedAudio 是解码后的音频：用于波形的峰值与播放器。samples 是交错的采样（单声道或立体声，与播放器共用、不可修改），
+// 多于两个声道的文件为 nil。
 type loadedAudio struct {
-	peaks  waveform.Peaks
-	player *audio.Player
+	peaks    waveform.Peaks
+	player   *audio.Player
+	samples  []float32
+	rate, ch int
 }
 
 // loadAudio 读取 path 的音频文件（WAV，或 audio 包已注册的格式），解码为采样并计算峰值。
@@ -102,14 +105,18 @@ func loadAudio(path string) (loadedAudio, error) {
 	}
 	// NewSound 只接受单声道或立体声；更多声道时让 DecodeSound 自行取前两个声道。
 	var snd *audio.Sound
+	kept := samples
 	if ch <= 2 {
 		snd = audio.NewSound(dec.SampleRate(), ch, samples)
 	} else if snd, err = audio.DecodeSound(data); err != nil {
 		return loadedAudio{}, err
+	} else {
+		kept = nil
 	}
 	return loadedAudio{
-		peaks:  waveform.Compute(samples, ch, dec.SampleRate(), waveform.DefaultFramesPerBucket),
-		player: snd.NewPlayer(),
+		peaks:   waveform.Compute(samples, ch, dec.SampleRate(), waveform.DefaultFramesPerBucket),
+		player:  snd.NewPlayer(),
+		samples: kept, rate: dec.SampleRate(), ch: ch,
 	}, nil
 }
 

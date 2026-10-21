@@ -311,6 +311,9 @@ type Analysis struct {
 	Key       struct {
 		// Label 是整首的调号；有转调时（Segments 多于一段）它是各段的折中，界面以 Segments 为准。
 		Label       string  `json:"label"`
+		TonicPC     int     `json:"tonic_pc"` // 主音音级，0 = C
+		Mode        string  `json:"mode"`     // major / minor
+		Flats       bool    `json:"flats"`    // 是否用降号拼写
 		Relative    string  `json:"relative"`
 		Confidence  string  `json:"confidence"` // 高 / 中 / 低
 		Correlation float64 `json:"correlation"`
@@ -335,11 +338,13 @@ type Analysis struct {
 	} `json:"emotion"`
 }
 
-// Segment 是一段带标签的时间区间（秒）。
+// Segment 是一段带标签的时间区间（秒）。和弦段另有根音与性质（无和弦 N 时 Root 为 nil）。
 type Segment struct {
-	Start float64 `json:"start"`
-	End   float64 `json:"end"`
-	Label string  `json:"label"`
+	Start   float64 `json:"start"`
+	End     float64 `json:"end"`
+	Label   string  `json:"label"`
+	Root    *int    `json:"root,omitempty"`    // 根音音级，0 = C
+	Quality string  `json:"quality,omitempty"` // 和弦性质，见引擎 harmony.QUALITIES
 }
 
 // ReadAnalysis 读取并解析 analysis.json。

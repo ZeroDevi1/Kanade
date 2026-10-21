@@ -34,6 +34,7 @@ type scoreState struct {
 	runs    []*score.Run
 	shown   int
 	preview audioPreview
+	sheet   sheetState
 	dlJob   string
 	err     string
 }
@@ -42,7 +43,8 @@ func newScoreState() scoreState {
 	d := score.DefaultOptions()
 	return scoreState{separate: true, stemChoice: coverStemChoices[0], beatTitle: score.BeatMethods[0].Title,
 		profileTitle: score.KeyProfiles[0].Title, vocabTitle: score.ChordVocabs[0].Title, foldMin: 70, foldMax: 180,
-		keySegment: d.KeySegmentS, selfProb: d.ChordSelfProb, minBeats: float64(d.ChordMinBeats), emotion: true}
+		keySegment: d.KeySegmentS, selfProb: d.ChordSelfProb, minBeats: float64(d.ChordMinBeats), emotion: true,
+		sheet: newSheetState()}
 }
 
 func keyOf(list []struct{ Key, Title string }, title string) string {
@@ -97,7 +99,8 @@ func (a *app) scorePage(c *ui.Context, tk *fluent.Tokens) {
 	res := st.Result
 	a.scoreSummary(c, tk, s.runs[s.shown], st)
 	card(c, tk, "试听", func() { a.scorePlayer(c, tk, res) })
-	card(c, tk, "和弦谱", func() { a.scoreChordChart(c, res) })
+	a.scoreSheetCard(c, tk, res)
+	a.scoreColorCard(c, tk, res)
 	if res.Emotion != nil {
 		card(c, tk, "情绪", func() { a.scoreEmotion(c, res) })
 	}
@@ -365,6 +368,7 @@ func (a *app) scorePlayer(c *ui.Context, tk *fluent.Tokens, res *score.Analysis)
 	t := c.Theme()
 	s := &a.score
 	s.preview.show(c, tk, "", nil)
+	a.scorePlaySource(c, res)
 	pos, seek := a.scorePosition()
 	bar, beat := res.BarAt(pos)
 	cur, next := "—", ""
@@ -391,54 +395,6 @@ func (a *app) scorePlayer(c *ui.Context, tk *fluent.Tokens, res *score.Analysis)
 			})
 		}
 	})
-}
-
-// scoreChordChart 按小节显示和弦谱（每行 4 小节），高亮播放位置所在的小节，点击小节跳转播放。
-func (a *app) scoreChordChart(c *ui.Context, res *score.Analysis) {
-	t := c.Theme()
-	bars := res.Bars()
-	if len(bars) == 0 {
-		ui.Text(c, "没有检测到小节线，无法排成和弦谱。").TextColor(t.TextMuted)
-		return
-	}
-	pos, seek := a.scorePosition()
-	tk := fluent.For(t)
-	for row := 0; row < len(bars); row += 4 {
-		ui.Row(c.Key(fmt.Sprintf("chart-%d", row))).Gap(6).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, fmt.Sprintf("%d", row+1)).FontSize(12).Font("monospace").TextColor(t.TextMuted).Width(32)
-			ui.Text(c, score.Clock(bars[row].Start)).FontSize(12).Font("monospace").TextColor(t.TextMuted).Width(40)
-			for i := row; i < min(row+4, len(bars)); i++ {
-				b := bars[i]
-				label := strings.Join(b.Chords, "  ")
-				if label == "" {
-					label = "N"
-				}
-				btn := ui.ButtonBase(c.Key(fmt.Sprintf("bar-%d", i))).Grow(1).Basis(0).Height(36).Padding(0, 10).
-					Radius(fluent.ControlRadius).AlignItems(ui.Center).Label(fmt.Sprintf("第 %d 小节 %s", i+1, label)).
-					Border(1, tk.CardStroke)
-				playing := pos >= b.Start && pos < b.End
-				switch {
-				case playing:
-					btn.Background(t.Accent)
-				case btn.Hovered():
-					btn.Background(tk.SubtleHover)
-				}
-				btn.Children(func() {
-					txt := ui.Text(c, label).FontSize(14).SingleLine()
-					if playing {
-						txt.TextColor(t.AccentText)
-					}
-				})
-				if btn.Clicked() {
-					seek(b.Start)
-				}
-			}
-			// 最后一行不足 4 小节时用占位补齐，保持各列宽度一致。
-			for i := len(bars); i < row+4; i++ {
-				ui.Box(c.Key(fmt.Sprintf("bar-pad-%d", i))).Grow(1).Basis(0)
-			}
-		})
-	}
 }
 
 // scoreEmotion 显示情绪分布、效价 / 唤醒度与随时间的变化（与试听同步，点击跳转）。

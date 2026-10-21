@@ -17,7 +17,7 @@ import (
 
 func sample() *Analysis {
 	a := &Analysis{Duration: 10, Beats: []float64{0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5}, Downbeats: []float64{0.5, 2.5, 4.5}}
-	a.Chords = []Segment{{0, 2.5, "C"}, {2.5, 3.5, "G"}, {3.5, 4.5, "Am"}, {4.5, 10, "F"}}
+	a.Chords = []Segment{{Start: 0, End: 2.5, Label: "C"}, {Start: 2.5, End: 3.5, Label: "G"}, {Start: 3.5, End: 4.5, Label: "Am"}, {Start: 4.5, End: 10, Label: "F"}}
 	a.Key.Label = "C 大调"
 	return a
 }
