@@ -351,15 +351,24 @@ func (a *app) scoreSummary(c *ui.Context, tk *fluent.Tokens, run *score.Run, st 
 			}
 			export("导出分析 JSON…", st.Files["analysis"], name+"_analysis")
 			export("导出和弦标注 .lab…", st.Files["chords"], name+"_chords")
-			if ui.Button(c, "导出和弦谱 .txt…").Clicked() {
-				// 和弦谱由界面生成：先写到暂存区，再走统一的另存流程。
-				p := filepath.Join(filepath.Dir(st.Files["analysis"]), "chord_chart.txt")
-				if err := os.WriteFile(p, []byte(res.ChordChart(name)), 0o644); err != nil {
-					s.err = err.Error()
-				} else {
-					a.saveFileAs(p, name+"_和弦谱", func(_ string, err error) { s.err = errText(err) })
+			// 和弦谱与 MIDI 由界面生成：先写到暂存区（不写进分析记录的目录），再走统一的另存流程。
+			generated := func(label, file, saveName string, content func() ([]byte, error)) {
+				if !ui.Button(c.Key("export-"+label), label).Clicked() {
+					return
 				}
+				data, err := content()
+				p := filepath.Join(a.be.layout.Scratch, file)
+				if err == nil {
+					err = os.WriteFile(p, data, 0o644)
+				}
+				if err != nil {
+					s.err = err.Error()
+					return
+				}
+				a.saveFileAs(p, saveName, func(_ string, err error) { s.err = errText(err) })
 			}
+			generated("导出和弦谱 .txt…", "chord_chart.txt", name+"_和弦谱", func() ([]byte, error) { return []byte(res.ChordChart(name)), nil })
+			generated("导出 MIDI…", "score.mid", name, res.MIDI)
 		})
 	})
 }
