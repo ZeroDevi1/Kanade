@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"slices"
 
 	"github.com/egoist/mygo/audio"
 	"github.com/egoist/mygo/ui"
@@ -19,8 +20,8 @@ const (
 
 const (
 	playOriginal = iota // 原曲
-	playChords          // 和弦伴奏
-	playBoth            // 原曲 + 和弦伴奏
+	playChords          // 钢琴（和弦铺底，可加旋律）
+	playBoth            // 原曲 + 钢琴
 )
 
 // symbolStyles 是和弦记号写法的选项（标题 → score.Symbol* 键）。
@@ -42,15 +43,19 @@ type sheetState struct {
 	lastRow  int    // 上一帧所在的行，用于只在换行时滚动
 	lastView int    // 上一帧的视图；切换视图后立即滚到当前行
 
-	synthFor  *score.Analysis
-	synthBusy bool
-	chords    *audio.Sound // 和弦伴奏
-	both      *audio.Sound // 原曲 + 和弦伴奏
-	synthErr  string
+	// melody 为 true 时钢琴同时弹旋律（有旋律线时才可选）。
+	melody bool
+
+	synthFor   *score.Analysis
+	synthMelod bool // 缓存的合成是否含旋律
+	synthBusy  bool
+	chords     *audio.Sound // 和弦伴奏
+	both       *audio.Sound // 原曲 + 和弦伴奏
+	synthErr   string
 }
 
 func newSheetState() sheetState {
-	return sheetState{style: symbolStyles[0].Title, follow: true, lastRow: -1}
+	return sheetState{style: symbolStyles[0].Title, follow: true, lastRow: -1, melody: true}
 }
 
 func (s *sheetState) styleKey() string {
@@ -62,26 +67,30 @@ func (s *sheetState) styleKey() string {
 	return score.SymbolJazz
 }
 
-// scorePlaySource 是试听卡片中的音源切换：和弦伴奏在后台合成，完成后保持播放位置切换过去。
+// scorePlaySource 是试听卡片中的音源切换：钢琴在后台合成，完成后保持播放位置切换过去。
 func (a *app) scorePlaySource(c *ui.Context, res *score.Analysis) {
 	t := c.Theme()
 	s := &a.score.sheet
 	pv := &a.score.preview
+	hasMelody := res.Melody != nil && len(res.Melody.Notes) > 0
 	ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-		if ui.Segmented(c, &s.play, "原曲", "和弦伴奏", "原曲 + 和弦").Label("播放音源").Changed() {
+		if ui.Segmented(c, &s.play, "原曲", "钢琴", "原曲 + 钢琴").Label("播放音源").Changed() {
+			a.applyPlaySource(res)
+		}
+		if hasMelody && ui.Checkbox(c, &s.melody, "钢琴弹旋律").Changed() && s.play != playOriginal {
 			a.applyPlaySource(res)
 		}
 		switch {
 		case s.synthBusy:
 			ui.Spinner(c)
-			ui.Text(c, "正在合成和弦伴奏…").FontSize(12).TextColor(t.TextMuted)
+			ui.Text(c, "正在合成钢琴…").FontSize(12).TextColor(t.TextMuted)
 		case s.synthErr != "":
 			ui.Text(c, s.synthErr).FontSize(12).TextColor(t.Danger)
 		case s.play != playOriginal:
-			ui.Text(c, "按谱面弹奏：低音为根音，高音声部为密集排列，每小节重新弹奏。").FontSize(12).TextColor(t.TextMuted)
+			ui.Text(c, "钢琴以弱力度的柱式和弦铺底（模态钢琴模型），每小节重新弹奏。").FontSize(12).TextColor(t.TextMuted)
 		}
 	})
-	// 切换到别的分析结果（或重新载入原曲）后，合成缓存失效，回到原曲。
+	// 切换到别的分析结果后，合成缓存失效，回到原曲。
 	if s.synthFor != nil && s.synthFor != res {
 		s.synthFor, s.chords, s.both = nil, nil, nil
 		if s.play != playOriginal {
@@ -101,7 +110,8 @@ func (a *app) applyPlaySource(res *score.Analysis) {
 		pv.swap(nil)
 		return
 	}
-	if s.synthFor == res && s.chords != nil {
+	withMelody := s.melody && res.Melody != nil
+	if s.synthFor == res && s.synthMelod == withMelody && s.chords != nil {
 		if s.play == playChords {
 			pv.swap(s.chords)
 		} else {
@@ -118,10 +128,10 @@ func (a *app) applyPlaySource(res *score.Analysis) {
 		rate = 44100
 	}
 	go func() {
-		pcm := res.SynthChords(rate)
+		pcm := res.SynthPiano(rate, withMelody)
 		var both []float32
 		if orig != nil && ch > 0 {
-			// 叠加：原曲略降 1.5 dB 给伴奏留出空间；合成音为单声道，两个声道各加一份。
+			// 叠加：原曲略降 1.5 dB 给钢琴留出空间；钢琴为单声道，两个声道各加一份。
 			frames := len(orig) / ch
 			both = make([]float32, len(orig))
 			for i := 0; i < frames; i++ {
@@ -141,7 +151,7 @@ func (a *app) applyPlaySource(res *score.Analysis) {
 				s.synthErr = "没有可合成的和弦"
 				return
 			}
-			s.synthFor, s.chords = res, audio.NewSound(rate, 1, pcm)
+			s.synthFor, s.synthMelod, s.chords = res, withMelody, audio.NewSound(rate, 1, pcm)
 			s.both = s.chords
 			if both != nil {
 				s.both = audio.NewSound(rate, ch, both)
@@ -312,7 +322,8 @@ func stepY(step int, treble bool) float32 {
 	return float32(bassBottom - float64(step-bassBase)*staffGap/2)
 }
 
-// staffSheet 是五线谱：大谱表，每行 4 小节；高音谱表为和弦的密集排列，低音谱表为根音，按占的拍数决定时值。
+// staffSheet 是五线谱（大谱表，每行 4 小节）。有旋律线时：高音谱表写旋律（量化到八分音符），低音谱表写和弦
+// （根音加和弦音，整体降一个八度）；没有旋律时：高音谱表写和弦的密集排列，低音谱表写根音。和弦记号写在最上方。
 func (a *app) staffSheet(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, ms []score.Measure, pos float64, cur int,
 	scroll bool, seek func(float64)) {
 	style := a.score.sheet.styleKey()
@@ -320,13 +331,10 @@ func (a *app) staffSheet(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, 
 	if res.Key.Flats && sig == 6 {
 		sig = -6 // F♯ / G♭ 大调按拼写选择升号或降号
 	}
-	// 声部进行跨小节连续：先按顺序算出每个事件的配置。
-	type ev struct {
-		score.Event
-		v  score.Voicing
-		ok bool
-	}
-	events := make([][]ev, len(ms))
+	transpose := res.MelodyTranspose()
+	melody := res.MelodyLayout(ms, transpose, res.Key.Flats || sig < 0)
+	// 声部进行跨小节连续：先按顺序算出每个和弦事件的配置。
+	events := make([][]staffEvent, len(ms))
 	var prev []int
 	for i, m := range ms {
 		for _, e := range m.Events() {
@@ -334,14 +342,18 @@ func (a *app) staffSheet(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, 
 			if ok {
 				prev = v.MIDIs()
 			}
-			events[i] = append(events[i], ev{e, v, ok})
+			events[i] = append(events[i], staffEvent{e, v, ok})
 		}
+	}
+	if melody != nil {
+		t := c.Theme()
+		ui.Text(c, "旋律由主唱识别并量化到八分音符，仅供参考；低音谱表为和弦。").FontSize(12).TextColor(t.TextMuted)
 	}
 	for r := 0; r < len(ms); r += measuresPerRow {
 		rowEl := ui.Row(c.Key(fmt.Sprintf("staff-row-%d", r))).Height(systemHeight).AlignItems(ui.Stretch)
 		followRow(rowEl, scroll, cur, r, len(ms))
 		rowEl.Children(func() {
-			staffHeaderBox(c, sig, ms[r].Number)
+			staffHeaderBox(c, sig, ms[r].Number, melody != nil && transpose == 12)
 			n := min(measuresPerRow, len(ms)-r)
 			area := ui.Box(c.Key(fmt.Sprintf("staff-area-%d", r))).Grow(1).MinWidth(0).Cursor(ui.CursorPointer)
 			// 点击跳到所点位置所在的拍。
@@ -357,15 +369,9 @@ func (a *app) staffSheet(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, 
 			}
 			theme := c.Theme()
 			area.Draw(func(p *ui.Painter, rc ui.Rect) {
-				ink := theme.Text
 				faint := theme.TextMuted.Alpha(0.6)
 				mw := rc.W / measuresPerRow
-				for _, top := range []float64{trebleTop, bassTop} {
-					for k := 0; k < 5; k++ {
-						y := rc.Y + float32(top+float64(k)*staffGap)
-						p.Line(rc.X, y, rc.X+mw*float32(n), y, 1, faint)
-					}
-				}
+				drawStaffLines(p, rc.X, rc.Y, mw*float32(n), faint)
 				for k := 0; k <= n; k++ {
 					x := rc.X + mw*float32(k)
 					w := float32(1)
@@ -380,7 +386,6 @@ func (a *app) staffSheet(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, 
 					x0 := rc.X + mw*float32(k)
 					if i == cur {
 						p.Fill(ui.Rect{X: x0 + 1, Y: rc.Y + trebleTop - 18, W: mw - 2, H: bassBottom - trebleTop + 36}, theme.Accent.Alpha(0.07), 4)
-						// 播放线：按拍插值。
 						if fx := measureFraction(m, pos); fx >= 0 {
 							x := x0 + mw*float32(fx)
 							p.Line(x, rc.Y+trebleTop-14, x, rc.Y+bassBottom+14, 1.5, theme.Danger.Alpha(0.7))
@@ -391,30 +396,41 @@ func (a *app) staffSheet(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, 
 							continue
 						}
 						x := x0 + mw*(float32(e.FirstBeat)+0.4)/float32(len(m.Beats))
-						color := ink
+						color := theme.Text
 						if pos >= e.Start && pos < e.End {
 							color = theme.Accent
 						}
-						var treble, bass []score.Note
-						for _, nt := range append([]score.Note{e.v.Bass}, e.v.Upper...) {
-							if nt.MIDI >= middleC {
-								treble = append(treble, nt)
-							} else {
-								bass = append(bass, nt)
-							}
+						treble, bass := e.staffNotes(melody != nil)
+						if melody == nil {
+							drawChordNotes(p, rc, x, treble, true, e.Beats, color, faint)
 						}
-						drawChordNotes(p, rc, x, treble, true, e.Beats, color, faint)
 						drawChordNotes(p, rc, x, bass, false, e.Beats, color, faint)
+					}
+					if melody != nil {
+						drawMelody(p, rc, x0, mw, melody[i], pos, theme, faint, i+1 < len(ms) && k+1 < n)
 					}
 				}
 			})
 			// 和弦记号与临时记号是文字，放在绘图区上方的绝对定位层（按比例定位，随宽度伸缩）。
 			area.Children(func() {
+				keyAcc := score.KeyAccidentals(sig)
 				for k := 0; k < n; k++ {
 					i := r + k
 					m := ms[i]
-					shown := map[int]int{} // 本小节已出现的临时记号：音级序号 → 变化
-					keyAcc := score.KeyAccidentals(sig)
+					shown := map[[2]int]int{} // 本小节已出现的临时记号：(音级序号, 是否高音谱表) → 变化
+					accidental := func(key string, nt score.Note, treble bool, frac float32) {
+						letter := ((nt.Step % 7) + 7) % 7
+						want := keyAcc[letter]
+						if prev, ok := shown[[2]int{nt.Step, b2i(treble)}]; ok {
+							want = prev
+						}
+						if nt.Accidental == want {
+							return
+						}
+						shown[[2]int{nt.Step, b2i(treble)}] = nt.Accidental
+						ui.Text(c.Key(key), score.AccidentalSign(nt.Accidental)).Absolute().LeftPercent(frac*100).
+							Top(stepY(nt.Step, treble)-11).Margin(0, 0, 0, -15).FontSize(15).NoWrap()
+					}
 					for _, e := range events[i] {
 						if !e.ok {
 							continue
@@ -422,31 +438,194 @@ func (a *app) staffSheet(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, 
 						frac := (float32(k) + (float32(e.FirstBeat)+0.4)/float32(len(m.Beats))) / measuresPerRow
 						sym := score.Symbol(e.Chord, style, res.Key.TonicPC)
 						on := pos >= e.Start && pos < e.End
-						ui.Box(c.Key(fmt.Sprintf("sym-%d-%d", i, e.FirstBeat))).Absolute().LeftPercent(frac * 100).Top(4).
+						ui.Box(c.Key(fmt.Sprintf("sym-%d-%d", i, e.FirstBeat))).Absolute().LeftPercent(frac * 100).Top(2).
 							Children(func() {
 								txt := ui.Text(c, sym).FontSize(14).FontWeight(600).NoWrap()
 								if on {
 									txt.TextColor(theme.Accent)
 								}
 							})
-						for _, nt := range append([]score.Note{e.v.Bass}, e.v.Upper...) {
-							letter := ((nt.Step % 7) + 7) % 7
-							want := keyAcc[letter]
-							if prev, ok := shown[nt.Step]; ok {
-								want = prev
+						treble, bass := e.staffNotes(melody != nil)
+						if melody == nil {
+							for _, nt := range treble {
+								accidental(fmt.Sprintf("acc-t-%d-%d-%d", i, e.FirstBeat, nt.MIDI), nt, true, frac)
 							}
-							if nt.Accidental == want {
+						}
+						for _, nt := range bass {
+							accidental(fmt.Sprintf("acc-b-%d-%d-%d", i, e.FirstBeat, nt.MIDI), nt, false, frac)
+						}
+					}
+					if melody != nil {
+						mm := melody[i]
+						for _, it := range mm.Items {
+							if it.Rest {
 								continue
 							}
-							shown[nt.Step] = nt.Accidental
-							y := stepY(nt.Step, nt.MIDI >= middleC)
-							ui.Text(c.Key(fmt.Sprintf("acc-%d-%d-%d", i, e.FirstBeat, nt.MIDI)), score.AccidentalSign(nt.Accidental)).
-								Absolute().LeftPercent(frac*100).Top(y-11).Margin(0, 0, 0, -15).FontSize(15).NoWrap()
+							frac := (float32(k) + melodyX(it, mm)) / measuresPerRow
+							accidental(fmt.Sprintf("acc-m-%d-%d", i, it.Slot), it.Note, true, frac)
 						}
 					}
 				}
 			})
 		})
+	}
+}
+
+// staffEvent 是五线谱上一个和弦事件及其配置。
+type staffEvent struct {
+	score.Event
+	v  score.Voicing
+	ok bool
+}
+
+// staffNotes 把和弦的音分到两行谱表。withMelody 为 true 时高音谱表留给旋律，和弦音整体降一个八度写在低音谱表
+// （与根音同音的不重复）；否则以中央 C 为界分开。
+func (e staffEvent) staffNotes(withMelody bool) (treble, bass []score.Note) {
+	if withMelody {
+		bass = append(bass, e.v.Bass)
+		for _, u := range e.v.Upper {
+			low := u
+			low.MIDI -= 12
+			low.Step -= 7
+			if low.MIDI != e.v.Bass.MIDI {
+				bass = append(bass, low)
+			}
+		}
+		slices.SortFunc(bass, func(a, b score.Note) int { return a.Step - b.Step })
+		return nil, bass
+	}
+	for _, nt := range append([]score.Note{e.v.Bass}, e.v.Upper...) {
+		if nt.MIDI >= middleC {
+			treble = append(treble, nt)
+		} else {
+			bass = append(bass, nt)
+		}
+	}
+	return treble, bass
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// melodyX 是旋律音在小节内的横向位置（0–1）：按网格位置均分，音符画在所占第一格的中部。
+func melodyX(it score.MelodyItem, mm score.MelodyMeasure) float32 {
+	return (float32(it.Slot) + 0.45) / float32(max(mm.Slots, 1))
+}
+
+// drawStaffLines 画大谱表的十条线。
+func drawStaffLines(p *ui.Painter, x, y, w float32, color ui.Color) {
+	for _, top := range []float64{trebleTop, bassTop} {
+		for k := 0; k < 5; k++ {
+			yy := y + float32(top+float64(k)*staffGap)
+			p.Line(x, yy, x+w, yy, 1, color)
+		}
+	}
+}
+
+// drawMelody 画一个小节的旋律：音符（符头、符干、符尾、附点、加线）、休止符与连音线。
+// tieOut 为 false 时（行末）跨小节的连音线只画到小节线。
+func drawMelody(p *ui.Painter, rc ui.Rect, x0, mw float32, mm score.MelodyMeasure, pos float64, theme *ui.Theme,
+	faint ui.Color, tieOut bool) {
+	for idx, it := range mm.Items {
+		x := x0 + mw*melodyX(it, mm)
+		color := theme.Text
+		if pos >= it.Start && pos < it.End {
+			color = theme.Accent
+		}
+		if it.Rest {
+			drawRest(p, x, rc.Y, it.Len, color)
+			continue
+		}
+		drawMelodyNote(p, rc, x, it, color, faint)
+		if it.TieNext {
+			// 连音线画到下一个音符；它在下一小节时画到本小节末尾（行末）或下一小节第一个音符的位置。
+			x1 := x0 + mw
+			if idx+1 < len(mm.Items) {
+				x1 = x0 + mw*melodyX(mm.Items[idx+1], mm)
+			} else if tieOut {
+				x1 = x0 + mw + mw*0.45/float32(max(mm.Slots, 1))
+			}
+			y := rc.Y + stepY(it.Note.Step, true)
+			up := it.Note.Step >= 34 // 符干朝下时连音线在上方
+			dy := float32(6)
+			if up {
+				dy = -6
+			}
+			path := (&ui.Path{}).MoveTo(x+3, y+dy*0.8).QuadTo((x+x1)/2, y+dy*2.2, x1-3, y+dy*0.8)
+			p.StrokePath(path, 1.2, color)
+		}
+	}
+}
+
+// drawMelodyNote 画一个旋律音：加线、符头（二分及以上空心）、附点、符干（低于第三线朝上）与八分音符的符尾。
+func drawMelodyNote(p *ui.Painter, rc ui.Rect, x float32, it score.MelodyItem, color, faint ui.Color) {
+	step := it.Note.Step
+	y := rc.Y + stepY(step, true)
+	for s := trebleBase - 2; s >= step; s -= 2 {
+		yy := rc.Y + stepY(s, true)
+		p.Line(x-headW*0.9, yy, x+headW*0.9, yy, 1, faint)
+	}
+	for s := trebleBase + 10; s <= step; s += 2 {
+		yy := rc.Y + stepY(s, true)
+		p.Line(x-headW*0.9, yy, x+headW*0.9, yy, 1, faint)
+	}
+	head := ui.Rect{X: x - headW/2, Y: y - headH/2, W: headW, H: headH}
+	if it.Len >= 4 {
+		p.Stroke(head, color, headH/2, 1.6)
+	} else {
+		p.Fill(head, color, headH/2)
+	}
+	if it.Len == 3 || it.Len == 6 {
+		p.Fill(ui.Rect{X: x + headW/2 + 3, Y: y - 1.5, W: 3, H: 3}, color, 1.5)
+	}
+	if it.Len >= 8 {
+		return
+	}
+	up := step < 34 // 第三线（B4）以下符干朝上
+	stemLen := float32(3.5 * staffGap)
+	if up {
+		sx := x + headW/2 - 0.6
+		p.Line(sx, y, sx, y-stemLen, 1.2, color)
+		if it.Len == 1 {
+			path := (&ui.Path{}).MoveTo(sx, y-stemLen).CubeTo(sx+2, y-stemLen+8, sx+9, y-stemLen+10, sx+6, y-stemLen+20)
+			p.StrokePath(path, 1.4, color)
+		}
+	} else {
+		sx := x - headW/2 + 0.6
+		p.Line(sx, y, sx, y+stemLen, 1.2, color)
+		if it.Len == 1 {
+			path := (&ui.Path{}).MoveTo(sx, y+stemLen).CubeTo(sx+2, y+stemLen-8, sx+9, y+stemLen-10, sx+6, y+stemLen-20)
+			p.StrokePath(path, 1.4, color)
+		}
+	}
+}
+
+// drawRest 画休止符（高音谱表）：全休止挂在第四线下，二分休止坐在第三线上，四分休止为折线，八分休止为圆点加斜线；
+// 附点时值在右侧加点。字体中通常没有休止符字形，因此用路径绘制。
+func drawRest(p *ui.Painter, x, y0 float32, l int, color ui.Color) {
+	line := func(k int) float32 { return y0 + float32(trebleTop+float64(k)*staffGap) } // 第 k 线（从上往下 0–4）
+	switch {
+	case l >= 8:
+		p.Fill(ui.Rect{X: x - 5, Y: line(1), W: 10, H: 4}, color, 0)
+	case l >= 4:
+		p.Fill(ui.Rect{X: x - 5, Y: line(2) - 4, W: 10, H: 4}, color, 0)
+	case l >= 2:
+		yt := line(1)
+		path := (&ui.Path{}).MoveTo(x-2, yt).LineTo(x+3, yt+7).LineTo(x-2, yt+13).LineTo(x+3, yt+19).
+			QuadTo(x-5, yt+17, x-1, yt+25)
+		p.StrokePath(path, 2, color)
+	default:
+		yt := line(1) + 4
+		p.Fill(ui.Rect{X: x - 3, Y: yt - 2, W: 4, H: 4}, color, 2)
+		p.Line(x+3, yt, x-1, yt+16, 1.5, color)
+		p.Line(x-3, yt+1, x+3, yt, 1.2, color)
+	}
+	if l == 3 || l == 6 {
+		p.Fill(ui.Rect{X: x + 8, Y: line(2) - 6, W: 3, H: 3}, color, 1.5)
 	}
 }
 
@@ -534,18 +713,13 @@ func drawChordNotes(p *ui.Painter, rc ui.Rect, x float32, notes []score.Note, tr
 	}
 }
 
-// staffHeaderBox 是每个系统开头的谱号与调号（以及小节号）。
-func staffHeaderBox(c *ui.Context, sig, number int) {
+// staffHeaderBox 是每个系统开头的谱号与调号（以及小节号）。octaveUp 为 true 时高音谱号下方标「8」：旋律按高八度记谱。
+func staffHeaderBox(c *ui.Context, sig, number int, octaveUp bool) {
 	t := c.Theme()
 	box := ui.Box(c).Width(staffHeader).Shrink(0)
 	box.Draw(func(p *ui.Painter, rc ui.Rect) {
 		faint := t.TextMuted.Alpha(0.6)
-		for _, top := range []float64{trebleTop, bassTop} {
-			for k := 0; k < 5; k++ {
-				y := rc.Y + float32(top+float64(k)*staffGap)
-				p.Line(rc.X, y, rc.X+rc.W, y, 1, faint)
-			}
-		}
+		drawStaffLines(p, rc.X, rc.Y, rc.W, faint)
 		// 系统左端的连线与花括号的位置用一条粗线代替。
 		p.Line(rc.X+1, rc.Y+trebleTop, rc.X+1, rc.Y+bassBottom, 2, faint)
 	})
@@ -553,6 +727,9 @@ func staffHeaderBox(c *ui.Context, sig, number int) {
 		ui.Text(c, fmt.Sprint(number)).Absolute().Left(4).Top(trebleTop - 30).FontSize(10).Font("monospace").TextColor(t.TextMuted)
 		// 谱号字形（U+1D11E / U+1D122）的字号按谱表高度标定：高音谱号约跨 7 个线距，低音谱号约跨 3 个。
 		ui.Text(c, "𝄞").Absolute().Left(6).Top(trebleTop - 30).FontSize(58).NoWrap()
+		if octaveUp {
+			ui.Text(c, "8").Absolute().Left(17).Top(trebleBottom + 10).FontSize(10).NoWrap()
+		}
 		ui.Text(c, "𝄢").Absolute().Left(8).Top(bassTop - 15).FontSize(42).NoWrap()
 		steps, sign := sharpSteps, "♯"
 		if sig < 0 {

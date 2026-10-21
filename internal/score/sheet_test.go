@@ -79,10 +79,10 @@ func TestKeySignature(t *testing.T) {
 	}
 }
 
-func TestSynthChords(t *testing.T) {
+func TestSynthPiano(t *testing.T) {
 	a := &Analysis{Duration: 2, Downbeats: []float64{0, 1}}
 	a.Chords = []Segment{{0, 2, "C", ip(0), "maj"}}
-	pcm := a.SynthChords(8000)
+	pcm := a.SynthPiano(8000, false)
 	if len(pcm) != 16000 {
 		t.Fatalf("len %d", len(pcm))
 	}
@@ -99,5 +99,39 @@ func TestSynthChords(t *testing.T) {
 	}
 	if peak == 0 || peak > 0.91 || energy(8000, 8800) <= energy(7200, 8000) {
 		t.Errorf("peak %v, energy before %v after %v", peak, energy(7200, 8000), energy(8000, 8800))
+	}
+}
+
+func TestPianoModel(t *testing.T) {
+	const rate = 16000
+	// 非谐性：高音的第 10 泛音比整数倍更高。
+	if inharmonicity(84) <= inharmonicity(48) {
+		t.Error("inharmonicity should grow with pitch")
+	}
+	highEnergy := func(pcm []float32) float64 {
+		// 一阶差分的能量：差分放大高频，用来比较音色明暗。
+		e := 0.0
+		for i := 1; i < len(pcm); i++ {
+			d := float64(pcm[i] - pcm[i-1])
+			e += d * d
+		}
+		return e
+	}
+	soft := RenderPiano([]PianoNote{{MIDI: 60, Start: 0, End: 1, Velocity: 0.3}}, rate, 1.5)
+	loud := RenderPiano([]PianoNote{{MIDI: 60, Start: 0, End: 1, Velocity: 0.8}}, rate, 1.5)
+	rms := func(pcm []float32) float64 {
+		e := 0.0
+		for _, x := range pcm {
+			e += float64(x) * float64(x)
+		}
+		return e
+	}
+	// 力度越大越响、越亮：高频能量占比更高。
+	if rms(loud) <= rms(soft) || highEnergy(loud)/rms(loud) <= highEnergy(soft)/rms(soft) {
+		t.Errorf("velocity: soft %.3g/%.3g loud %.3g/%.3g", rms(soft), highEnergy(soft), rms(loud), highEnergy(loud))
+	}
+	// 松键后迅速衰减：1.2 秒后的能量远小于按住期间。
+	if rms(soft[int(1.2*rate):]) > rms(soft[:rate])*0.01 {
+		t.Error("damper did not stop the note")
 	}
 }

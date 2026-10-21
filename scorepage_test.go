@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -26,7 +27,7 @@ func TestScorePage(t *testing.T) {
 	a.be = backend{layout: l, cond: cond}
 	a.current = "score"
 	tt := ui.NewTester(a.view, 1200, 2400)
-	if !tt.HasText("下载缺少的模型（约 696 MB）") || tt.HasText("和弦词汇") {
+	if !tt.HasText("下载缺少的模型（约 1131 MB）") || tt.HasText("和弦词汇") {
 		t.Errorf("smart texts %q", tt.Texts())
 	}
 	if err := tt.Click("专业"); err != nil {
@@ -37,6 +38,7 @@ func TestScorePage(t *testing.T) {
 			t.Errorf("pro missing %q", label)
 		}
 	}
+	// 默认识别旋律：先提交分轨（干声 → 去和声）。
 	a.score.input, a.score.separate, a.score.vocabTitle = "/music/song.flac", false, "含七和弦、减三、挂四"
 	tt.Frame()
 	if err := tt.Click("开始分析"); err != nil {
@@ -46,7 +48,26 @@ func TestScorePage(t *testing.T) {
 	for len(cond.Jobs()) == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	jobs := cond.Jobs()
+	if jobs := cond.Jobs(); len(jobs) != 1 || jobs[0].Task != "stems.chain" || fmt.Sprint(jobs[0].Params["steps"]) != "[vocals karaoke]" {
+		t.Fatalf("melody separation jobs %+v", jobs)
+	}
+	a.score.runs[0].Cancel()
+	for a.score.runs[0].Snapshot().Running() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cond.Cancel(cond.Jobs()[0].ID)
+
+	// 不分离、不识别旋律：直接提交分析。
+	a.score.melody = false
+	tt.Frame()
+	if err := tt.Click("开始分析"); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for len(cond.Jobs()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	jobs := cond.Jobs()[1:]
 	if len(jobs) != 1 || jobs[0].Task != "score.analyze" || jobs[0].Params["harmonic_input"] != nil ||
 		jobs[0].Params["options"].(map[string]any)["chord_vocab"] != "extended" {
 		t.Fatalf("jobs %+v, err %q", jobs, a.score.err)

@@ -4,6 +4,7 @@
 
     input:           歌曲（任意 ffmpeg 可解码的格式）
     harmonic_input:  可选，去掉人声的伴奏；有时调号与和弦用它分析
+    melody_input:    可选，分离出的主唱（去和声）；有时用 SOME 识别旋律线
     options: {
         beat_method:   "beat_this"（默认）| "librosa"
         tempo_range:   [lo, hi]，可选；BPM 按倍数折叠到区间内（半速 / 倍速误判时用）
@@ -14,6 +15,8 @@
         chord_min_beats: 最短和弦（拍），默认 1
         emotion:       是否做情绪识别，默认 true
     }
+
+melody 为 {notes: [{start, end, pitch}], source}，没有 melody_input 时为 null。
 
 输出（任务目录下）：audio.wav（原曲解码为 44.1 kHz WAV，供界面预览）、analysis.json（结构见 run_analyze 末尾的 result）与 chords.lab（MIREX 和弦标注格式：
 起止秒与和弦名，制表符分隔，可导入 Sonic Visualiser 等工具）。
@@ -31,7 +34,7 @@ import soundfile as sf
 
 from kanade_engine import Job
 
-from . import emotion, harmony, models, rhythm
+from . import emotion, harmony, melody, models, rhythm
 
 SR = 44100
 HOP = 512
@@ -58,6 +61,9 @@ def run_analyze(job: Job) -> None:
     harm_src = Path(p["harmonic_input"]) if p.get("harmonic_input") else None
     if harm_src is not None and not harm_src.is_file():
         raise ValueError(f"伴奏文件不存在：{harm_src}")
+    mel_src = Path(p["melody_input"]) if p.get("melody_input") else None
+    if mel_src is not None and not mel_src.is_file():
+        raise ValueError(f"主唱文件不存在：{mel_src}")
     o = p.get("options") or {}
     beat_method = o.get("beat_method") or "beat_this"
     if beat_method not in ("beat_this", "librosa"):
@@ -75,7 +81,8 @@ def run_analyze(job: Job) -> None:
     want_emotion = o.get("emotion", True)
 
     # 1. 模型（按需下载）与解码。
-    groups = (["beat_this"] if beat_method == "beat_this" else []) + (["clap"] if want_emotion else [])
+    groups = (["beat_this"] if beat_method == "beat_this" else []) + (["clap"] if want_emotion else []) + \
+        (["some"] if mel_src else [])
     models.ensure(job, groups, 0.0, 0.15)
     out_dir = job.output_dir / job.id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -84,6 +91,7 @@ def run_analyze(job: Job) -> None:
     y, sr = decode(src, out_dir, "audio")
     with tempfile.TemporaryDirectory(dir=out_dir) as tmp:
         hy, hsr = decode(harm_src, Path(tmp), "harmonic") if harm_src else (y, sr)
+        vy, vsr = decode(mel_src, Path(tmp), "melody") if mel_src else (None, 0)
     duration = len(y) / sr
     job.check_cancelled()
 
@@ -110,10 +118,13 @@ def run_analyze(job: Job) -> None:
                                    (key["tonic_pc"], key["mode"]))
     job.check_cancelled()
 
-    # 4. 情绪（原曲）。
+    # 4. 旋律（主唱）与情绪（原曲）。
+    tune = None
+    if vy is not None:
+        tune = {"notes": melody.transcribe(job, vy.mean(axis=1), vsr, 0.58, 0.7), "source": "lead_vocal"}
     mood = None
     if want_emotion:
-        mood = emotion.analyze(job, y.mean(axis=1), sr, 0.6, 0.97)
+        mood = emotion.analyze(job, y.mean(axis=1), sr, 0.7, 0.97)
 
     result = {
         "version": 1,
@@ -127,6 +138,7 @@ def run_analyze(job: Job) -> None:
         "chords": chords,
         "chord_source": "accompaniment" if harm_src else "mix",
         "emotion": mood,
+        "melody": tune,
         "options": {"beat_method": beat_method, "key_profile": profile, "chord_vocab": vocab,
                     "chord_self_prob": self_prob, "chord_min_beats": min_beats},
     }

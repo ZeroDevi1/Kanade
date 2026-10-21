@@ -78,14 +78,16 @@ func (o Options) params() (map[string]any, error) {
 // Request 是一次分析的输入。Separate 为 true 时先用分轨引擎分离伴奏，调号与和弦基于伴奏分析
 // （人声旋律音会干扰色度，分离后和弦更准，但要多跑一次 GPU 分离）。
 type Request struct {
-	Input      string
-	Separate   bool
+	Input    string
+	Separate bool
+	// Melody 为 true 时分离出主唱（干声 → 去和声）并识别旋律线；需要两步 GPU 分离。
+	Melody     bool
 	StemModels map[string]string // 分离伴奏用的模型，见 stems.Recommended
 	Options    Options
 }
 
-// Params 返回 score.analyze 的任务参数；harmonic 为分离出的伴奏（可为空）。
-func (r Request) Params(harmonic string) (map[string]any, error) {
+// Params 返回 score.analyze 的任务参数；harmonic 为分离出的伴奏、melody 为分离出的主唱（均可为空）。
+func (r Request) Params(harmonic, melody string) (map[string]any, error) {
 	if r.Input == "" {
 		return nil, errors.New("请选择要分析的歌曲")
 	}
@@ -96,6 +98,9 @@ func (r Request) Params(harmonic string) (map[string]any, error) {
 	p := map[string]any{"input": r.Input, "options": opts}
 	if harmonic != "" {
 		p["harmonic_input"] = harmonic
+	}
+	if melody != "" {
+		p["melody_input"] = melody
 	}
 	return p, nil
 }
@@ -114,6 +119,7 @@ type ModelGroup struct {
 var ModelGroups = []ModelGroup{
 	{"beat_this", "节拍（beat_this）", []string{"beat_this/final0.ckpt"}, 81},
 	{"clap", "情绪（CLAP）", []string{"clap/clap-htsat-unfused/pytorch_model.bin", "clap/clap-htsat-unfused/config.json"}, 615},
+	{"some", "旋律（SOME）", []string{"some/0119_continuous256_5spk/model_ckpt_steps_100000_simplified.ckpt"}, 435},
 }
 
 // Installed 报告模型组是否已下载。
@@ -177,14 +183,14 @@ func (s RunState) Running() bool { return s.Err == "" && s.Stage < StageDone }
 
 // Start 校验输入并在后台启动流水线；onChange 在状态变化时调用（可为 nil）。
 func Start(jobs Jobs, r Request, onChange func()) (*Run, error) {
-	if _, err := r.Params(""); err != nil {
+	if _, err := r.Params("", ""); err != nil {
 		return nil, err
 	}
 	if onChange == nil {
 		onChange = func() {}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	run := &Run{Request: r, jobs: jobs, onChange: onChange, cancel: cancel, files: map[string]string{}, skipSep: !r.Separate}
+	run := &Run{Request: r, jobs: jobs, onChange: onChange, cancel: cancel, files: map[string]string{}, skipSep: !r.Separate && !r.Melody}
 	go run.run(ctx)
 	return run, nil
 }
@@ -243,25 +249,37 @@ func (r *Run) step(ctx context.Context, stage int, engine, task string, params m
 
 func (r *Run) run(ctx context.Context) {
 	fail := func(err error) { r.set(func() { r.err = err.Error() }) }
-	harmonic := ""
+	// 分离：伴奏（调号与和弦）与主唱（旋律）在同一次分轨任务中完成；主唱取去和声后的 _vocals_karaoke。
+	harmonic, melody := "", ""
+	var steps []string
 	if r.Request.Separate {
-		params, _ := stems.ChainParams(r.Request.Input, []string{"other"}, r.Request.StemModels)
+		steps = append(steps, "other")
+	}
+	if r.Request.Melody {
+		steps = append(steps, "karaoke")
+	}
+	if len(steps) > 0 {
+		params, _ := stems.ChainParams(r.Request.Input, steps, r.Request.StemModels)
 		arts, err := r.step(ctx, StageSeparate, stems.Engine, "stems.chain", params)
 		if err != nil {
 			fail(err)
 			return
 		}
 		for _, a := range arts {
-			if strings.HasSuffix(a, "_other.wav") {
+			switch {
+			case strings.HasSuffix(a, "_vocals_karaoke.wav"):
+				melody = a
+			case strings.HasSuffix(a, "_vocals_other.wav"): // 和声，不用
+			case strings.HasSuffix(a, "_other.wav"):
 				harmonic = a
 			}
 		}
-		if harmonic == "" {
-			fail(errors.New("分轨结果缺少伴奏"))
+		if r.Request.Separate && harmonic == "" || r.Request.Melody && melody == "" {
+			fail(errors.New("分轨结果缺少伴奏或主唱"))
 			return
 		}
 	}
-	params, err := r.Request.Params(harmonic)
+	params, err := r.Request.Params(harmonic, melody)
 	if err != nil {
 		fail(err)
 		return
@@ -325,6 +343,7 @@ type Analysis struct {
 		Segments []Segment `json:"segments"`
 	} `json:"key"`
 	Chords      []Segment `json:"chords"`
+	Melody      *Melody   `json:"melody"`       // 旋律线；分析时没有分离主唱则为 nil
 	ChordSource string    `json:"chord_source"` // accompaniment / mix
 	Emotion     *struct {
 		Moods []struct {

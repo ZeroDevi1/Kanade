@@ -20,6 +20,7 @@ type scoreState struct {
 	mode     int    // modeSmart / modePro
 	input    string // 要分析的歌曲
 	separate bool   // 先分离伴奏，调号与和弦基于伴奏分析
+	melody   bool   // 分离主唱并识别旋律线
 	// 专业模式参数。
 	stemChoice                          string // coverStemChoices 之一（与翻唱共用选项）
 	beatTitle, profileTitle, vocabTitle string
@@ -41,7 +42,7 @@ type scoreState struct {
 
 func newScoreState() scoreState {
 	d := score.DefaultOptions()
-	return scoreState{separate: true, stemChoice: coverStemChoices[0], beatTitle: score.BeatMethods[0].Title,
+	return scoreState{separate: true, melody: true, stemChoice: coverStemChoices[0], beatTitle: score.BeatMethods[0].Title,
 		profileTitle: score.KeyProfiles[0].Title, vocabTitle: score.ChordVocabs[0].Title, foldMin: 70, foldMax: 180,
 		keySegment: d.KeySegmentS, selfProb: d.ChordSelfProb, minBeats: float64(d.ChordMinBeats), emotion: true,
 		sheet: newSheetState()}
@@ -59,7 +60,7 @@ func keyOf(list []struct{ Key, Title string }, title string) string {
 // request 按当前模式组装分析请求：智能模式只有「分离伴奏」一项，其余用引擎默认。
 func (a *app) scoreRequest() score.Request {
 	s := &a.score
-	r := score.Request{Input: s.input, Separate: s.separate, StemModels: stems.Recommended, Options: score.DefaultOptions()}
+	r := score.Request{Input: s.input, Separate: s.separate, Melody: s.melody, StemModels: stems.Recommended, Options: score.DefaultOptions()}
 	if s.mode == modeSmart {
 		return r
 	}
@@ -162,11 +163,21 @@ func (a *app) scoreRunCard(c *ui.Context, tk *fluent.Tokens) {
 	card(c, tk, "分析", func() {
 		modeSwitch(c, "score-mode", &s.mode, "只需选择歌曲；节拍、调号、和弦与情绪都用推荐参数。")
 		a.audioPicker(c, "歌曲", &s.input, anyAudioExts())
-		ui.Checkbox(c, &s.separate, "先分离伴奏再分析调号与和弦（人声会干扰和弦判断；分离需要 GPU，CPU 上较慢）")
-		if s.separate {
-			if files, mb := stems.Missing(a.be.layout, []string{"other"}, a.scoreRequest().StemModels); len(files) > 0 {
-				ui.Textf(c, "首次分离会下载分轨模型（约 %d MB）。", mb).FontSize(12).TextColor(t.TextMuted)
+		ui.Checkbox(c, &s.separate, "先分离伴奏再分析调号与和弦（人声会干扰和弦判断）")
+		ui.Checkbox(c, &s.melody, "识别旋律线（分离出主唱后转写成音符，显示在五线谱上）")
+		if s.separate || s.melody {
+			var steps []string
+			if s.separate {
+				steps = append(steps, "other")
 			}
+			if s.melody {
+				steps = append(steps, "karaoke")
+			}
+			note := "分离在 GPU 上约一两分钟，CPU 上一首歌可能要半小时以上。"
+			if files, mb := stems.Missing(a.be.layout, steps, a.scoreRequest().StemModels); len(files) > 0 {
+				note = fmt.Sprintf("首次分离会下载分轨模型（约 %.1f GB）。", float64(mb)/1000) + note
+			}
+			ui.Text(c, note).FontSize(12).TextColor(t.TextMuted)
 		}
 		if s.mode == modePro {
 			a.scoreProParams(c)

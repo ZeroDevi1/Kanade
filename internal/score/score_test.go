@@ -45,17 +45,17 @@ func TestBarsAndPosition(t *testing.T) {
 
 func TestOptionsValidation(t *testing.T) {
 	r := Request{Input: "/a.flac", Options: DefaultOptions()}
-	p, err := r.Params("/inst.wav")
+	p, err := r.Params("/inst.wav", "")
 	if err != nil || p["harmonic_input"] != "/inst.wav" || p["options"].(map[string]any)["beat_method"] != "beat_this" {
 		t.Fatalf("%v %v", p, err)
 	}
 	r.Options.TempoMin, r.Options.TempoMax = 80, 120 // 上限不足下限 2 倍，无法折叠
-	if _, err := r.Params(""); err == nil {
+	if _, err := r.Params("", ""); err == nil {
 		t.Error("narrow tempo range accepted")
 	}
 	r.Options.TempoMin, r.Options.TempoMax = 0, 0
 	r.Options.ChordSelfProb = 1.2
-	if _, err := r.Params(""); err == nil {
+	if _, err := r.Params("", ""); err == nil {
 		t.Error("self prob accepted")
 	}
 }

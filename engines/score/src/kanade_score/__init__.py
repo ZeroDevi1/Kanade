@@ -2,12 +2,12 @@
 
 任务（参数由 Go 端 internal/score 组装）：
 
-- score.analyze  {input, harmonic_input?, options?}：分析一首歌，输出 analysis.json（字段见 analyze.py）与
-                 和弦标注 chords.lab。harmonic_input 是去掉人声的伴奏（由 Go 端先经分轨引擎得到），
-                 调号与和弦用它分析，节拍与情绪仍用原曲。
-- score.download {models?}：预下载模型（beat_this、clap）并上报进度。
+- score.analyze  {input, harmonic_input?, melody_input?, options?}：分析一首歌，输出 analysis.json（字段见 analyze.py）与
+                 和弦标注 chords.lab。harmonic_input 是去掉人声的伴奏、melody_input 是去掉和声的主唱（均由 Go 端先经
+                 分轨引擎得到）：调号与和弦用伴奏分析，旋律线用主唱识别（SOME），节拍与情绪仍用原曲。
+- score.download {models?}：预下载模型（beat_this、clap、some）并上报进度。
 
-设备：beat_this 与 CLAP 有 CUDA 时用 CUDA，否则 CPU（两者在 MPS 上未经验证，macOS 只保证流程可用）；
+设备：beat_this、CLAP 与 SOME 有 CUDA 时用 CUDA，否则 CPU（两者在 MPS 上未经验证，macOS 只保证流程可用）；
 调号与和弦是 librosa 的信号处理，只用 CPU。
 """
 

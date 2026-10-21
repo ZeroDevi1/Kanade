@@ -19,6 +19,8 @@ dependencies = [
     "einops==0.8.2",
     # 情绪识别用 CLAP（laion/clap-htsat-unfused，Apache-2.0）的零样本分类。
     "transformers==5.13.1",
+    # SOME 旋律识别读取其 config.yaml（transformers 也依赖它，这里显式声明）。
+    "pyyaml",
     # 解码 MP3 / M4A 等格式。
     "imageio-ffmpeg==0.6.0",
 ]
