@@ -31,6 +31,9 @@ def converter():
     if _converter is None:
         from rvc.infer.infer import VoiceConverter
 
+        from . import pipeline_compat
+
+        pipeline_compat.install()
         _converter = VoiceConverter()
     return _converter
 
