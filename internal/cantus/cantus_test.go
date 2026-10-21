@@ -95,3 +95,21 @@ func TestSpeakerStore(t *testing.T) {
 		t.Errorf("after delete %+v", list)
 	}
 }
+
+func TestSFTCheckpoints(t *testing.T) {
+	l := paths.New(t.TempDir())
+	if _, err := SFTAssembleParams(l, "xuan"); err == nil {
+		t.Error("assemble without checkpoints accepted")
+	}
+	exp := filepath.Join(Root(l), "_sft", "xuan", "exp", "llm")
+	os.MkdirAll(exp, 0o755)
+	for _, f := range []string{"epoch_0_whole.yaml", "epoch_1_whole.yaml", "epoch_1_whole.pt"} {
+		os.WriteFile(filepath.Join(exp, f), nil, 0o644)
+	}
+	if parts, n := SFTCheckpoints(l, " xuan "); len(parts) != 1 || parts[0] != "llm" || n != 2 {
+		t.Errorf("parts %v n %d", parts, n)
+	}
+	if p, err := SFTAssembleParams(l, "xuan"); err != nil || p["name"] != "xuan" {
+		t.Errorf("%v %v", p, err)
+	}
+}

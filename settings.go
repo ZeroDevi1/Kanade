@@ -160,7 +160,7 @@ func (a *app) doctorCard(c *ui.Context, tk *fluent.Tokens) {
 	s := &a.settings
 	card(c, tk, "环境检查", func() {
 		engines := a.be.cond.Engines()
-		if ui.Button(c, "检查已安装的引擎").Clicked() {
+		if ui.Button(c, "检查已安装的引擎").AlignSelf(ui.Start).Clicked() {
 			if s.doctor == nil {
 				s.doctor = map[string]string{}
 			}

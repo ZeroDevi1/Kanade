@@ -303,7 +303,7 @@ func (a *app) timbreConvert(c *ui.Context, tk *fluent.Tokens) {
 		ui.Text(c, "整首歌请用「翻唱」，或先用「分轨」得到干净主唱。").FontSize(12).TextColor(c.Theme().TextMuted)
 		a.timbreParams(c, false)
 		_, active := a.jobStatusPeek(s.job)
-		if ui.PrimaryButton(c, "开始转换").Disabled(active).Clicked() {
+		if ui.PrimaryButton(c, "开始转换").Disabled(active).AlignSelf(ui.Start).Clicked() {
 			params, err := s.inferRequest(s.input, false).Params()
 			if err == nil {
 				s.job, err = a.be.cond.Submit(timbre.Engine, "timbre.infer", params)
@@ -402,11 +402,6 @@ func (a *app) timbreCover(c *ui.Context, tk *fluent.Tokens) {
 					st = cv.Snapshot()
 				}
 				s.err = errText(err)
-			}
-			if s.cover != nil && st.Running() {
-				if ui.Button(c, "取消").Clicked() {
-					s.cover.Cancel()
-				}
 			}
 		})
 		if s.cover == nil {
@@ -581,7 +576,7 @@ func (a *app) timbreTrain(c *ui.Context, tk *fluent.Tokens) {
 			a.timbreTrainPro(c)
 		}
 		_, active := a.jobStatusPeek(s.trainJob)
-		if ui.PrimaryButton(c, "开始训练").Disabled(active).Clicked() {
+		if ui.PrimaryButton(c, "开始训练").Disabled(active).AlignSelf(ui.Start).Clicked() {
 			params, err := s.trainRequest().Params()
 			if err == nil {
 				s.trainJob, err = a.be.cond.Submit(timbre.Engine, "timbre.train", params)
@@ -678,7 +673,7 @@ func (a *app) timbreModels(c *ui.Context, tk *fluent.Tokens) {
 	t := c.Theme()
 	s := &a.timbre
 	card(c, tk, fmt.Sprintf("模型（%d）", len(s.models)), func() {
-		if ui.Button(c, "刷新").Clicked() {
+		if ui.Button(c, "刷新").AlignSelf(ui.Start).Clicked() {
 			s.modelsStale = true
 		}
 		for _, m := range s.models {
@@ -741,7 +736,7 @@ func (a *app) timbreModels(c *ui.Context, tk *fluent.Tokens) {
 		}
 		filePicker("权重", &s.importWeights, "pth")
 		filePicker("索引", &s.importIndex, "index")
-		if ui.PrimaryButton(c, "导入").Clicked() {
+		if ui.PrimaryButton(c, "导入").AlignSelf(ui.Start).Clicked() {
 			m, err := timbre.Import(a.be.layout, s.importName, s.importWeights, s.importIndex)
 			s.err = errText(err)
 			if err == nil {

@@ -93,12 +93,13 @@ func (a *app) scorePage(c *ui.Context, tk *fluent.Tokens) {
 		return
 	}
 	s.preview.load(a, st.Audio)
+	s.preview.title = filepath.Base(s.runs[s.shown].Request.Input)
 	res := st.Result
 	a.scoreSummary(c, tk, s.runs[s.shown], st)
 	card(c, tk, "试听", func() { a.scorePlayer(c, tk, res) })
 	card(c, tk, "和弦谱", func() { a.scoreChordChart(c, res) })
 	if res.Emotion != nil {
-		card(c, tk, "情绪", func() { scoreEmotion(c, res) })
+		card(c, tk, "情绪", func() { a.scoreEmotion(c, res) })
 	}
 }
 
@@ -345,15 +346,26 @@ func (a *app) scoreSummary(c *ui.Context, tk *fluent.Tokens, run *score.Run, st 
 	})
 }
 
+// scorePosition 返回当前播放位置（秒，没有播放器时为 -1）与跳转函数。
+func (a *app) scorePosition() (float64, func(float64)) {
+	pv := &a.score.preview
+	pos := -1.0
+	if p := pv.player; p != nil && !pv.loading {
+		pos = p.Position().Seconds()
+	}
+	return pos, func(sec float64) {
+		if p := pv.player; p != nil {
+			p.Seek(time.Duration(sec * float64(time.Second)))
+		}
+	}
+}
+
 // scorePlayer 是试听：波形与播放，播放时显示当前小节、拍与和弦。
 func (a *app) scorePlayer(c *ui.Context, tk *fluent.Tokens, res *score.Analysis) {
 	t := c.Theme()
 	s := &a.score
 	s.preview.show(c, tk, "", nil)
-	pos := 0.0
-	if p := s.preview.player; p != nil && !s.preview.loading {
-		pos = p.Position().Seconds()
-	}
+	pos, seek := a.scorePosition()
 	bar, beat := res.BarAt(pos)
 	cur, next := "—", ""
 	if i := res.ChordAt(pos); i >= 0 {
@@ -362,6 +374,7 @@ func (a *app) scorePlayer(c *ui.Context, tk *fluent.Tokens, res *score.Analysis)
 			next = res.Chords[i+1].Label
 		}
 	}
+	timeline(c, "chord-line", res.Chords, res.Duration, pos, chordWindowS, seek, nil)
 	ui.Row(c).Gap(24).AlignItems(ui.End).Children(func() {
 		ui.Column(c).Gap(2).Children(func() {
 			ui.Text(c, "当前和弦").FontSize(12).TextColor(t.TextMuted)
@@ -383,16 +396,12 @@ func (a *app) scorePlayer(c *ui.Context, tk *fluent.Tokens, res *score.Analysis)
 // scoreChordChart 按小节显示和弦谱（每行 4 小节），高亮播放位置所在的小节，点击小节跳转播放。
 func (a *app) scoreChordChart(c *ui.Context, res *score.Analysis) {
 	t := c.Theme()
-	s := &a.score
 	bars := res.Bars()
 	if len(bars) == 0 {
 		ui.Text(c, "没有检测到小节线，无法排成和弦谱。").TextColor(t.TextMuted)
 		return
 	}
-	pos := -1.0
-	if p := s.preview.player; p != nil && !s.preview.loading {
-		pos = p.Position().Seconds()
-	}
+	pos, seek := a.scorePosition()
 	tk := fluent.For(t)
 	for row := 0; row < len(bars); row += 4 {
 		ui.Row(c.Key(fmt.Sprintf("chart-%d", row))).Gap(6).AlignItems(ui.Center).Children(func() {
@@ -420,18 +429,23 @@ func (a *app) scoreChordChart(c *ui.Context, res *score.Analysis) {
 						txt.TextColor(t.AccentText)
 					}
 				})
-				if btn.Clicked() && s.preview.player != nil {
-					s.preview.player.Seek(time.Duration(b.Start * float64(time.Second)))
+				if btn.Clicked() {
+					seek(b.Start)
 				}
+			}
+			// 最后一行不足 4 小节时用占位补齐，保持各列宽度一致。
+			for i := len(bars); i < row+4; i++ {
+				ui.Box(c.Key(fmt.Sprintf("bar-pad-%d", i))).Grow(1).Basis(0)
 			}
 		})
 	}
 }
 
-// scoreEmotion 显示情绪分布、效价 / 唤醒度与随时间的变化。
-func scoreEmotion(c *ui.Context, res *score.Analysis) {
+// scoreEmotion 显示情绪分布、效价 / 唤醒度与随时间的变化（与试听同步，点击跳转）。
+func (a *app) scoreEmotion(c *ui.Context, res *score.Analysis) {
 	t := c.Theme()
 	e := res.Emotion
+	pos, seek := a.scorePosition()
 	for _, m := range e.Moods[:min(5, len(e.Moods))] {
 		ui.Row(c.Key("mood-" + m.Key)).Gap(12).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, m.Label).Width(48)
@@ -442,10 +456,88 @@ func scoreEmotion(c *ui.Context, res *score.Analysis) {
 	}
 	ui.Textf(c, "效价（消极 0 — 积极 1）%.2f · 唤醒度（舒缓 0 — 激烈 1）%.2f", e.Valence, e.Arousal).FontSize(12).TextColor(t.TextMuted)
 	if len(e.Segments) > 1 {
-		parts := make([]string, len(e.Segments))
-		for i, sg := range e.Segments {
-			parts[i] = fmt.Sprintf("%s %s", score.Clock(sg.Start), sg.Label)
-		}
-		ui.Text(c, "变化："+strings.Join(parts, " → ")).FontSize(12).TextColor(t.TextMuted)
+		ui.Text(c, "随时间的变化").FontSize(12).TextColor(t.TextMuted)
+		timeline(c, "mood-line", e.Segments, res.Duration, pos, 0, seek, moodColor)
 	}
+}
+
+// moodColor 给情绪时间线着色：积极、激烈的情绪偏暖，消极、舒缓的偏冷。
+func moodColor(t *ui.Theme, label string) ui.Color {
+	switch label {
+	case "欢快", "激昂", "宏大", "愤怒":
+		return t.Warning.Alpha(0.35)
+	case "悲伤", "阴郁", "怀旧":
+		return t.Accent.Alpha(0.35)
+	default:
+		return t.Success.Alpha(0.3)
+	}
+}
+
+// chordWindowS 是和弦时间线显示的时长（秒）：约 10 小节（130 BPM），每个和弦都有空间显示名称。
+const chordWindowS = 20
+
+// timelineMinLabelShare 是时间线上显示文字的最小段宽（占全曲时长的比例）：内容区约 900 像素宽时约 27 像素，
+// 刚好放下「Bbm7」这样的和弦名；更窄的段只显示色块，悬停可看名称。
+const timelineMinLabelShare = 0.03
+
+// timeline 是与时间轴等比的分段条：每段宽度按时长分配，pos 所在段高亮，点击跳到段首。
+// window > 0 且短于全曲时只显示 [pos 前 20%, pos 后 80%] 的 window 秒并随播放滚动，段落短（如和弦）时用它保证文字放得下。
+// color 为 nil 时用交替的中性色。
+func timeline(c *ui.Context, key string, segs []score.Segment, duration, pos, window float64, seek func(float64),
+	color func(*ui.Theme, string) ui.Color) {
+	t := c.Theme()
+	tk := fluent.For(t)
+	if duration <= 0 || len(segs) == 0 {
+		return
+	}
+	v0, v1 := 0.0, duration
+	if window > 0 && duration > window {
+		v0 = min(max(pos-window*0.2, 0), duration-window)
+		v1 = v0 + window
+	}
+	ui.Row(c.Key(key)).Height(30).Gap(1).AlignItems(ui.Stretch).Radius(fluent.ControlRadius).Clip().Children(func() {
+		// 窗口起点到第一段之间的空白（例如前奏未检测到和弦）用占位撑开，保证与时间轴对齐。
+		cursor := v0
+		for i, sg := range segs {
+			a, b := max(sg.Start, v0), min(sg.End, v1)
+			if b <= a {
+				continue
+			}
+			if a > cursor {
+				ui.Box(c.Key(fmt.Sprintf("%s-gap-%d", key, i))).Grow(float32(a - cursor)).Basis(0)
+			}
+			cursor = b
+			dur := b - a
+			cur := pos >= sg.Start && pos < sg.End
+			btn := ui.ButtonBase(c.Key(fmt.Sprintf("%s-%d", key, i))).Grow(float32(dur)).Basis(0).MinWidth(0).Clip().
+				AlignItems(ui.Center).Justify(ui.Center).Label(sg.Label).Tooltip(fmt.Sprintf("%s · %s", score.Clock(sg.Start), sg.Label))
+			bg := tk.SubtleHover
+			switch {
+			case cur:
+				bg = t.Accent
+			case color != nil:
+				bg = color(t, sg.Label)
+			case i%2 == 1:
+				bg = tk.SubtlePressed
+			}
+			if btn.Hovered() && !cur {
+				bg = tk.SubtlePressed
+			}
+			btn.Background(bg)
+			if dur/(v1-v0) >= timelineMinLabelShare {
+				btn.Children(func() {
+					txt := ui.Text(c, sg.Label).FontSize(12).SingleLine()
+					if cur {
+						txt.TextColor(t.AccentText)
+					}
+				})
+			}
+			if btn.Clicked() {
+				seek(sg.Start)
+			}
+		}
+		if cursor < v1 {
+			ui.Box(c.Key(key + "-tail")).Grow(float32(v1 - cursor)).Basis(0)
+		}
+	})
 }

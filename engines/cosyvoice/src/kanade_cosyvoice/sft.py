@@ -2,6 +2,7 @@
 
 - cosyvoice.sft_prepare {name, dataset_dir, list?, base_model_dir, dev_ratio?, asr_model?, instruct?}
   读取 .list 文本（缺文本时可用 Whisper 转写）→ wetext 归一化 → campplus 提取说话人向量 → 写 parquet 与 data.list。
+- cosyvoice.sft_assemble {name, base_model_dir?}：用已保存的 checkpoint 平均并组装（训练中途失败后使用）。
 - cosyvoice.sft_train {name, base_model_dir, part (llm|flow|both), epochs, lr?, num_workers?, llm_layers?}
   需要 NVIDIA CUDA。llm_layers > 0 时 LLM 只训练 Qwen 顶部这么多层（8 GB 显存用 12，见 sft_launch._install_freeze_hook）；
   0 或缺省为全量训练，约需 12 GB 以上显存；-1 为按显存自动选择（见 auto_llm_layers）。依次训练所选部分 → val_best 平均 checkpoint → 组装模型目录（含 spk2info.pt）。
@@ -301,19 +302,53 @@ def run_train(job: Job) -> None:
                    "--tensorboard_dir", str(wd / "tensorboard" / part), "--ddp.dist_backend", backend,
                    "--num_workers", str(workers), "--prefetch", "2", "--use_amp"],
              i * span, (i + 0.95) * span, f"训练 {part}", epochs, exp, {"KANADE_SFT_LLM_LAYERS": str(llm_layers)})
-        # 取验证损失最好的若干 checkpoint 平均：llm 3 个、flow 5 个（VoiceLab 文档第 7 步）。
-        # 轮数少于该数量时取全部：average_model.py 断言实际取到的个数等于 --num（只统计 epoch_*_whole.yaml，见其 --val_best）。
-        saved = len(list(exp.glob("epoch_*_whole.yaml")))
-        num = min(3 if part == "llm" else 5, saved)
-        if num == 0:
-            raise RuntimeError(f"{part} 训练没有产出 checkpoint")
-        _run(job, ["average_model.py", "--dst_model", str(exp / f"{part}_avg.pt"), "--src_path", str(exp),
-                   "--num", str(num), "--val_best"], (i + 0.95) * span, (i + 1) * span, f"平均 {part} checkpoint")
+        _average(job, exp, part, (i + 0.95) * span, (i + 1) * span)
 
     job.progress(0.92, "组装模型目录")
     out = assemble(base, name, wd)
     job.artifact(out, "cosyvoice-model")
     job.progress(1.0, f"完成：{out.name}")
+
+
+def _average(job: Job, exp: Path, part: str, lo: float, hi: float) -> None:
+    """取验证损失最好的若干 checkpoint 平均：llm 3 个、flow 5 个（VoiceLab 文档第 7 步）。
+    轮数少于该数量时取全部：average_model.py 断言实际取到的个数等于 --num（只统计 epoch_*_whole.yaml，见其 --val_best）。"""
+    saved = len(list(exp.glob("epoch_*_whole.yaml")))
+    num = min(3 if part == "llm" else 5, saved)
+    if num == 0:
+        raise RuntimeError(f"{part} 训练没有产出 checkpoint")
+    _run(job, ["average_model.py", "--dst_model", str(exp / f"{part}_avg.pt"), "--src_path", str(exp),
+               "--num", str(num), "--val_best"], lo, hi, f"平均 {part} checkpoint（{num} 个）")
+
+
+def saved_parts(name: str) -> list[str]:
+    """已有保存的 checkpoint 的训练部分（llm / flow）。"""
+    wd = work_dir(name)
+    return [p for p in ("llm", "flow") if any((wd / "exp" / p).glob("epoch_*_whole.yaml"))]
+
+
+def run_assemble(job: Job) -> None:
+    """用已保存的 checkpoint 平均并组装模型：训练中途失败（如显卡驱动重置）或提前取消后，不必重新训练。
+
+    只处理有 checkpoint 的部分；平均不需要 CUDA（average_model.py 在 CPU 上加载权重）。
+    """
+    p = job.params
+    name = _check_name(p.get("name"))
+    wd = work_dir(name)
+    meta_path = wd / "prepare.json"
+    if not meta_path.is_file():
+        raise ValueError("找不到该音色的训练目录")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    base = Path(p.get("base_model_dir") or meta["base_model_dir"])
+    parts = saved_parts(name)
+    if not parts:
+        raise ValueError("没有已保存的 checkpoint，请先训练")
+    for i, part in enumerate(parts):
+        _average(job, wd / "exp" / part, part, 0.9 * i / len(parts), 0.9 * (i + 1) / len(parts))
+    job.progress(0.92, "组装模型目录")
+    out = assemble(base, name, wd)
+    job.artifact(out, "cosyvoice-model")
+    job.progress(1.0, f"完成：{out.name}（{'、'.join(parts)}）")
 
 
 def auto_llm_layers() -> int:

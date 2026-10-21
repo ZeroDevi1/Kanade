@@ -8,7 +8,7 @@
 - cosyvoice.sft           {model_dir, text, spk_id, speed, text_frontend}
 - cosyvoice.instruct      {model_dir, text, instruct, spk_id（CosyVoice 1）| prompt_wav / speaker_dir（2、3）, speed}
 - cosyvoice.vc            {model_dir, source_wav, prompt_wav | speaker_dir}
-- cosyvoice.sft_prepare / cosyvoice.sft_train：CosyVoice 3 说话人 SFT，见 sft.py。
+- cosyvoice.sft_prepare / cosyvoice.sft_train / cosyvoice.sft_assemble：CosyVoice 3 说话人 SFT，见 sft.py。
 
 除 vc 外的合成任务都可另带 seed（固定随机种子）与 sampling {top_p, top_k, win_size, tau_r}（LLM 采样），
 见 tasks.configure_sampling。
@@ -50,6 +50,7 @@ def main() -> None:
         "cosyvoice.vc": tasks.vc,
         "cosyvoice.sft_prepare": sft.run_prepare,
         "cosyvoice.sft_train": sft.run_train,
+        "cosyvoice.sft_assemble": sft.run_assemble,
         # 上游 CosyVoice 只用 CUDA 或 CPU（不使用 MPS），检查结果按此报告。
         "cosyvoice.doctor": doctor(allow_mps=False),
     })

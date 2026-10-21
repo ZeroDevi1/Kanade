@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -19,6 +20,7 @@ type result struct {
 	title string // 列表中的显示名
 	name  string // 另存时建议的文件名（不含扩展名）
 	saved string // 最近一次另存的位置；空为尚未保存
+	added time.Time
 }
 
 // resultSet 是一个页面的输出列表（最新在前）与预览。保存在 app 中，切换页面不丢失；只在 UI 线程修改。
@@ -36,7 +38,7 @@ func (rs *resultSet) add(a *app, path, title, name string, show bool) bool {
 	if name == "" {
 		name = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	}
-	rs.items = append([]*result{{path: path, title: title, name: name}}, rs.items...)
+	rs.items = append([]*result{{path: path, title: title, name: name, added: time.Now()}}, rs.items...)
 	if show || rs.preview.path == "" {
 		rs.preview.load(a, path)
 	}

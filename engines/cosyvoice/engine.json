@@ -13,6 +13,7 @@
     "cosyvoice.vc",
     "cosyvoice.sft_prepare",
     "cosyvoice.sft_train",
+    "cosyvoice.sft_assemble",
     "cosyvoice.doctor"
   ]
 }

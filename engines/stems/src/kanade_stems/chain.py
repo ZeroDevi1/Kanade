@@ -13,7 +13,7 @@ from pathlib import Path
 
 from kanade_engine import Job
 
-from . import MODEL_DIR
+from . import MODEL_DIR, progress
 from .download import patch_downloader
 
 log = logging.getLogger("kanade_stems")
@@ -152,7 +152,14 @@ def run_chain(job: Job) -> None:
             sep.load_model(model_filename=model)
             names = _override_names(step, model, sep, stem)
         job.progress(base + 0.02, f"[{i + 1}/{len(steps)}] {step.title}：分离中")
-        produced = sep.separate(str(files[step.source]), custom_output_names=names)
+        # 分块进度映射到该步剩余的区间（留出最后 1% 给写出文件）。
+        span = 1 / len(steps) - 0.03
+
+        def report(frac: float, i=i, base=base, step=step) -> None:
+            job.progress(base + 0.02 + span * frac, f"[{i + 1}/{len(steps)}] {step.title}：分离中 {frac:.0%}")
+
+        with progress.reporting(report):
+            produced = sep.separate(str(files[step.source]), custom_output_names=names)
         for name in produced:
             path = Path(name) if Path(name).is_absolute() else out_dir / name
             if path.stem not in names.values():
@@ -180,7 +187,9 @@ def run_separate(job: Job) -> None:
     sep = _separator(out_dir, None, job.params.get("single_stem") or None)
     sep.load_model(model_filename=model)
     job.progress(0.1, "分离中")
-    for name in sep.separate(str(src)):
+    with progress.reporting(lambda frac: job.progress(0.1 + 0.88 * frac, f"分离中 {frac:.0%}")):
+        produced = sep.separate(str(src))
+    for name in produced:
         path = Path(name)
         job.artifact(path if path.is_absolute() else out_dir / path, "audio")
     job.progress(1.0, "完成")

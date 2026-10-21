@@ -64,6 +64,7 @@ type cantusState struct {
 	sftSummary                   *dataset.Summary
 	sftPrepareJob, sftTrainJob   string
 	sftChain                     string // 智能模式：完成后自动开始训练的准备任务
+	sftAssembleJob               string // 用已保存 checkpoint 组装的任务
 	sftScanned                   string // 已为其刷新过模型列表的训练任务
 
 	job       string            // 最近提交的合成任务
@@ -444,13 +445,19 @@ func anyAudioExts() []string {
 	return exts
 }
 
-// audioPicker 显示已选文件并提供选择按钮；对话框在后台 goroutine 中打开，选择结果经 post 写回 *path。
-// exts 是对话框筛选的扩展名（directAudioExts 或 anyAudioExts()）。
+// audioPicker 显示已选文件并提供选择按钮，也可以把文件从 Finder / 资源管理器拖到这一行上。
+// 对话框在后台 goroutine 中打开，选择结果经 post 写回 *path。exts 是可接受的扩展名（directAudioExts 或 anyAudioExts()）。
 func (a *app) audioPicker(c *ui.Context, label string, path *string, exts []string) {
 	t := c.Theme()
-	ui.Row(c.Key("pick-" + label)).Gap(8).AlignItems(ui.Center).Children(func() {
-		ui.Text(c, label).FontSize(12).Width(64)
-		name := "未选择"
+	tk := fluent.For(t)
+	key := "pick-" + label
+	row := ui.Row(c.Key(key)).Gap(8).AlignItems(ui.Center).Padding(2, 4).Margin(-2, -4).Radius(fluent.ControlRadius)
+	if row.FileDragOver() {
+		row.Background(tk.SubtleHover).Border(1, t.Accent)
+	}
+	row.Children(func() {
+		ui.Text(c, label).FontSize(12).Width(88)
+		name := "未选择（可拖入文件）"
 		if *path != "" {
 			name = filepath.Base(*path)
 		}
@@ -465,10 +472,21 @@ func (a *app) audioPicker(c *ui.Context, label string, path *string, exts []stri
 				if err != nil || len(files) == 0 {
 					return
 				}
-				a.post(func() { *path = files[0] })
+				a.post(func() { *path, a.dropErr = files[0], "" })
 			}()
 		}
 	})
+	if files := row.DroppedFiles(); len(files) > 0 {
+		ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(files[0]), "."))
+		if slices.Contains(exts, ext) {
+			*path, a.dropErr = files[0], ""
+		} else {
+			a.dropErr = key + "\x00" + fmt.Sprintf("不支持 .%s 文件，%s可用：%s", ext, label, strings.Join(exts, "、"))
+		}
+	}
+	if k, msg, ok := strings.Cut(a.dropErr, "\x00"); ok && k == key {
+		ui.Text(c, msg).FontSize(12).TextColor(t.Danger)
+	}
 }
 
 // cantusSubmitRow 提交合成任务并显示其进度；任务完成后把输出加入结果列表并载入预览。
@@ -652,7 +670,7 @@ func (a *app) cantusSFTCard(c *ui.Context, tk *fluent.Tokens) {
 		_, preparing := a.jobStatusPeek(s.sftPrepareJob)
 		_, training := a.jobStatusPeek(s.sftTrainJob)
 		if s.sftMode == modeSmart {
-			if ui.PrimaryButton(c, "开始微调").Disabled(preparing || training || s.sftChain != "").Clicked() {
+			if ui.PrimaryButton(c, "开始微调").Disabled(preparing || training || s.sftChain != "").AlignSelf(ui.Start).Clicked() {
 				a.submitSFTPrepare(true)
 			}
 		} else {
@@ -672,6 +690,23 @@ func (a *app) cantusSFTCard(c *ui.Context, tk *fluent.Tokens) {
 		if j, _ := a.jobStatus(c, s.sftTrainJob); j.State == conductor.JobDone && s.sftScanned != s.sftTrainJob {
 			s.sftScanned, s.speakersStale = s.sftTrainJob, true
 			ui.Text(c, "微调完成，模型已出现在模型列表中。").FontSize(12).TextColor(t.Success)
+		}
+		// 训练中途失败或被取消时，可以直接用已保存的 checkpoint 组装，不必重训。
+		if parts, epochs := cantus.SFTCheckpoints(a.be.layout, s.sftName); len(parts) > 0 && !training {
+			_, assembling := a.jobStatusPeek(s.sftAssembleJob)
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Textf(c, "已保存 %d 个 checkpoint（%s）。", epochs, strings.Join(parts, "、")).FontSize(12).TextColor(t.TextMuted)
+				if ui.Button(c, "用已保存的 checkpoint 组装").Disabled(assembling).Clicked() {
+					params, err := cantus.SFTAssembleParams(a.be.layout, s.sftName)
+					if err == nil {
+						s.sftAssembleJob, err = a.be.cond.Submit(cantus.Engine, "cosyvoice.sft_assemble", params)
+					}
+					s.err = errText(err)
+				}
+			})
+			if j, _ := a.jobStatus(c, s.sftAssembleJob); j.State == conductor.JobDone && s.sftScanned != s.sftAssembleJob {
+				s.sftScanned, s.speakersStale = s.sftAssembleJob, true
+			}
 		}
 	})
 }

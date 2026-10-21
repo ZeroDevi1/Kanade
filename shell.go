@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"time"
 
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
 	"kanade/internal/ui/fluent"
@@ -90,6 +92,10 @@ func (a *app) nav(c *ui.Context, tk *fluent.Tokens) {
 		}
 		ui.Box(c).Grow(1)
 		for _, it := range navFooter {
+			// 「M0 验证」是开发期的框架验证页，正式构建（mygo build）中不显示。
+			if it.id == "lab" && !mygo.IsDev() {
+				continue
+			}
 			a.navButton(c, tk, it)
 		}
 	})
@@ -108,12 +114,20 @@ func (a *app) navButton(c *ui.Context, tk *fluent.Tokens, it navItem) {
 		b.Background(tk.SubtleHover)
 	}
 	if a.navCollapsed {
-		b.Tooltip(it.label)
+		label := it.label
+		if n := a.activeJobs(); it.id == "tasks" && n > 0 {
+			label = fmt.Sprintf("%s（%d 个进行中）", label, n)
+		}
+		b.Tooltip(label)
 	}
 	b.Children(func() {
 		ui.Row(c).Grow(1).AlignItems(ui.Center).Gap(16).Children(func() {
 			ui.Icon(c, it.icon).Size(16, 16).Shrink(0)
-			ui.Text(c, it.label).FontSize(14).SingleLine()
+			ui.Text(c, it.label).FontSize(14).SingleLine().Grow(1)
+			// 任务项显示进行中的任务数；紧凑导航时文字被裁掉，数量放在提示框里。
+			if n := a.activeJobs(); it.id == "tasks" && n > 0 && !a.navCollapsed {
+				ui.Badge(c, fmt.Sprint(n))
+			}
 		})
 	})
 	if selected {
@@ -125,4 +139,18 @@ func (a *app) navButton(c *ui.Context, tk *fluent.Tokens, it navItem) {
 	if b.Clicked() {
 		a.current = it.id
 	}
+}
+
+// activeJobs 返回尚未结束的任务数；后端未启动时为 0。
+func (a *app) activeJobs() int {
+	if a.be.cond == nil {
+		return 0
+	}
+	n := 0
+	for _, j := range a.be.cond.Jobs() {
+		if !j.State.Finished() {
+			n++
+		}
+	}
+	return n
 }

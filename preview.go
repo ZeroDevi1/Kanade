@@ -17,7 +17,9 @@ import (
 type audioPreview struct {
 	handle ui.Handle
 	// path 是正在显示（或正在解码）的文件；loading 为 true 时 peaks / player 仍是上一个文件的。
-	path    string
+	path string
+	// title 非空时代替文件名显示（例如分析页播放的是解码出的 audio.wav，显示原曲名更直观）。
+	title   string
 	loading bool
 	err     string
 	peaks   *waveform.Peaks
@@ -61,7 +63,11 @@ func (pv *audioPreview) show(c *ui.Context, tk *fluent.Tokens, empty string, act
 		return
 	}
 	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-		ui.Text(c, filepath.Base(pv.path)).Font("monospace").FontSize(12).Grow(1).SingleLine()
+		name := filepath.Base(pv.path)
+		if pv.title != "" {
+			name = pv.title
+		}
+		ui.Text(c, name).Font("monospace").FontSize(12).Grow(1).SingleLine()
 		if pv.loading {
 			ui.Spinner(c)
 		}

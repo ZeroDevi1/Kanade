@@ -2,7 +2,8 @@
 
 worker 同一时间只持有一个已加载的模型（显存约 2–4 GB）；切换模型时先释放旧模型。
 推理以非流式方式逐句执行：文本先经上游 text_normalize 切分成句，每句完成后上报进度并检查取消，
-最后把各句音频拼接为一个 16-bit WAV。
+最后把各句音频拼接为一个 16-bit WAV。取消在句子内部也能生效：LLM 逐 token 采样时检查取消并返回结束 token
+（见 configure_sampling），当前句随即结束。
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from kanade_engine import Job
+from kanade_engine import Cancelled, Job
 
 from . import download as dl
 
@@ -188,9 +189,17 @@ def synthesize(job: Job, model, text: str, text_frontend: bool, run: Callable[[]
     total = max(len(segments), 1)
     job.progress(0.1, f"共 {total} 句")
     chunks = []
-    for i, out in enumerate(run()):
-        chunks.append(out["tts_speech"])
-        job.progress(0.1 + 0.88 * min(i + 1, total) / total, f"已合成 {min(i + 1, total)}/{total} 句")
+    try:
+        for i, out in enumerate(run()):
+            chunks.append(out["tts_speech"])
+            job.progress(0.1 + 0.88 * min(i + 1, total) / total, f"已合成 {min(i + 1, total)}/{total} 句")
+    except Cancelled:
+        raise
+    except Exception as exc:
+        # 取消时 LLM 被提前截断，残缺的 token 序列可能让后续的 flow / 声码器报错；此时按取消处理而不是失败。
+        if job.cancelled:
+            raise Cancelled() from exc
+        raise
     write_output(job, model, chunks)
 
 
@@ -206,11 +215,13 @@ def write_output(job: Job, model, chunks: list) -> None:
     job.artifact(out, "audio")
 
 
-def configure_sampling(model, fam: str, p: dict) -> None:
+def configure_sampling(job: Job, model, fam: str, p: dict) -> None:
     """按任务参数设置 LLM 采样与随机种子，每个任务都重新设置（同一模型实例跨任务复用）。
 
     - sampling {top_p, top_k, win_size, tau_r}：覆盖 ras_sampling 参数；缺省时微调模型用 SFT_SAMPLING，其他模型恢复 yaml 默认。
     - seed：非负整数时固定 random / numpy / torch 的种子，便于复现与 A/B 对比；缺省时微调模型用 SFT_SEED，其他模型不固定。
+    - 取消：每个 token 采样前检查 job.cancelled，已取消时返回结束 token，让上游的生成循环立即结束
+      （各版本的循环在采样结果等于 eos_token 或属于 stop_token_ids 时退出，eos_token 都在其中）。
     """
     import random
 
@@ -226,9 +237,16 @@ def configure_sampling(model, fam: str, p: dict) -> None:
         sampling = SFT_SAMPLING
     if sampling:
         kw = {k: conv(sampling[k]) for k, conv in SAMPLING_KEYS.items() if sampling.get(k) is not None}
-        llm.sampling = lambda scores, decoded, s: ras_sampling(scores, decoded, s, **kw)
+        base = lambda scores, decoded, s: ras_sampling(scores, decoded, s, **kw)  # noqa: E731
     else:
-        llm.sampling = llm._kanade_default_sampling
+        base = llm._kanade_default_sampling
+
+    def guarded(scores, decoded, s):
+        if job.cancelled:
+            return llm.eos_token
+        return base(scores, decoded, s)
+
+    llm.sampling = guarded
     seed = p.get("seed")
     if seed is None and fam == "v3-sft":
         seed = SFT_SEED
@@ -244,7 +262,7 @@ def _common(job: Job, mode: str):
     model = load(job, model_dir, mode)
     fam = family(model_dir)
     if mode != "vc":  # 声音转换不经过 LLM
-        configure_sampling(model, fam, p)
+        configure_sampling(job, model, fam, p)
     return p, model, fam, float(p.get("speed") or 1.0), bool(p.get("text_frontend", True))
 
 

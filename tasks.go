@@ -45,7 +45,7 @@ func (a *app) tasksPage(c *ui.Context, tk *fluent.Tokens) {
 	jobs := a.be.cond.Jobs()
 	if len(jobs) == 0 {
 		card(c, tk, "暂无任务", func() {
-			ui.Text(c, "在各功能页或「M0 验证」页提交任务后会显示在这里。").TextColor(c.Theme().TextMuted)
+			ui.Text(c, "在各功能页提交任务后会显示在这里。").TextColor(c.Theme().TextMuted)
 		})
 		return
 	}

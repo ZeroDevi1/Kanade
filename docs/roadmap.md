@@ -4,11 +4,10 @@
 
 2026-10-21：原「一键翻唱达到手工后期的效果」（分轨可选模型、和声转换、按原唱响度对齐、混响与母带）、
 单实例保护与训练表单可见标签已实现，待 Windows 实测，见 [windows-test-plan.md](windows-test-plan.md) 第 5 节。
+2026-10-21：CosyVoice 句内取消、SFT「用已保存的 checkpoint 组装」、分轨分块进度已实现，见第 7 节。
 
 ## 1. 实测中发现、尚未处理的问题
 
-- CosyVoice 长文本取消在句与句之间生效，最长要等当前一句合成完。
-- CosyVoice SFT：训练中途失败（例如显卡驱动重置）后，界面没有「用已保存的检查点平均并组装」的入口；
-  「训练 LLM + Flow」与「无 .list 时 Whisper 转写」尚未在 Windows 上测试。
+- CosyVoice SFT：「训练 LLM + Flow」与「无 .list 时 Whisper 转写」尚未在 Windows 上测试。
 - 8 GB 显卡上分轨与训练同时运行会超出显存、回退到共享内存，速度降到几分之一：
   Conductor 只限制了自身同一时间一个 GPU 任务，空闲 worker 仍常驻显存，可考虑空闲一段时间后释放。

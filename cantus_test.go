@@ -26,6 +26,7 @@ func TestCantusSubmitsZeroShot(t *testing.T) {
 
 	a := newApp()
 	a.be = backend{layout: l, cond: cond}
+	a.current = "cantus"
 	a.cantus.promptWav, a.cantus.promptText, a.cantus.text = "/tmp/p.wav", "参考", "目标文本"
 	tt := ui.NewTester(a.view, 1200, 1400)
 	if err := tt.Click("生成"); err != nil {

@@ -112,3 +112,24 @@ func SFTTrainParams(l paths.Layout, t SFTTrain) (map[string]any, error) {
 	}
 	return p, nil
 }
+
+// SFTCheckpoints 返回名为 name 的 SFT 已保存 checkpoint 的训练部分（llm / flow）与轮数合计，
+// 与引擎 sft.saved_parts 的判断一致（exp/<部分>/epoch_*_whole.yaml）。
+func SFTCheckpoints(l paths.Layout, name string) (parts []string, epochs int) {
+	for _, part := range []string{"llm", "flow"} {
+		files, _ := filepath.Glob(filepath.Join(Root(l), "_sft", strings.TrimSpace(name), "exp", part, "epoch_*_whole.yaml"))
+		if len(files) > 0 {
+			parts, epochs = append(parts, part), epochs+len(files)
+		}
+	}
+	return parts, epochs
+}
+
+// SFTAssembleParams 返回 cosyvoice.sft_assemble 的任务参数：用已保存的 checkpoint 平均并组装模型。
+func SFTAssembleParams(l paths.Layout, name string) (map[string]any, error) {
+	name = strings.TrimSpace(name)
+	if parts, _ := SFTCheckpoints(l, name); len(parts) == 0 {
+		return nil, errors.New("没有已保存的 checkpoint，请先训练")
+	}
+	return map[string]any{"name": name, "base_model_dir": SFTBase().Dir(l)}, nil
+}

@@ -25,6 +25,8 @@ type app struct {
 	navCollapsed bool
 	// saveDir 是上次另存结果的目录，作为下次保存对话框的默认目录；空为数据根目录下的 outputs。
 	saveDir string
+	// dropErr 是最近一次拖入文件被拒绝的原因，格式为「选择框键\x00消息」，只在对应的选择框下显示。
+	dropErr string
 
 	lab      labState
 	settings settingsState
@@ -35,7 +37,7 @@ type app struct {
 }
 
 func newApp() *app {
-	return &app{current: "cantus", post: func(fn func()) { fn() }, cantus: newCantusState(), timbre: newTimbreState(), score: newScoreState()}
+	return &app{current: "home", post: func(fn func()) { fn() }, cantus: newCantusState(), timbre: newTimbreState(), score: newScoreState()}
 }
 
 func main() {

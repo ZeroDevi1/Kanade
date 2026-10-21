@@ -6,7 +6,7 @@ import (
 	"kanade/internal/ui/fluent"
 )
 
-// page 按当前导航项构建内容区。M0 中除验证页外均为占位页。
+// page 按当前导航项构建内容区。
 func (a *app) page(c *ui.Context, tk *fluent.Tokens) {
 	ui.Column(c).Padding(28, 36).Gap(16).MaxWidth(1000).AlignItems(ui.Stretch).Children(func() {
 		switch a.current {
@@ -25,7 +25,7 @@ func (a *app) page(c *ui.Context, tk *fluent.Tokens) {
 		case "settings":
 			a.settingsPage(c, tk)
 		default:
-			placeholder(c, tk, "主页", "最近项目与任务队列。")
+			a.homePage(c, tk)
 		}
 	})
 }
@@ -44,12 +44,5 @@ func card(c *ui.Context, tk *fluent.Tokens, title string, body func()) {
 		Background(tk.Card).Border(1, tk.CardStroke).Children(func() {
 		ui.Text(c, title).FontSize(16).FontWeight(600)
 		body()
-	})
-}
-
-func placeholder(c *ui.Context, tk *fluent.Tokens, title, subtitle string) {
-	pageHeader(c, title, subtitle)
-	card(c, tk, "尚未实现", func() {
-		ui.Text(c, "该模块在后续里程碑中接入 Conductor 推理引擎。").TextColor(c.Theme().TextMuted)
 	})
 }
