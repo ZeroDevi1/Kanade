@@ -1,0 +1,12 @@
+{
+  "name": "score",
+  "title": "音乐分析",
+  "description": "调号、拍号、BPM、和弦与情绪识别（beat_this 节拍、librosa 和声分析、CLAP 情绪）。",
+  "python": "3.12",
+  "module": "kanade_score",
+  "tasks": [
+    "score.analyze",
+    "score.download",
+    "score.doctor"
+  ]
+}

@@ -100,19 +100,30 @@ func (rs *resultSet) show(c *ui.Context, tk *fluent.Tokens, a *app, empty string
 	}
 }
 
-// saveResult 打开保存对话框，把 r 复制到用户选择的位置。默认文件名在上次保存的目录中去重，避免覆盖已有文件；
-// 用户在对话框里选择已有文件时由系统对话框确认覆盖。
+// saveResult 打开保存对话框，把 r 复制到用户选择的位置。
 func (a *app) saveResult(rs *resultSet, r *result) {
+	a.saveFileAs(r.path, r.name, func(dst string, err error) {
+		rs.err = errText(err)
+		if err == nil {
+			r.saved = dst
+		}
+	})
+}
+
+// saveFileAs 打开保存对话框，把 src 复制到用户选择的位置；done 在 UI 线程调用（用户取消时不调用）。
+// 默认文件名为 name 加 src 的扩展名，在上次保存的目录中去重，避免覆盖已有文件；
+// 用户在对话框里选择已有文件时由系统对话框确认覆盖。
+func (a *app) saveFileAs(src, name string, done func(dst string, err error)) {
 	dir := a.saveDir
 	if dir == "" {
 		dir = a.be.layout.Outputs
 	}
-	ext := filepath.Ext(r.path)
-	def := uniquePath(dir, safeFileName(r.name)+ext)
-	src, win := r.path, a.win
+	ext := filepath.Ext(src)
+	def := uniquePath(dir, safeFileName(name)+ext)
+	win := a.win
 	go func() {
 		dst, err := mygo.Dialog.Save(mygo.SaveDialogOptions{
-			Parent: win, Title: "保存音频", DefaultPath: def, CreateDirectories: true,
+			Parent: win, Title: "保存", DefaultPath: def, CreateDirectories: true,
 			Filters: []mygo.FileFilter{{Name: strings.ToUpper(strings.TrimPrefix(ext, ".")), Extensions: []string{strings.TrimPrefix(ext, ".")}}},
 		})
 		if err != nil || dst == "" {
@@ -124,10 +135,10 @@ func (a *app) saveResult(rs *resultSet, r *result) {
 		}
 		err = copyFileAtomic(src, dst)
 		a.post(func() {
-			rs.err = errText(err)
 			if err == nil {
-				r.saved, a.saveDir = dst, filepath.Dir(dst)
+				a.saveDir = filepath.Dir(dst)
 			}
+			done(dst, err)
 		})
 	}()
 }

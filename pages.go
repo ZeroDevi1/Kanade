@@ -19,7 +19,7 @@ func (a *app) page(c *ui.Context, tk *fluent.Tokens) {
 		case "stems":
 			a.stemsPage(c, tk)
 		case "score":
-			placeholder(c, tk, "音乐分析", "Score · 调号、拍号、BPM、和弦与情绪识别。")
+			a.scorePage(c, tk)
 		case "tasks":
 			a.tasksPage(c, tk)
 		case "settings":

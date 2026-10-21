@@ -11,5 +11,6 @@ import "embed"
 //go:embed dev-mock/engine.json dev-mock/pyproject.toml dev-mock/uv.lock all:dev-mock/src
 //go:embed stems/engine.json stems/pyproject.toml stems/uv.lock all:stems/src
 //go:embed timbre/engine.json timbre/pyproject.toml timbre/uv.lock all:timbre/src all:timbre/vendor
+//go:embed score/engine.json score/pyproject.toml score/uv.lock all:score/src
 //go:embed cosyvoice/engine.json cosyvoice/pyproject.toml cosyvoice/uv.lock all:cosyvoice/src all:cosyvoice/vendor
 var FS embed.FS

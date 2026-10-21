@@ -1,0 +1,49 @@
+[project]
+name = "kanade-score"
+version = "0.1.0"
+description = "Kanade 的音乐分析引擎（Score）：节拍 / 拍号 / BPM、调号、和弦与情绪识别"
+requires-python = "==3.12.*"
+# torch / torchaudio / transformers / librosa / numpy 的版本与 timbre 引擎一致：该组合已在 Windows + RTX 50 上实测
+# （torchaudio 最后一个版本为 2.11，beat_this 依赖它，因此不跟随分轨引擎的 torch 2.14）。
+dependencies = [
+    "kanade-engine-sdk",
+    "numpy==2.4.6",
+    "scipy==1.18.0",
+    "soundfile==0.14.0",
+    "soxr==1.1.0",
+    "librosa==0.11.0",
+    "torch==2.11.0",
+    "torchaudio==2.11.0",
+    # 节拍与小节线（MIT，CPJKU）：Transformer 模型，权重约 80 MB，首次使用时下载。
+    "beat-this==1.1.0",
+    "einops==0.8.2",
+    # 情绪识别用 CLAP（laion/clap-htsat-unfused，Apache-2.0）的零样本分类。
+    "transformers==5.13.1",
+    # 解码 MP3 / M4A 等格式。
+    "imageio-ffmpeg==0.6.0",
+]
+
+[tool.uv]
+environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[tool.uv.sources]
+# editable：SDK 版本号不变时 uv sync 不会重装非 editable 的 path 依赖，改为直接引用释放出的源码。
+kanade-engine-sdk = { path = "../sdk", editable = true }
+# Windows 用 PyTorch 官方 CUDA 12.8 构建，支持 RTX 50（Blackwell），要求 NVIDIA 驱动 570 及以上。
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32'" }]
+torchaudio = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kanade_score"]
