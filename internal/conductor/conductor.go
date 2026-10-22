@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,6 +104,8 @@ type Conductor struct {
 	wake    chan struct{}     // 有新任务时唤醒 runner，容量 1
 	worker  *Worker
 	wEngine string // worker 所属引擎
+	// wEnv 是 worker 启动时的 extraEnv：设置变化后（例如填写 Hugging Face 令牌）下一个任务换用新进程。
+	wEnv []string
 	// extraEnv 是追加给 uv 与 worker 的环境变量（下载镜像），对之后启动的进程生效。
 	extraEnv []string
 	closed   bool
@@ -140,7 +143,8 @@ func New(l paths.Layout, src fs.FS, onChange func()) (*Conductor, error) {
 	return c, nil
 }
 
-// SetEnv 设置追加给 uv 与之后启动的 worker 的环境变量；已在运行的 worker 不受影响。
+// SetEnv 设置追加给 uv 与 worker 的环境变量。正在执行的任务不受影响；已启动的 worker 在下一个任务开始前
+// 换成按新环境启动的进程（见 workerFor）。
 func (c *Conductor) SetEnv(env []string) {
 	c.mu.Lock()
 	c.extraEnv = append([]string(nil), env...)
@@ -525,12 +529,13 @@ func (c *Conductor) waitInstalled(ctx context.Context, name string) error {
 	}
 }
 
-// workerFor 返回引擎的 worker：复用同引擎的 worker，否则关闭旧 worker 再启动新的。
+// workerFor 返回引擎的 worker：复用同引擎、且启动时环境与当前一致的 worker，否则关闭旧 worker 再启动新的。
 func (c *Conductor) workerFor(name string) (*Worker, error) {
+	env := c.env()
 	c.mu.Lock()
-	w, owner := c.worker, c.wEngine
+	w, owner, wEnv := c.worker, c.wEngine, c.wEnv
 	c.mu.Unlock()
-	if w != nil && owner == name && w.Err() == nil {
+	if w != nil && owner == name && slices.Equal(wEnv, env) && w.Err() == nil {
 		select {
 		case <-w.Exited:
 		default:
@@ -545,17 +550,17 @@ func (c *Conductor) workerFor(name string) (*Worker, error) {
 	c.mu.Lock()
 	spec := c.engines[name].spec
 	c.mu.Unlock()
-	w, err := StartWorker(c.layout, spec, c.env()...)
+	w, err := StartWorker(c.layout, spec, env...)
 	if err != nil {
 		c.mu.Lock()
-		c.worker, c.wEngine = nil, ""
+		c.worker, c.wEngine, c.wEnv = nil, "", nil
 		c.engines[name].state, c.engines[name].err = EngineFailed, err.Error()
 		c.mu.Unlock()
 		c.onChange()
 		return nil, err
 	}
 	c.mu.Lock()
-	c.worker, c.wEngine = w, name
+	c.worker, c.wEngine, c.wEnv = w, name, env
 	c.mu.Unlock()
 	c.setEngineState(name, EngineRunning)
 	return w, nil

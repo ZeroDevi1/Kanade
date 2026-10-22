@@ -24,10 +24,11 @@ type settingsState struct {
 	// expanded 记录展开了安装日志的引擎名称。
 	expanded map[string]bool
 
-	// 下载镜像的编辑值；mirrorLoaded 为 false 时从已保存设置初始化。
+	// 下载镜像与 Hugging Face 令牌的编辑值；mirrorLoaded 为 false 时从已保存设置初始化。
 	mirrorLoaded bool
 	mirrorCN     bool
 	ghMirror     string
+	hfToken      string
 	mirrorSaved  bool
 	// doctor 是各引擎环境检查任务的 ID。
 	doctor map[string]string
@@ -115,18 +116,21 @@ func (a *app) settingsPage(c *ui.Context, tk *fluent.Tokens) {
 	a.doctorCard(c, tk)
 }
 
-// mirrorCard 设置模型与运行时的下载镜像，保存后对之后启动的引擎生效。
+// mirrorCard 设置模型与运行时的下载镜像和 Hugging Face 访问令牌，保存后从下一个任务起生效。
 func (a *app) mirrorCard(c *ui.Context, tk *fluent.Tokens) {
 	t := c.Theme()
 	s := &a.settings
 	if !s.mirrorLoaded {
 		s.mirrorLoaded = true
-		s.mirrorCN, s.ghMirror = a.be.settings.Mirror == settings.MirrorCN, a.be.settings.GitHubMirror
+		s.mirrorCN, s.ghMirror, s.hfToken = a.be.settings.Mirror == settings.MirrorCN, a.be.settings.GitHubMirror, a.be.settings.HFToken
 	}
-	card(c, tk, "下载镜像", func() {
+	card(c, tk, "下载", func() {
 		ui.Checkbox(c, &s.mirrorCN, "Hugging Face 使用国内镜像（"+settings.HFMirror+"）")
 		ui.TextInput(c, &s.ghMirror).Label("GitHub 镜像前缀").Placeholder("留空直连，例如 https://ghfast.top/").Width(360)
 		ui.Text(c, "GitHub 镜像用于分轨模型、uv 与 Python 运行时的下载；CosyVoice 模型可在语音生成页选择 ModelScope。").
+			FontSize(12).TextColor(t.TextMuted)
+		ui.TextInput(c, &s.hfToken).Label("Hugging Face 访问令牌").Placeholder("hf_…（可选）").Password().Width(360)
+		ui.Text(c, "下载需要登录并接受许可的模型（音乐分析的多乐器转录 MuScriptor）时使用，Read 权限即可；以明文保存在本机设置文件中。").
 			FontSize(12).TextColor(t.TextMuted)
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 			if ui.Button(c, "保存").Clicked() {
@@ -135,8 +139,13 @@ func (a *app) mirrorCard(c *ui.Context, tk *fluent.Tokens) {
 					s.err, s.mirrorSaved = "GitHub 镜像前缀须以 https:// 开头", false
 					return
 				}
+				tok := strings.TrimSpace(s.hfToken)
+				if strings.ContainsAny(tok, " \t\r\n") {
+					s.err, s.mirrorSaved = "Hugging Face 令牌不能包含空白字符", false
+					return
+				}
 				next := a.be.settings
-				next.Mirror, next.GitHubMirror = "", gh
+				next.Mirror, next.GitHubMirror, next.HFToken = "", gh, tok
 				if s.mirrorCN {
 					next.Mirror = settings.MirrorCN
 				}
@@ -148,7 +157,7 @@ func (a *app) mirrorCard(c *ui.Context, tk *fluent.Tokens) {
 				a.be.cond.SetEnv(next.Env())
 			}
 			if s.mirrorSaved {
-				ui.Text(c, "已保存，对之后启动的引擎生效").FontSize(12).TextColor(t.Success)
+				ui.Text(c, "已保存，从下一个任务起生效").FontSize(12).TextColor(t.Success)
 			}
 		})
 	})

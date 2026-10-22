@@ -23,6 +23,8 @@ dependencies = [
     "pyyaml",
     # 解码 MP3 / M4A 等格式。
     "imageio-ffmpeg==0.6.0",
+    # 多乐器转录（Kyutai × Mirelo，代码 MIT）：权重为 CC BY-NC 4.0 非商用许可，且 Hugging Face 仓库需登录接受许可后才能下载。
+    "muscriptor==0.4.0",
 ]
 
 [tool.uv]

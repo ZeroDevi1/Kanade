@@ -3,6 +3,9 @@
 镜像由 Go 端经环境变量传入（设置页的下载镜像选项）：
 - KANADE_HF_ENDPOINT：替换 https://huggingface.co（例如 https://hf-mirror.com）。
 - KANADE_GITHUB_MIRROR：作为前缀加在 https://github.com/ 地址前（例如 https://ghfast.top/）。
+
+KANADE_HF_TOKEN（设置页的 Hugging Face 访问令牌）非空时，Hugging Face 地址（含镜像）的请求带上
+Authorization 头，用于下载需要登录并接受许可的门控模型；重定向到 CDN 时不转发该头。
 """
 
 from __future__ import annotations
@@ -55,6 +58,13 @@ def mirror(url: str) -> str:
     return url
 
 
+def _hf_token(url: str) -> str:
+    """url 是 Hugging Face 地址时返回访问令牌（未设置时为空串）。只认原始地址，镜像改写在其后进行。"""
+    if not url.startswith("https://huggingface.co/"):
+        return ""
+    return os.environ.get("KANADE_HF_TOKEN", "").strip()
+
+
 class HTTPStatusError(IOError):
     def __init__(self, url: str, code: int):
         super().__init__(f"下载失败（HTTP {code}）：{url}")
@@ -90,8 +100,12 @@ def _fetch_once(url: str, dst: Path, on_bytes: Callable[[int, int], None] | None
     headers = {"User-Agent": "Kanade"}
     if have:
         headers["Range"] = f"bytes={have}-"
+    req = urllib.request.Request(mirror(url), headers=headers)
+    if token := _hf_token(url):
+        # unredirected：resolve 地址会重定向到带签名的 CDN 地址，令牌不应发给 CDN（签名地址也拒绝额外的鉴权头）。
+        req.add_unredirected_header("Authorization", f"Bearer {token}")
     try:
-        resp = urlopen(urllib.request.Request(mirror(url), headers=headers), timeout=TIMEOUT)
+        resp = urlopen(req, timeout=TIMEOUT)
     except urllib.error.HTTPError as exc:
         if exc.code == 416 and size and have == size:
             os.replace(part, dst)  # 上次已下载完整但未改名

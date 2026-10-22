@@ -19,6 +19,9 @@ import (
 //   - 匀速的歌（Tempo.Stable）只写一个速度，便于在编辑器中按网格编辑；
 //     有变速的歌每拍写一个速度，逐拍对齐原曲。
 //
+// 有多乐器转录时，和弦轨之后每种乐器一轨（按转录的音符数从多到少），音色为该乐器组的代表 GM 音色，鼓在通道 10。
+// 轨道名与 Melody / Chords 一样用英文：轨道名元事件没有编码约定，mido 与不少 DAW 按 Latin-1 读取，中文会显示为乱码。
+//
 // 有歌词时旋律轨在每个音的按下处写歌词事件（FF 05，UTF-8）：字写在字的第一个音上，连音写 "-"
 // （Synthesizer V、ACE Studio、VOCALOID 的延音记号），导入后连音 / 转音仍归同一个字。
 
@@ -29,7 +32,19 @@ const midiPPQ = 480
 const (
 	midiMelodyChannel = 0
 	midiChordChannel  = 1
+	// midiDrumChannel 是 GM 规定的打击乐通道（第 10 通道）。
+	midiDrumChannel = 9
 )
+
+// midiInstrumentVelocity 是转录音符的力度：MuScriptor 不输出力度，取 mf 附近的固定值（约 90）。
+const midiInstrumentVelocity = 0.7
+
+// instrumentChannel 返回第 i 种有音高乐器的通道：依次用通道 3–16（跳过鼓通道 10），超过 13 种时循环复用
+// （共用通道的乐器在播放时会互相改掉音色，但各轨音符仍分开，导入 DAW 后可逐轨重设）。
+func instrumentChannel(i int) int {
+	free := []int{2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15}
+	return free[i%len(free)]
+}
 
 // midiAnchor 是时间（秒）与 tick 的对应点，相邻两点之间线性换算，并各自对应一个速度。
 type midiAnchor struct {
@@ -152,15 +167,24 @@ type midiEvent struct {
 	data  []byte
 }
 
-// MIDI 返回分析结果的 MIDI 文件。没有和弦与旋律时返回错误。
+// MIDI 返回分析结果的 MIDI 文件。没有和弦、旋律与转录音符时返回错误。
 func (a *Analysis) MIDI() ([]byte, error) {
 	melody, chords := a.MelodyPiano(), a.ChordPad()
-	if len(melody) == 0 && len(chords) == 0 {
-		return nil, errors.New("没有可导出的和弦或旋律")
+	var parts []Instrument
+	if a.Transcription != nil {
+		parts = slices.DeleteFunc(slices.Clone(a.Transcription.Instruments), func(in Instrument) bool { return len(in.Notes) == 0 })
+	}
+	if len(melody) == 0 && len(chords) == 0 && len(parts) == 0 {
+		return nil, errors.New("没有可导出的和弦、旋律或转录音符")
 	}
 	end := a.Duration
 	for _, n := range append(slices.Clone(melody), chords...) {
 		end = max(end, n.End)
+	}
+	for _, in := range parts {
+		for _, n := range in.Notes {
+			end = max(end, n.End)
+		}
 	}
 	tm := a.newMidiTimeMap(end)
 
@@ -176,7 +200,7 @@ func (a *Analysis) MIDI() ([]byte, error) {
 	for i := 0; i+1 < len(melody); i++ {
 		melody[i].End = min(melody[i].End, melody[i+1].Start)
 	}
-	melodyTrack := noteTrack("Melody", midiMelodyChannel, melody, tm)
+	melodyTrack := noteTrack("Melody", midiMelodyChannel, 0, melody, tm)
 	if a.Melody != nil {
 		for _, n := range a.Melody.Notes {
 			text := n.Lyric
@@ -191,7 +215,20 @@ func (a *Analysis) MIDI() ([]byte, error) {
 	tracks := [][]midiEvent{
 		conductor,
 		melodyTrack,
-		noteTrack("Chords", midiChordChannel, chords, tm),
+		noteTrack("Chords", midiChordChannel, 0, chords, tm),
+	}
+	pitched := 0
+	for _, in := range parts {
+		ch, prog := midiDrumChannel, 0
+		if !in.Drum {
+			ch, prog = instrumentChannel(pitched), min(max(in.Program, 0), 127)
+			pitched++
+		}
+		notes := make([]PianoNote, len(in.Notes))
+		for i, n := range in.Notes {
+			notes[i] = PianoNote{MIDI: n.Pitch, Start: n.Start, End: n.End, Velocity: midiInstrumentVelocity}
+		}
+		tracks = append(tracks, noteTrack(in.TrackName(), ch, prog, notes, tm))
 	}
 
 	var buf bytes.Buffer
@@ -204,12 +241,12 @@ func (a *Analysis) MIDI() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// noteTrack 把音符换成一条音轨的事件。同一音高的音在下一次按下前松开（MIDI 不允许同音重叠）；
-// 换算后短于 1 tick 的音丢弃。
-func noteTrack(name string, ch int, notes []PianoNote, tm *midiTimeMap) []midiEvent {
+// noteTrack 把音符换成一条音轨的事件，音色为 GM 音色 program（0–127）。同一音高的音在下一次按下前松开
+// （MIDI 不允许同音重叠）；换算后短于 1 tick 的音丢弃。
+func noteTrack(name string, ch, program int, notes []PianoNote, tm *midiTimeMap) []midiEvent {
 	ev := []midiEvent{
 		{data: append([]byte{0xFF, 0x03, byte(len(name))}, name...)},
-		{order: 1, data: []byte{byte(0xC0 | ch), 0}},
+		{order: 1, data: []byte{byte(0xC0 | ch), byte(program)}},
 	}
 	byPitch := map[int][]PianoNote{}
 	for _, n := range notes {

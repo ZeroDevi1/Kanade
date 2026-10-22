@@ -176,3 +176,61 @@ func TestMIDILyrics(t *testing.T) {
 		t.Errorf("lyric events %v", got)
 	}
 }
+
+// 多乐器转录：和弦轨之后每种乐器一轨，有音高的乐器用各自的通道与 GM 音色，鼓在通道 10；空乐器不写。
+func TestMIDIInstruments(t *testing.T) {
+	a := midiSample(true)
+	a.Transcription = &Transcription{Instruments: []Instrument{
+		{Name: "drums", Program: -1, Drum: true, Notes: []InstrumentNote{{Start: 0.5, End: 0.55, Pitch: 36}}},
+		{Name: "electric_bass", Program: 33, Notes: []InstrumentNote{{Start: 1, End: 1.5, Pitch: 40}}},
+		{Name: "violin", Program: 40},
+	}}
+	data, err := a.MIDI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, tracks := parseMIDI(t, data)
+	if len(tracks) != 5 {
+		t.Fatalf("tracks %d", len(tracks))
+	}
+	check := func(tr []parsedEvent, name string, ch, prog, tick, pitch int) {
+		t.Helper()
+		var gotName string
+		gotProg, on := -1, false
+		for _, e := range tr {
+			switch {
+			case e.data[0] == 0xFF && e.data[1] == 0x03:
+				gotName = string(e.data[3:])
+			case e.data[0] == byte(0xC0|ch):
+				gotProg = int(e.data[1])
+			case e.data[0] == byte(0x90|ch) && e.tick == tick && int(e.data[1]) == pitch:
+				on = true
+			}
+		}
+		if gotName != name || gotProg != prog || !on {
+			t.Errorf("%s: name %q program %d note-on %v", name, gotName, gotProg, on)
+		}
+	}
+	check(tracks[3], "Drums", midiDrumChannel, 0, 480, 36)
+	check(tracks[4], "Electric Bass", 2, 33, 960, 40)
+
+	// 只有转录音符时也能导出。
+	b := &Analysis{Duration: 5, Transcription: a.Transcription}
+	if _, err := b.MIDI(); err != nil {
+		t.Errorf("transcription only: %v", err)
+	}
+}
+
+func TestInstrumentChannel(t *testing.T) {
+	seen := map[int]bool{}
+	for i := range 13 {
+		ch := instrumentChannel(i)
+		if ch == midiDrumChannel || ch == midiMelodyChannel || ch == midiChordChannel || seen[ch] {
+			t.Errorf("instrument %d on channel %d", i, ch)
+		}
+		seen[ch] = true
+	}
+	if instrumentChannel(13) != instrumentChannel(0) {
+		t.Error("channels should wrap around")
+	}
+}

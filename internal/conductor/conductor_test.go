@@ -91,6 +91,26 @@ func TestDevMockEndToEnd(t *testing.T) {
 	if j := waitJob(t, c, slow, 30*time.Second); j.State != JobCanceled {
 		t.Fatalf("slow job %+v", j)
 	}
+
+	// 环境不变时复用 worker；SetEnv 改变环境后，下一个任务换用新启动的 worker。
+	quick := func() *Worker {
+		t.Helper()
+		id, _ := c.Submit("dev-mock", "mock.tts", map[string]any{"steps": 1})
+		if j := waitJob(t, c, id, time.Minute); j.State != JobDone {
+			t.Fatalf("job %+v", j)
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.worker
+	}
+	w1 := quick()
+	if w2 := quick(); w2 != w1 {
+		t.Error("worker restarted without an env change")
+	}
+	c.SetEnv([]string{"KANADE_HF_TOKEN=hf_test"})
+	if w3 := quick(); w3 == w1 {
+		t.Error("worker kept after env change")
+	}
 }
 
 func waitJob(t *testing.T, c *Conductor, id string, timeout time.Duration) Job {

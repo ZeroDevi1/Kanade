@@ -34,6 +34,8 @@ type Options struct {
 	Emotion            bool
 	// SlurModel 是有歌词时字与音符的对应方法（SlurModels 之一），空为引擎默认 align。
 	SlurModel string
+	// Transcribe 为 true 时用 MuScriptor 对原曲做多乐器转录（权重为 CC BY-NC 4.0 非商用许可，下载需要 HF 令牌）。
+	Transcribe bool
 }
 
 // 可选值，与引擎一致。Title 用于界面。
@@ -66,7 +68,7 @@ func (o Options) params() (map[string]any, error) {
 	if o.ChordMinBeats < 0 || o.KeySegmentS < 0 {
 		return nil, errors.New("最短和弦与分段长度不能为负")
 	}
-	p := map[string]any{"emotion": o.Emotion, "key_segment_s": o.KeySegmentS}
+	p := map[string]any{"emotion": o.Emotion, "key_segment_s": o.KeySegmentS, "transcribe": o.Transcribe}
 	for k, v := range map[string]string{"beat_method": o.BeatMethod, "key_profile": o.KeyProfile, "chord_vocab": o.ChordVocab,
 		"slur_model": o.SlurModel} {
 		if v != "" {
@@ -141,7 +143,12 @@ var ModelGroups = []ModelGroup{
 	{"lyrics", "歌词对齐（wav2vec2）", []string{"lyrics/wav2vec2-large-xlsr-53-chinese-zh-cn/pytorch_model.bin",
 		"lyrics/wav2vec2-large-xlsr-53-chinese-zh-cn/vocab.json"}, 1276},
 	{"game", "连音（GAME，非商用）", []string{"game/GAME-1.0-medium/model.pt", "game/GAME-1.0-medium/config.yaml"}, 185},
+	{"muscriptor", "多乐器转录（MuScriptor，非商用）", []string{"muscriptor/muscriptor-medium/model.safetensors",
+		"muscriptor/muscriptor-medium/config.json"}, 1228},
 }
+
+// MuScriptorPage 是 MuScriptor 权重的 Hugging Face 页面：下载前须登录并在此接受许可。
+const MuScriptorPage = "https://huggingface.co/MuScriptor/muscriptor-medium"
 
 // Installed 报告模型组是否已下载。
 func (g ModelGroup) Installed(l paths.Layout) bool {
@@ -407,10 +414,12 @@ type Analysis struct {
 		} `json:"candidates"`
 		Segments []Segment `json:"segments"`
 	} `json:"key"`
-	Chords      []Segment `json:"chords"`
-	Melody      *Melody   `json:"melody"`       // 旋律线；分析时没有分离主唱则为 nil
-	ChordSource string    `json:"chord_source"` // accompaniment / mix
-	Emotion     *struct {
+	Chords []Segment `json:"chords"`
+	Melody *Melody   `json:"melody"` // 旋律线；分析时没有分离主唱则为 nil
+	// Transcription 是原曲的多乐器转录；未开启时为 nil。
+	Transcription *Transcription `json:"transcription"`
+	ChordSource   string         `json:"chord_source"` // accompaniment / mix
+	Emotion       *struct {
 		Moods []struct {
 			Key   string  `json:"key"`
 			Label string  `json:"label"`
@@ -420,6 +429,59 @@ type Analysis struct {
 		Arousal  float64   `json:"arousal"`
 		Segments []Segment `json:"segments"`
 	} `json:"emotion"`
+}
+
+// Transcription 是 MuScriptor 的多乐器转录结果（见引擎 transcribe.py）。
+type Transcription struct {
+	Model string `json:"model"`
+	// OnsetDelay 是已从全部音符中扣除的整体起音延迟（秒），0 为未校正。
+	OnsetDelay  float64      `json:"onset_delay"`
+	Instruments []Instrument `json:"instruments"` // 按音符数从多到少
+}
+
+// Instrument 是一种乐器（上游的乐器组）的音符。
+type Instrument struct {
+	Name    string           `json:"name"`    // 上游乐器组名，如 electric_bass；未知组形如 program_42
+	Program int              `json:"program"` // 代表 GM 音色 0–127；鼓为 -1
+	Drum    bool             `json:"drum"`
+	Notes   []InstrumentNote `json:"notes"`
+}
+
+// InstrumentNote 是转录出的一个音（秒）。鼓的时长是引擎给的固定短音。
+type InstrumentNote struct {
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
+	Pitch int     `json:"pitch"` // MIDI 音高；鼓为 GM 打击乐键位
+}
+
+// instrumentTitles 是乐器组的中文名。
+var instrumentTitles = map[string]string{
+	"acoustic_piano": "原声钢琴", "electric_piano": "电钢琴", "chromatic_percussion": "有音高打击乐", "organ": "风琴",
+	"acoustic_guitar": "原声吉他", "clean_electric_guitar": "清音电吉他", "distorted_electric_guitar": "失真电吉他",
+	"acoustic_bass": "原声贝斯", "electric_bass": "电贝斯", "violin": "小提琴", "viola": "中提琴", "cello": "大提琴",
+	"contrabass": "低音提琴", "orchestral_harp": "竖琴", "timpani": "定音鼓", "string_ensemble": "弦乐组",
+	"synth_strings": "合成弦乐", "voice": "人声", "orchestra_hit": "管弦乐齐奏", "trumpet": "小号", "trombone": "长号",
+	"tuba": "大号", "french_horn": "圆号", "brass_section": "铜管组", "soprano_and_alto_sax": "高音 / 中音萨克斯",
+	"tenor_sax": "次中音萨克斯", "baritone_sax": "上低音萨克斯", "oboe": "双簧管", "english_horn": "英国管",
+	"bassoon": "大管", "clarinet": "单簧管", "flutes": "长笛", "synth_lead": "合成主音", "synth_pad": "合成铺底",
+	"drums": "鼓",
+}
+
+// Title 返回乐器的中文名；没有译名时返回原名。
+func (i Instrument) Title() string {
+	if t, ok := instrumentTitles[i.Name]; ok {
+		return t
+	}
+	return i.Name
+}
+
+// TrackName 返回 MIDI 轨道名：上游组名换成首字母大写的英文词，如 electric_bass → Electric Bass。
+func (i Instrument) TrackName() string {
+	words := strings.Fields(strings.ReplaceAll(i.Name, "_", " "))
+	for k, w := range words {
+		words[k] = strings.ToUpper(w[:1]) + w[1:]
+	}
+	return strings.Join(words, " ")
 }
 
 // Segment 是一段带标签的时间区间（秒）。和弦段另有根音与性质（无和弦 N 时 Root 为 nil）。

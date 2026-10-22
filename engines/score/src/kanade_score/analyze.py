@@ -18,12 +18,17 @@
         slur_model:    有歌词时字与音符的对应方法："align"（默认，SOME 音符 + 动态规划分配）| "game"（GAME 按字切分音符，
                        权重为 CC BY-NC-SA 4.0 非商用许可）
         emotion:       是否做情绪识别，默认 true
+        transcribe:    是否做多乐器转录（MuScriptor，见 transcribe.py），默认 false；权重为 CC BY-NC 4.0 非商用许可，
+                       下载需要 Hugging Face 访问令牌
     }
 
 melody 为 {notes: [{start, end, pitch, lyric?, slur?}], source, lyrics?}，没有 melody_input 时为 null。有歌词时
 lyric 是该音唱的字、slur 为 true 表示同一个字的后续音（连音）；lyrics 为 {source（LRC 路径）, words, matched, note}：
 words 是逐字对齐结果 [{text, line, start, end}]，matched 是分到音符的字数，note 非空时说明对齐放宽了哪些约束，
 method 是字与音符的对应方法（同 options.slur_model）。
+
+transcription 为 {model, onset_delay, instruments: [{name, program, drum, notes: [{start, end, pitch}]}]}（原曲的多乐器
+转录，字段见 transcribe.transcribe），未开启时为 null。
 
 输出（任务目录下）：audio.wav（原曲解码为 44.1 kHz WAV，供界面预览）、analysis.json（结构见 run_analyze 末尾的 result）与 chords.lab（MIREX 和弦标注格式：
 起止秒与和弦名，制表符分隔，可导入 Sonic Visualiser 等工具）。
@@ -41,7 +46,7 @@ import soundfile as sf
 
 from kanade_engine import Job, pick_device
 
-from . import btc, emotion, harmony, lyrics, melody, models, rhythm
+from . import btc, emotion, harmony, lyrics, melody, models, rhythm, transcribe
 
 SR = 44100
 HOP = 512
@@ -100,6 +105,7 @@ def run_analyze(job: Job) -> None:
     segment_s = float(o.get("key_segment_s", 30) or 0)
     fold = tuple(o["tempo_range"]) if o.get("tempo_range") else None
     want_emotion = o.get("emotion", True)
+    want_transcribe = bool(o.get("transcribe", False))
     slur_model = o.get("slur_model") or "align"
     if slur_model not in ("align", "game"):
         raise ValueError(f"未知的连音方法：{slur_model}")
@@ -108,7 +114,7 @@ def run_analyze(job: Job) -> None:
     # 1. 模型（按需下载）与解码。
     groups = (["beat_this"] if beat_method == "beat_this" else []) + (["clap"] if want_emotion else []) + \
         (["some"] if mel_src else []) + (["btc"] if vocab == "full" else []) + (["lyrics"] if lines else []) + \
-        (["game"] if use_game else [])
+        (["game"] if use_game else []) + (["muscriptor"] if want_transcribe else [])
     models.ensure(job, groups, 0.0, 0.15)
     out_dir = job.output_dir / job.id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -155,7 +161,7 @@ def run_analyze(job: Job) -> None:
                                        (key["tonic_pc"], key["mode"]))
     job.check_cancelled()
 
-    # 4. 旋律（主唱）与情绪（原曲）。
+    # 4. 旋律（主唱）、情绪与多乐器转录（原曲）。转录最慢，开启时占用情绪之后的大部分进度。
     tune = None
     if vy is not None:
         tune = {"notes": melody.transcribe(job, vy.mean(axis=1), vsr, 0.58, 0.66 if lines else 0.7), "source": "lead_vocal"}
@@ -167,9 +173,13 @@ def run_analyze(job: Job) -> None:
                 tune["notes"], lost = lyrics.attach(tune["notes"], words)
             tune["lyrics"] = {"source": str(lrc_src), "words": words, "matched": len(words) - lost, "note": note,
                               "method": slur_model}
+    mood_hi = 0.75 if want_transcribe else 0.97
     mood = None
     if want_emotion:
-        mood = emotion.analyze(job, y.mean(axis=1), sr, 0.7, 0.97)
+        mood = emotion.analyze(job, y.mean(axis=1), sr, 0.7, mood_hi)
+    parts = None
+    if want_transcribe:
+        parts = transcribe.transcribe(job, y.mean(axis=1), sr, beats, downbeats, mood_hi, 0.97)
 
     result = {
         "version": 1,
@@ -184,8 +194,10 @@ def run_analyze(job: Job) -> None:
         "chord_source": "accompaniment" if harm_src else "mix",
         "emotion": mood,
         "melody": tune,
+        "transcription": parts,
         "options": {"beat_method": beat_method, "key_profile": profile, "chord_vocab": vocab,
-                    "chord_self_prob": self_prob, "chord_min_beats": min_beats, "slur_model": slur_model},
+                    "chord_self_prob": self_prob, "chord_min_beats": min_beats, "slur_model": slur_model,
+                    "transcribe": want_transcribe},
     }
     js = out_dir / "analysis.json"
     js.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

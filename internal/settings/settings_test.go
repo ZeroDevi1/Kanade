@@ -18,6 +18,9 @@ func TestMirrorEnvAndRoundTrip(t *testing.T) {
 	if got := s.Env(); !reflect.DeepEqual(got, want) {
 		t.Errorf("env %v", got)
 	}
+	if env := (Settings{HFToken: " hf_abc "}).Env(); !reflect.DeepEqual(env, []string{"KANADE_HF_TOKEN=hf_abc"}) {
+		t.Errorf("token env %v", env)
+	}
 	dir := t.TempDir()
 	if err := Save(dir, s); err != nil {
 		t.Fatal(err)

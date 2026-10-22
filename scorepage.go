@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,8 @@ type scoreState struct {
 	input    string // 要分析的歌曲
 	separate bool   // 先分离伴奏，调号与和弦基于伴奏分析
 	melody   bool   // 分离主唱并识别旋律线
+	// transcribe 为 true 时用 MuScriptor 对原曲做多乐器转录（智能与专业模式都可选）。
+	transcribe bool
 	// lyrics 是 LRC 歌词（识别旋律线时逐字对到音符上），空为不用歌词。lyricsFor 是上次自动查找同名 .lrc 时的
 	// 歌曲路径：换歌时重新查找（找不到则清空），用户之后手动选择或清除不会被覆盖。
 	lyrics, lyricsFor string
@@ -72,6 +75,7 @@ func (a *app) scoreRequest() score.Request {
 	s := &a.score
 	r := score.Request{Input: s.input, Separate: s.separate, Melody: s.melody, Lyrics: s.lyrics, StemModels: stems.Recommended,
 		Options: score.DefaultOptions(), History: score.HistoryDir(a.be.layout)}
+	r.Options.Transcribe = s.transcribe
 	if s.mode == modeSmart {
 		return r
 	}
@@ -121,10 +125,50 @@ func (a *app) scorePage(c *ui.Context, tk *fluent.Tokens) {
 	if res.Emotion != nil {
 		card(c, tk, "情绪", func() { a.scoreEmotion(c, res) })
 	}
+	if tr := res.Transcription; tr != nil {
+		card(c, tk, "乐器", func() { scoreInstruments(c, tr, res.Duration) })
+	}
+}
+
+// scoreInstruments 列出多乐器转录识别出的乐器：音符数、音域与出现的时间范围。
+func scoreInstruments(c *ui.Context, tr *score.Transcription, duration float64) {
+	t := c.Theme()
+	if len(tr.Instruments) == 0 {
+		ui.Text(c, "没有转录出音符。").FontSize(12).TextColor(t.TextMuted)
+		return
+	}
+	for _, in := range tr.Instruments {
+		if len(in.Notes) == 0 {
+			continue
+		}
+		lo, hi := in.Notes[0].Pitch, in.Notes[0].Pitch
+		first, last := in.Notes[0].Start, in.Notes[0].End
+		for _, n := range in.Notes {
+			lo, hi = min(lo, n.Pitch), max(hi, n.Pitch)
+			first, last = min(first, n.Start), max(last, n.End)
+		}
+		ui.Row(c.Key("instrument-" + in.Name)).Gap(12).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, in.Title()).Width(140)
+			ui.Textf(c, "%d 个音", len(in.Notes)).FontSize(12).Font("monospace").Width(90)
+			if !in.Drum {
+				ui.Text(c, midiNoteName(lo)+" – "+midiNoteName(hi)).FontSize(12).Font("monospace").Width(90)
+			} else {
+				ui.Box(c).Width(90)
+			}
+			ui.Text(c, score.Clock(first)+" – "+score.Clock(min(last, duration))).FontSize(12).TextColor(t.TextMuted)
+		})
+	}
+	ui.Text(c, "导出 MIDI 时每种乐器一轨（鼓在第 10 通道）。转录由 MuScriptor 完成，其权重为 CC BY-NC 4.0 许可，仅限非商业用途。").
+		FontSize(12).TextColor(t.TextMuted)
+}
+
+// midiNoteName 把 MIDI 音高写成科学音名（60 = C4），用升号拼写。
+func midiNoteName(m int) string {
+	return score.PitchName(((m%12)+12)%12, false) + strconv.Itoa(m/12-1)
 }
 
 // scoreModelsCard 显示分析模型的下载状态。歌词对齐模型较大（约 1.3 GB）且只在给了歌词时使用，
-// 只有当前选了歌词才列出；GAME 只在专业模式选了 GAME 连音时列出。
+// 只有当前选了歌词才列出；GAME 只在专业模式选了 GAME 连音时列出；MuScriptor 只在开启多乐器转录时列出。
 func (a *app) scoreModelsCard(c *ui.Context, tk *fluent.Tokens) {
 	t := c.Theme()
 	s := &a.score
@@ -133,7 +177,7 @@ func (a *app) scoreModelsCard(c *ui.Context, tk *fluent.Tokens) {
 	lyrics := s.melody && s.lyrics != ""
 	game := lyrics && a.scoreRequest().Options.SlurModel == "game"
 	groups = slices.DeleteFunc(slices.Clone(groups), func(g score.ModelGroup) bool {
-		return g.Key == "lyrics" && !lyrics || g.Key == "game" && !game
+		return g.Key == "lyrics" && !lyrics || g.Key == "game" && !game || g.Key == "muscriptor" && !s.transcribe
 	})
 	var missing []any
 	mb := 0
@@ -188,6 +232,22 @@ func (a *app) scoreRunCard(c *ui.Context, tk *fluent.Tokens) {
 		a.audioPicker(c, "歌曲", &s.input, anyAudioExts())
 		ui.Checkbox(c, &s.separate, "先分离伴奏再分析调号与和弦（人声会干扰和弦判断）")
 		ui.Checkbox(c, &s.melody, "识别旋律线（分离出主唱后转写成音符，显示在五线谱上）")
+		ui.Checkbox(c, &s.transcribe, "多乐器转录（MuScriptor：把原曲各乐器转成音符，导出到 MIDI）")
+		// needToken：开启了转录、权重未下载且没有令牌时下载必然失败（门控仓库），禁止开始分析。
+		needToken := false
+		if s.transcribe {
+			g := score.ModelGroups[slices.IndexFunc(score.ModelGroups, func(g score.ModelGroup) bool { return g.Key == "muscriptor" })]
+			note := "转录逐 5 秒顺序生成，是分析中最慢的一步，没有 GPU 时尤其慢。其权重为 CC BY-NC 4.0 许可，仅限非商业用途。"
+			if !g.Installed(a.be.layout) {
+				if needToken = strings.TrimSpace(a.be.settings.HFToken) == ""; needToken {
+					ui.Text(c, "下载权重（约 1.2 GB）需要授权：请先登录 "+score.MuScriptorPage+" 接受许可，"+
+						"再在设置页填写 Hugging Face 访问令牌。").FontSize(12).TextColor(t.Warning).Selectable()
+				} else {
+					note = "首次转录会下载权重（约 1.2 GB）。" + note
+				}
+			}
+			ui.Text(c, note).FontSize(12).TextColor(t.TextMuted)
+		}
 		if s.input != s.lyricsFor {
 			s.lyricsFor, s.lyrics = s.input, ""
 			if lrc := strings.TrimSuffix(s.input, filepath.Ext(s.input)) + ".lrc"; s.input != "" {
@@ -224,7 +284,7 @@ func (a *app) scoreRunCard(c *ui.Context, tk *fluent.Tokens) {
 			a.scoreProParams(c)
 		}
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			if ui.PrimaryButton(c, "开始分析").Disabled(cur != nil && st.Running()).Clicked() {
+			if ui.PrimaryButton(c, "开始分析").Disabled(cur != nil && st.Running() || needToken).Clicked() {
 				run, err := score.Start(a.be.cond, a.scoreRequest(), func() { a.post(func() {}) })
 				if err == nil {
 					s.runs, s.shown = append([]*score.Run{run}, s.runs...), 0

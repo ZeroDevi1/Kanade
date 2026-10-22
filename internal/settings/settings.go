@@ -20,6 +20,9 @@ type Settings struct {
 	// GitHubMirror 是 GitHub 下载的镜像前缀（例如 https://ghfast.top/），空串为直连；
 	// 用于分轨模型与 uv 下载的 Python 运行时。
 	GitHubMirror string `json:"githubMirror,omitempty"`
+	// HFToken 是 Hugging Face 访问令牌（Read 权限即可），用于下载需要登录并接受许可的门控模型（如 MuScriptor）；
+	// 空串为不带令牌。以明文保存在设置文件中，只经环境变量交给引擎进程，不写入日志。
+	HFToken string `json:"hfToken,omitempty"`
 }
 
 // MirrorCN 表示使用国内镜像。
@@ -40,6 +43,9 @@ func (s Settings) Env() []string {
 	if gh := strings.TrimSpace(s.GitHubMirror); gh != "" {
 		env = append(env, "KANADE_GITHUB_MIRROR="+gh,
 			"UV_PYTHON_INSTALL_MIRROR="+strings.TrimRight(gh, "/")+"/"+pythonBuildStandalone)
+	}
+	if tok := strings.TrimSpace(s.HFToken); tok != "" {
+		env = append(env, "KANADE_HF_TOKEN="+tok)
 	}
 	return env
 }
