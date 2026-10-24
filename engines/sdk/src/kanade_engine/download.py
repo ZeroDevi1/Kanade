@@ -30,10 +30,18 @@ BACKOFF = 2.0
 
 class _RedirectHandler(urllib.request.HTTPRedirectHandler):
     """补上 308 重定向：Python 3.11 之前的 urllib 不跟随 308，而 Hugging Face 的 resolve 地址会返回 308
-    （CosyVoice 引擎用 Python 3.10）。308 与 307 一样保留方法与请求头（包括续传用的 Range）。"""
+    （CosyVoice 引擎用 Python 3.10）。308 与 307 一样保留方法与请求头（包括续传用的 Range）。
+
+    鉴权头以 unredirected 方式添加，默认不随重定向转发；只有新地址仍是 huggingface.co 时才带上：
+    hf-mirror.com 不代理门控仓库，会把请求 308 重定向回 huggingface.co，丢掉令牌就会 401。
+    之后再重定向到 CDN 时，新请求不在 huggingface.co 上，令牌照旧不转发。"""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return super().redirect_request(req, fp, 307 if code == 308 else code, msg, headers, newurl)
+        new = super().redirect_request(req, fp, 307 if code == 308 else code, msg, headers, newurl)
+        auth = req.unredirected_hdrs.get("Authorization")
+        if new is not None and auth and newurl.startswith("https://huggingface.co/"):
+            new.add_unredirected_header("Authorization", auth)
+        return new
 
     def http_error_308(self, req, fp, code, msg, headers):
         return self.http_error_302(req, fp, code, msg, headers)
