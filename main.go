@@ -79,6 +79,12 @@ func main() {
 		}
 		a.win = mygo.NewWindow(opts)
 		clearCaptionAccent(a.win.NativeHandle())
+		// 最大化时去掉窗口菜单，免得 DWM 在自绘窗口按钮上再画一组（见 setSystemMenu）；
+		// 按上次状态恢复为最大化的窗口在创建时就要去掉。
+		hwnd := a.win.NativeHandle()
+		setSystemMenu(hwnd, !a.win.IsMaximized())
+		a.win.OnMaximize(func() { setSystemMenu(hwnd, false) })
+		a.win.OnUnmaximize(func() { setSystemMenu(hwnd, true) })
 		a.post = a.win.Update
 		// Conductor 的状态变化来自后台 goroutine：经 Update 回到 UI 线程重建视图（视图读取的是快照）。
 		a.be = startBackend(func() { a.post(func() {}) })

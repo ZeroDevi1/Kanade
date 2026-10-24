@@ -107,28 +107,50 @@ func (a *app) scorePage(c *ui.Context, tk *fluent.Tokens) {
 		s.runs = append(s.runs, score.LoadHistory(score.HistoryDir(a.be.layout))...)
 	}
 	a.scoreModelsCard(c, tk)
-	a.scoreRunCard(c, tk)
-	if len(s.runs) == 0 {
-		return
+	// current 返回所选记录与它的结果（还没有结果时为 nil）。分析卡片可能在本帧开始分析或删除记录，
+	// 之后用到记录的地方都重新取，不沿用之前取到的。
+	current := func() (*score.Run, score.RunState) {
+		if len(s.runs) == 0 {
+			return nil, score.RunState{}
+		}
+		s.shown = min(s.shown, len(s.runs)-1)
+		run := s.runs[s.shown]
+		return run, run.Snapshot()
 	}
-	st := s.runs[s.shown].Snapshot()
+	// 宽屏时分析表单与概览并排；概览在分析卡片之后构建，取到的是本帧操作之后的记录。
+	var summary func() ui.Element
+	if _, st := current(); st.Result != nil {
+		summary = func() ui.Element {
+			if run, st := current(); st.Result != nil {
+				return a.scoreSummary(c, tk, run, st)
+			}
+			return ui.Box(c) // 本帧刚删除了有结果的记录：留空一帧，下一帧这一格不再出现
+		}
+	}
+	cardRow(c, scoreCardMinWidth, func() ui.Element { return a.scoreRunCard(c, tk) }, summary)
+	run, st := current()
 	if st.Result == nil {
 		return
 	}
 	s.preview.load(a, st.Audio)
-	s.preview.title = filepath.Base(s.runs[s.shown].Request.Input)
+	s.preview.title = filepath.Base(run.Request.Input)
 	res := st.Result
-	a.scoreSummary(c, tk, s.runs[s.shown], st)
 	card(c, tk, "试听", func() { a.scorePlayer(c, tk, res) })
 	a.scoreSheetCard(c, tk, res)
 	a.scoreColorCard(c, tk, res)
+	var emotion, instruments func() ui.Element
 	if res.Emotion != nil {
-		card(c, tk, "情绪", func() { a.scoreEmotion(c, res) })
+		emotion = func() ui.Element { return card(c, tk, "情绪", func() { a.scoreEmotion(c, res) }) }
 	}
 	if tr := res.Transcription; tr != nil {
-		card(c, tk, "乐器", func() { scoreInstruments(c, tr, res.Duration) })
+		instruments = func() ui.Element { return card(c, tk, "乐器", func() { scoreInstruments(c, tr, res.Duration) }) }
 	}
+	cardRow(c, scoreCardMinWidth, emotion, instruments)
 }
+
+// scoreCardMinWidth 是音乐分析页并排卡片的最小宽度：分析表单在约 560 宽时文件名与按钮仍放得下一行
+// （窄于此的窗口里卡片各占一行，与原来的单列布局相同）。
+const scoreCardMinWidth = 560
 
 // scoreInstruments 列出多乐器转录识别出的乐器：音符数、音域与出现的时间范围。
 func scoreInstruments(c *ui.Context, tr *score.Transcription, duration float64) {
@@ -218,7 +240,7 @@ func (a *app) scoreModelsCard(c *ui.Context, tk *fluent.Tokens) {
 }
 
 // scoreRunCard 选择歌曲与参数并启动分析，显示流水线进度。
-func (a *app) scoreRunCard(c *ui.Context, tk *fluent.Tokens) {
+func (a *app) scoreRunCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
 	t := c.Theme()
 	s := &a.score
 	var cur *score.Run
@@ -227,7 +249,7 @@ func (a *app) scoreRunCard(c *ui.Context, tk *fluent.Tokens) {
 		cur = s.runs[0]
 		st = cur.Snapshot()
 	}
-	card(c, tk, "分析", func() {
+	return card(c, tk, "分析", func() {
 		modeSwitch(c, "score-mode", &s.mode, "只需选择歌曲；节拍、调号、和弦与情绪都用推荐参数。")
 		a.audioPicker(c, "歌曲", &s.input, anyAudioExts())
 		ui.Checkbox(c, &s.separate, "先分离伴奏再分析调号与和弦（人声会干扰和弦判断）")
@@ -373,12 +395,12 @@ func (a *app) scoreProParams(c *ui.Context) {
 }
 
 // scoreSummary 是结果概览：调号、拍号、BPM、情绪，以及导出按钮。
-func (a *app) scoreSummary(c *ui.Context, tk *fluent.Tokens, run *score.Run, st score.RunState) {
+func (a *app) scoreSummary(c *ui.Context, tk *fluent.Tokens, run *score.Run, st score.RunState) ui.Element {
 	t := c.Theme()
 	s := &a.score
 	res := st.Result
 	name := strings.TrimSuffix(filepath.Base(run.Request.Input), filepath.Ext(run.Request.Input))
-	card(c, tk, "概览 · "+name, func() {
+	return card(c, tk, "概览 · "+name, func() {
 		ui.Row(c).Gap(12).AlignItems(ui.Stretch).Children(func() {
 			tile := func(title, value, note string) {
 				ui.Column(c.Key("tile-"+title)).Grow(1).Basis(0).Padding(12).Gap(4).Radius(fluent.ControlRadius).
@@ -441,7 +463,7 @@ func (a *app) scoreSummary(c *ui.Context, tk *fluent.Tokens, run *score.Run, st 
 			src = "分离出的伴奏"
 		}
 		ui.Text(c, "调号与和弦基于"+src+"分析。").FontSize(12).TextColor(t.TextMuted)
-		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.Row(c).Wrap().Gap(8).AlignItems(ui.Center).Children(func() {
 			export := func(label, src, name string) {
 				if src != "" && ui.Button(c.Key("export-"+label), label).Clicked() {
 					a.saveFileAs(src, name, func(_ string, err error) { s.err = errText(err) })
