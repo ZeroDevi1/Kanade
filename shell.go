@@ -41,7 +41,7 @@ var (
 // view 是窗口根视图：Fluent 主题、标题栏、导航栏与内容层。
 func (a *app) view(c *ui.Context) {
 	tk := fluent.Apply(c)
-	ui.Column(c).Fill().AlignItems(ui.Stretch).Children(func() {
+	ui.Column(c).Fill().Bind(&a.root).AlignItems(ui.Stretch).Children(func() {
 		a.titleBar(c)
 		ui.Row(c).Grow(1).MinHeight(0).AlignItems(ui.Stretch).Children(func() {
 			a.nav(c, tk)

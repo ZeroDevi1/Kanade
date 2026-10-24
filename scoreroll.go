@@ -34,9 +34,60 @@ type rollState struct {
 	window int     // rollWindows 的序号
 	follow bool    // 播放时窗口跟随播放头（播放头在窗口 20% 处）
 	start  float64 // 不跟随时窗口的起点（秒）
+	// span 是 Ctrl+Shift+滚轮缩放出的可见时长（秒）；0 为按 window 的预设。选择预设时清零。
+	span float64
+	// laneH 是 Ctrl+滚轮调出的音轨高度（DIP，rollMinLaneH–rollMaxLaneH）；0 为 rollLaneHeight。
+	laneH float64
+
+	zoom zoomState // 放大查看（scoreviewer.go）
 }
 
+// 卷帘音轨高度的滚轮调节范围（DIP）：下限放得下音轨栏的名称与按钮，上限约为默认的 3 倍。
+const (
+	rollMinLaneH = 56
+	rollMaxLaneH = 200
+)
+
 func newRollState() rollState { return rollState{window: 1, follow: true} }
+
+// laneHeight 返回音轨高度。
+func (r *rollState) laneHeight() float32 {
+	if r.laneH > 0 {
+		return float32(r.laneH)
+	}
+	return rollLaneHeight
+}
+
+// visibleSpan 返回可见时长（秒），0 为全曲。
+func (r *rollState) visibleSpan() float64 {
+	if r.span > 0 {
+		return r.span
+	}
+	return rollWindows[r.window].sec
+}
+
+// wheel 处理卷帘上的滚轮：Ctrl+Shift 以指针时刻为中心横向缩放（at 为该时刻，frac 为它在窗口中的比例），
+// Ctrl 调整音轨高度；不按 Ctrl 时不处理，交给页面滚动。返回是否处理了。
+func (r *rollState) wheel(ev ui.InputEvent, at, frac, duration float64) bool {
+	if ev.Kind != ui.InputScroll || ev.Mods&ui.Ctrl == 0 {
+		return false
+	}
+	d := float64(ev.DY)
+	if d == 0 {
+		d = float64(ev.DX)
+	}
+	if ev.Mods&ui.Shift != 0 {
+		span := r.visibleSpan()
+		if span <= 0 {
+			span = duration
+		}
+		span = clampF(span*wheelFactor(d), zoomMinSpan, max(duration, zoomMinSpan))
+		r.span, r.start = span, at-frac*span
+		return true
+	}
+	r.laneH = clampF(float64(r.laneHeight())/wheelFactor(d), rollMinLaneH, rollMaxLaneH)
+	return true
+}
 
 // rollPalette 是各音轨音符的颜色（原曲之外按音轨序号循环取用），色相分散，深浅主题下都看得清。
 var rollPalette = []ui.Color{
@@ -46,9 +97,47 @@ var rollPalette = []ui.Color{
 
 func rollColor(i int) ui.Color { return rollPalette[(i-1+len(rollPalette))%len(rollPalette)] }
 
+// rollPaper 是卷帘画布（多轨卷帘的各轨与放大查看）的配色，参考 Cubase 的 Key Editor：浅灰网格、黑键所在行加深、
+// 深灰小节线、浅灰拍线、深色播放头与深色标尺。画布不随应用的深浅主题变化，音符的彩色在浅底上都看得清。
+var rollPaper = struct {
+	white, black     ui.Color // 白键行 / 黑键行（鼓轨按行交替用这两色）
+	rowLine, cLine   ui.Color // 行间分隔线 / 每个 C 下沿的八度线
+	beat, bar        ui.Color // 拍线 / 小节线
+	playhead         ui.Color
+	ruler, rulerText ui.Color
+	keyWhite         ui.Color
+	keyBlack         ui.Color
+	keyEdge, keyText ui.Color
+	wave             ui.Color // 原曲波形
+	noteEdge         ui.Color // 音符块的描边
+}{
+	white: ui.RGB(232, 232, 232), black: ui.RGB(208, 208, 208),
+	rowLine: ui.RGB(219, 219, 219), cLine: ui.RGB(160, 160, 160),
+	beat: ui.RGB(192, 192, 192), bar: ui.RGB(118, 118, 118),
+	playhead: ui.RGB(24, 24, 24),
+	ruler:    ui.RGB(40, 40, 42), rulerText: ui.RGB(205, 205, 205),
+	keyWhite: ui.RGB(244, 244, 244), keyBlack: ui.RGB(30, 30, 30),
+	keyEdge: ui.RGB(150, 150, 150), keyText: ui.RGB(70, 70, 70),
+	wave:     ui.RGB(96, 96, 96),
+	noteEdge: ui.RGBA(0, 0, 0, 0.55),
+}
+
+// rollNote 在浅色画布上画一个音符块：彩色填充加深色描边；muted 时淡化，active（正在发声）时描边加粗加深。
+func rollNote(p *ui.Painter, r ui.Rect, color ui.Color, muted, active bool, radius float32) {
+	fill, edge, width := color, rollPaper.noteEdge, float32(1)
+	switch {
+	case muted:
+		fill, edge = color.Alpha(0.35), rollPaper.noteEdge.Alpha(0.2)
+	case active:
+		edge, width = rollPaper.playhead, 2
+	}
+	p.Fill(r, fill, radius)
+	p.Stroke(r, edge, radius, width)
+}
+
 // rollView 返回 pos 时卷帘显示的时间范围 [v0, v1)（秒）。
 func (r *rollState) rollView(pos, duration float64) (v0, v1 float64) {
-	w := rollWindows[r.window].sec
+	w := r.visibleSpan()
 	if w <= 0 || duration <= w {
 		return 0, max(duration, 1)
 	}
@@ -61,7 +150,7 @@ func (r *rollState) rollView(pos, duration float64) (v0, v1 float64) {
 }
 
 // scoreRollCard 是多轨卷帘卡片。
-func (a *app) scoreRollCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysis) {
+func (a *app) scoreRollCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysis) ui.Element {
 	t := c.Theme()
 	s := &a.score.sheet
 	r := &s.roll
@@ -70,7 +159,7 @@ func (a *app) scoreRollCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysi
 	audible := s.mix.Audible(available)
 	changed := false
 	rollTick(c, pv)
-	card(c, tk, "多轨卷帘", func() {
+	el := card(c, tk, "多轨卷帘", func() {
 		// 顶栏：播放、可视范围、跟随与合成状态。
 		ui.Row(c).Wrap().Gap(12).AlignItems(ui.Center).Children(func() {
 			if p := pv.player; p != nil && !pv.loading {
@@ -87,7 +176,14 @@ func (a *app) scoreRollCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysi
 				}
 				ui.Textf(c, "%s / %s", clock(p.Position()), clock(p.Duration())).Font("monospace").FontSize(12).TextColor(t.TextMuted)
 			}
-			ui.Segmented(c, &r.window, titles(rollWindows, func(w rollWindow) string { return w.title })...).Label("可视范围")
+			if ui.Segmented(c, &r.window, titles(rollWindows, func(w rollWindow) string { return w.title })...).
+				Label("可视范围").Changed() {
+				r.span = 0 // 选择预设时放弃滚轮缩放出的时长
+			}
+			if r.span > 0 {
+				ui.Textf(c, "%.0f 秒", r.span).FontSize(12).Font("monospace").TextColor(t.TextMuted).
+					Tooltip("Ctrl+Shift+滚轮横向缩放，Ctrl+滚轮调整音轨高度；选择上面的范围恢复预设")
+			}
 			ui.Checkbox(c, &r.follow, "播放时跟随")
 			switch {
 			case s.synthBusy:
@@ -103,7 +199,7 @@ func (a *app) scoreRollCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysi
 		pos, seek := a.scorePosition()
 		v0, v1 := r.rollView(pos, res.Duration)
 		// 不跟随且只显示一段时：用滑块移动窗口。
-		if w := rollWindows[r.window].sec; !r.follow && w > 0 && res.Duration > w {
+		if w := r.visibleSpan(); !r.follow && w > 0 && res.Duration > w {
 			ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 				ui.Text(c, "位置").FontSize(12).TextColor(t.TextMuted)
 				r.start = v0
@@ -112,7 +208,7 @@ func (a *app) scoreRollCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysi
 		}
 		ui.Column(c).Gap(2).AlignItems(ui.Stretch).Children(func() {
 			for i, tr := range s.tracks {
-				ui.Row(c.Key(fmt.Sprintf("roll-%d", i))).Gap(8).Height(rollLaneHeight).AlignItems(ui.Stretch).Children(func() {
+				ui.Row(c.Key(fmt.Sprintf("roll-%d", i))).Gap(8).Height(r.laneHeight()).AlignItems(ui.Stretch).Children(func() {
 					if a.rollHeader(c, tk, i, tr, available[i], audible[i]) {
 						changed = true
 					}
@@ -130,9 +226,11 @@ func (a *app) scoreRollCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysi
 				"转录由 MuScriptor 完成，其权重为 CC BY-NC 4.0 许可，仅限非商业用途。").FontSize(12).TextColor(t.TextMuted)
 		}
 	})
+	a.scoreZoomDialog(c, tk, res)
 	if changed {
 		a.applyMix(res)
 	}
+	return el
 }
 
 // rollHeader 是一条音轨左侧的栏：色块、名称与音符概况、静音 / 独奏与音量。返回混音设置是否被改动。
@@ -147,14 +245,23 @@ func (a *app) rollHeader(c *ui.Context, tk *fluent.Tokens, i int, tr score.Track
 		if !audible {
 			swatch = swatch.Alpha(0.35)
 		}
-		ui.Box(c).Width(4).Height(rollLaneHeight - 12).Radius(2).Background(swatch)
+		ui.Box(c).Width(4).Height(s.roll.laneHeight() - 12).Radius(2).Background(swatch)
 		ui.Column(c).Grow(1).MinWidth(0).Gap(4).Children(func() {
 			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 				name := ui.Text(c, tr.Title).FontSize(13).SingleLine().Shrink(1).MinWidth(0)
 				if !audible {
 					name.TextColor(t.TextMuted)
 				}
-				ui.Text(c, rollSummary(tr)).FontSize(11).Font("monospace").TextColor(t.TextMuted).SingleLine()
+				ui.Text(c, rollSummary(tr)).FontSize(11).Font("monospace").TextColor(t.TextMuted).SingleLine().Grow(1)
+				zoom := ui.ButtonBase(c.Key("zoom-"+tr.Title)).Size(22, 20).Radius(fluent.ControlRadius).Center().
+					Label("放大查看" + tr.Title).Tooltip("放大查看（也可双击卷帘）")
+				if zoom.Hovered() {
+					zoom.Background(tk.SubtleHover)
+				}
+				zoom.Children(func() { ui.Icon(c, iconExpand).Size(12, 12) })
+				if zoom.Clicked() {
+					a.openZoom(i)
+				}
 			})
 			if !available {
 				ui.Text(c, "未识别旋律（分析时勾选「识别旋律线」）").FontSize(11).TextColor(t.TextMuted).SingleLine().
@@ -199,13 +306,24 @@ func (a *app) rollLane(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, i 
 	t := c.Theme()
 	pv := &a.score.preview
 	r := &a.score.sheet.roll
-	box := ui.Box(c.Key("lane")).Grow(1).MinWidth(0).Radius(4).Background(tk.Card).Border(1, tk.CardStroke).
+	box := ui.Box(c.Key("lane")).Grow(1).MinWidth(0).Radius(4).Background(rollPaper.white).Border(1, tk.CardStroke).
 		Cursor(ui.CursorPointer).Label(tr.Title + "卷帘").Clip()
 	if box.Pressed() {
 		if x, _, _ := box.PointerPosition(); box.Bounds().W > 0 {
 			seek(v0 + float64(x/box.Bounds().W)*(v1-v0))
 		}
 	}
+	if box.DoubleClicked() {
+		a.openZoom(i)
+	}
+	w := box.Bounds().W // 上一帧的宽度；回调在构建之外执行，不能再访问 box
+	box.HandleInput(func(ev ui.InputEvent) bool {
+		if w <= 0 {
+			return false
+		}
+		frac := float64(ev.X / w)
+		return r.wheel(ev, v0+frac*(v1-v0), frac, res.Duration)
+	})
 	rows, rowOf := rollRows(tr)
 	color := t.TextMuted
 	if i != score.TrackOriginal {
@@ -225,24 +343,20 @@ func (a *app) rollLane(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, i 
 		// 拍线与小节线。
 		for _, b := range res.Beats {
 			if b >= v0 && b < v1 {
-				p.Line(xOf(b), rect.Y, xOf(b), rect.Y+rect.H, 1, t.TextMuted.Alpha(0.08))
+				p.Line(xOf(b), rect.Y, xOf(b), rect.Y+rect.H, 1, rollPaper.beat)
 			}
 		}
 		for _, d := range res.Downbeats {
 			if d >= v0 && d < v1 {
-				p.Line(xOf(d), rect.Y, xOf(d), rect.Y+rect.H, 1, t.TextMuted.Alpha(0.25))
+				p.Line(xOf(d), rect.Y, xOf(d), rect.Y+rect.H, 1, rollPaper.bar)
 			}
 		}
 
 		if i == score.TrackOriginal {
-			rollWaveform(p, rect, pv, v0, v1, color.Alpha(0.6))
+			rollWaveform(p, rect, pv, v0, v1, rollPaper.wave)
 		} else if rows > 0 {
 			rowH := (rect.H - 6) / float32(rows)
 			noteH := max(3, min(rowH, 8))
-			alpha := float32(0.8)
-			if !audible {
-				alpha = 0.4
-			}
 			// 音符按开始时间排序：开始晚于窗口终点的都不用看。
 			end := sort.Search(len(tr.Notes), func(k int) bool { return tr.Notes[k].Start >= v1 })
 			for _, n := range tr.Notes[:end] {
@@ -251,18 +365,14 @@ func (a *app) rollLane(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, i 
 				}
 				y := rect.Y + 3 + float32(rows-1-rowOf(n.MIDI))*rowH + (rowH-noteH)/2
 				x0, x1 := xOf(max(n.Start, v0)), xOf(min(n.End, v1))
-				fill := color.Alpha(alpha)
-				if pos >= n.Start && pos < n.End && audible {
-					fill = color // 正在发声：不透明并加一圈描边
-					p.Stroke(ui.Rect{X: x0 - 1, Y: y - 1, W: max(x1-x0, 2) + 2, H: noteH + 2}, t.Text.Alpha(0.6), 2, 1)
-				}
-				p.Fill(ui.Rect{X: x0, Y: y, W: max(x1-x0, 2), H: noteH}, fill, 1.5)
+				rollNote(p, ui.Rect{X: x0, Y: y, W: max(x1-x0, 2), H: noteH}, color, !audible,
+					audible && pos >= n.Start && pos < n.End, 1.5)
 			}
 		}
 
 		if pos >= v0 && pos < v1 {
 			x := xOf(pos)
-			p.Fill(ui.Rect{X: x - 1, Y: rect.Y, W: 2, H: rect.H}, t.Text, 1)
+			p.Fill(ui.Rect{X: x - 1, Y: rect.Y, W: 2, H: rect.H}, rollPaper.playhead, 1)
 		}
 		if playing {
 			p.AnimationFrame()

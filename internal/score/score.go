@@ -419,16 +419,19 @@ type Analysis struct {
 	// Transcription 是原曲的多乐器转录；未开启时为 nil。
 	Transcription *Transcription `json:"transcription"`
 	ChordSource   string         `json:"chord_source"` // accompaniment / mix
-	Emotion       *struct {
-		Moods []struct {
-			Key   string  `json:"key"`
-			Label string  `json:"label"`
-			Score float64 `json:"score"`
-		} `json:"moods"`
-		Valence  float64   `json:"valence"`
-		Arousal  float64   `json:"arousal"`
-		Segments []Segment `json:"segments"`
-	} `json:"emotion"`
+	Emotion       *Emotion       `json:"emotion"`      // 未做情绪识别时为 nil
+}
+
+// Emotion 是情绪识别的结果（CLAP 零样本分类，见引擎 emotion.py）。
+type Emotion struct {
+	Moods []struct {
+		Key   string  `json:"key"`
+		Label string  `json:"label"`
+		Score float64 `json:"score"`
+	} `json:"moods"` // 按分数从高到低
+	Valence  float64   `json:"valence"` // 效价：消极 0 — 积极 1
+	Arousal  float64   `json:"arousal"` // 唤醒度：舒缓 0 — 激烈 1
+	Segments []Segment `json:"segments"`
 }
 
 // Transcription 是 MuScriptor 的多乐器转录结果（见引擎 transcribe.py）。

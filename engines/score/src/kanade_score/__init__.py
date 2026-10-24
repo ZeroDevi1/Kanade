@@ -7,6 +7,8 @@
                  分轨引擎得到）：调号与和弦用伴奏分析，旋律线用主唱识别（SOME），节拍与情绪仍用原曲。
                  lyrics_input 是 LRC 歌词，与主唱一起给出时把歌词逐字对到旋律音符上（wav2vec2 强制对齐）。
                  options.transcribe 为 true 时另用 MuScriptor 对原曲做多乐器转录（按乐器分组的音符）。
+- score.expression {input}：从主唱干声提取逐帧表情特征（基频、周期性、响度、频谱倾斜、高频噪声），输出 expression.json
+                 （字段见 expression.py），供导出 Synthesizer V 工程时生成参数曲线。只用 CPU，4 分钟的歌约 10 秒。
 - score.download {models?}：预下载模型（beat_this、clap、some、btc、lyrics、game、muscriptor）并上报进度；
                  未指定时不含需要 Hugging Face 授权的 muscriptor。
 
@@ -30,9 +32,10 @@ MODEL_DIR = Path(_models) / "score" if _models else Path.home() / ".cache" / "ka
 
 
 def main() -> None:
-    from . import analyze, models
+    from . import analyze, expression, models
 
     serve(ENGINE, VERSION, {
         "score.analyze": analyze.run_analyze,
+        "score.expression": expression.run_expression,
         "score.download": models.run_download,
     })

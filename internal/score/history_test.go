@@ -44,6 +44,9 @@ func (f *fileJobs) Wait(_ context.Context, id string) (conductor.Job, error) {
 	case "score.analyze":
 		data, _ := json.Marshal(sample())
 		arts = []string{write("audio.wav", "audio"), write("analysis.json", string(data)), write("chords.lab", "0\t1\tC\n")}
+	case "score.expression":
+		arts = []string{write("expression.json",
+			`{"version":1,"hop":0.01,"f0":[220,221],"periodicity":[0.9,0.9],"loudness":[-20,-21],"tilt":[-10,-9],"noise":[-30,-31]}`)}
 	}
 	return conductor.Job{ID: id, State: conductor.JobDone, Artifacts: arts}, nil
 }
@@ -100,6 +103,19 @@ func TestHistorySaveLoadReuse(t *testing.T) {
 	other.StemModels = nil
 	if s := findStems(root, other); s.harmonic != "" {
 		t.Errorf("reused stems across models: %+v", s)
+	}
+
+	// 主唱表情：从记录中的主唱分轨提取一次，缓存到记录目录；之后直接读取，不再提交任务。
+	if stem := runs[0].MelodyStem(); !strings.HasPrefix(stem, root) || !strings.HasSuffix(stem, "_vocals_karaoke.wav") {
+		t.Fatalf("melody stem %q", stem)
+	}
+	jobs3 := &fileJobs{dir: scratch}
+	e, err := runs[0].Expression(context.Background(), jobs3)
+	if err != nil || len(e.F0) != 2 || jobs3.params[0]["input"] != runs[0].MelodyStem() {
+		t.Fatalf("expression %+v %v params %v", e, err, jobs3.params)
+	}
+	if _, err := runs[0].Expression(context.Background(), jobs3); err != nil || len(jobs3.submitted) != 1 {
+		t.Errorf("cached expression re-submitted: %v %v", jobs3.submitted, err)
 	}
 
 	if err := runs[0].Delete(); err != nil {

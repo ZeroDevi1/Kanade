@@ -6,6 +6,7 @@
   "module": "kanade_score",
   "tasks": [
     "score.analyze",
+    "score.expression",
     "score.download",
     "score.doctor"
   ]

@@ -21,6 +21,9 @@ type app struct {
 	// be 在窗口创建后由 startBackend 赋值；测试中为零值（cond 为 nil），页面显示后端不可用。
 	be backend
 
+	// root 绑定窗口的根元素，读取上一帧的窗口内容尺寸（DIP），用于给全窗口大小的对话框定尺寸。
+	root ui.Handle
+
 	current      string // 当前页面，取 navItem.id
 	navCollapsed bool
 	// saveDir 是上次另存结果的目录，作为下次保存对话框的默认目录；空为数据根目录下的 outputs。

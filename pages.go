@@ -6,26 +6,28 @@ import (
 	"kanade/internal/ui/fluent"
 )
 
-// 内容列的最大宽度：表单类页面取 1000，免得输入行在宽屏上拉得过长；音乐分析页的乐谱、波形与和声色彩
-// 随宽度展开，放宽到 1600，宽度够时上方卡片两两并排（见 cardRow）。
-const (
-	pageMaxWidth     = 1000
-	pageWideMaxWidth = 1600
-)
+// 内容列的最大宽度：表单类页面取 1000，免得输入行在宽屏上拉得过长；音乐分析页的卷帘、乐谱、波形与和声色彩
+// 随宽度展开，不限宽度（只留页边距），宽度够时卡片两两并排（见 cardRow）。
+const pageMaxWidth = 1000
 
-// page 按当前导航项构建内容区。内容列在宽窗口中水平居中。
+// page 按当前导航项构建内容区。限宽的内容列在宽窗口中水平居中。
 func (a *app) page(c *ui.Context, tk *fluent.Tokens) {
 	maxW := float32(pageMaxWidth)
 	if a.current == "score" {
-		maxW = pageWideMaxWidth
+		maxW = 0
 	}
 	ui.Row(c).Justify(ui.Center).Children(func() {
 		a.pageColumn(c, tk, maxW)
 	})
 }
 
+// pageColumn 是内容列；maxW 为 0 时不限宽度。
 func (a *app) pageColumn(c *ui.Context, tk *fluent.Tokens, maxW float32) {
-	ui.Column(c).Grow(1).MinWidth(0).MaxWidth(maxW).Padding(28, 36).Gap(16).AlignItems(ui.Stretch).Children(func() {
+	col := ui.Column(c).Grow(1).MinWidth(0)
+	if maxW > 0 {
+		col.MaxWidth(maxW)
+	}
+	col.Padding(28, 36).Gap(16).AlignItems(ui.Stretch).Children(func() {
 		switch a.current {
 		case "lab":
 			a.labPage(c, tk)

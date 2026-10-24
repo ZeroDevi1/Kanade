@@ -209,11 +209,13 @@ func (a *app) applyMix(res *score.Analysis) {
 }
 
 // scoreSheetCard 是乐谱：爵士谱或五线谱，随播放高亮并自动跟随，点击跳转。
-func (a *app) scoreSheetCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysis) {
+// 乐谱放在自己的滚动容器里，长乐谱不会把页面无限拉长：与卷帘并排时填满卡片（与卷帘等高），
+// 单列时高度为 sheetViewportMinH。播放跟随（followRow）滚动的是这个容器。
+func (a *app) scoreSheetCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysis) ui.Element {
 	t := c.Theme()
 	s := &a.score.sheet
 	measures := res.Measures()
-	card(c, tk, "乐谱", func() {
+	return card(c, tk, "乐谱", func() {
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 			ui.Segmented(c, &s.view, "爵士谱", "五线谱").Label("乐谱视图")
 			ui.Select(c, &s.style, titles(symbolStyles, func(x struct{ Key, Title string }) string { return x.Title })).
@@ -239,13 +241,21 @@ func (a *app) scoreSheetCard(c *ui.Context, tk *fluent.Tokens, res *score.Analys
 		if cur >= 0 {
 			s.lastRow = row
 		}
-		if s.view == sheetJazz {
-			a.jazzSheet(c, tk, res, measures, pos, cur, scroll, seek)
-		} else {
-			a.staffSheet(c, tk, res, measures, pos, cur, scroll, seek)
-		}
+		// Basis(0) + Grow(1)：高度取卡片剩余的空间（并排时卡片被卷帘撑高），不随乐谱内容增长。
+		ui.Scroll(c.Key("sheet-scroll")).Basis(0).Grow(1).MinHeight(sheetViewportMinH).Children(func() {
+			ui.Column(c).AlignItems(ui.Stretch).Padding(0, 12, 0, 0).Children(func() { // 右侧留出滚动条的位置
+				if s.view == sheetJazz {
+					a.jazzSheet(c, tk, res, measures, pos, cur, scroll, seek)
+				} else {
+					a.staffSheet(c, tk, res, measures, pos, cur, scroll, seek)
+				}
+			})
+		})
 	})
 }
+
+// sheetViewportMinH 是乐谱滚动区的最小高度（DIP）：单列布局时的高度，约 5 行爵士谱或 2 行五线谱。
+const sheetViewportMinH = 520
 
 // jazzSheet 是爵士谱：每行 4 小节，按拍放置和弦记号，没有新和弦的拍画斜线，与上一小节相同的小节记为 %。
 func (a *app) jazzSheet(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, ms []score.Measure, pos float64, cur int,

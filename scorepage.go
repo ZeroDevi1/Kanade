@@ -46,6 +46,7 @@ type scoreState struct {
 	shown         int
 	preview       audioPreview
 	sheet         sheetState
+	sv            svExportState // 导出 Synthesizer V 工程的对话框
 	// confirmDelete 为 true 时删除按钮处于二次确认状态（针对正在显示的记录）。
 	confirmDelete bool
 	dlJob         string
@@ -128,6 +129,7 @@ func (a *app) scorePage(c *ui.Context, tk *fluent.Tokens) {
 		}
 	}
 	cardRow(c, scoreCardMinWidth, func() ui.Element { return a.scoreRunCard(c, tk) }, summary)
+	a.scoreSVDialog(c, tk)
 	run, st := current()
 	if st.Result == nil {
 		return
@@ -137,8 +139,9 @@ func (a *app) scorePage(c *ui.Context, tk *fluent.Tokens) {
 	res := st.Result
 	a.syncMix(res)
 	card(c, tk, "试听", func() { a.scorePlayer(c, tk, res) })
-	a.scoreRollCard(c, tk, res)
-	a.scoreSheetCard(c, tk, res)
+	// 宽屏时卷帘与乐谱并排，播放时两边同时可见；乐谱在自己的滚动区里，与卷帘等高。
+	cardRow(c, scoreRollSheetMinWidth, func() ui.Element { return a.scoreRollCard(c, tk, res) },
+		func() ui.Element { return a.scoreSheetCard(c, tk, res) })
 	a.scoreColorCard(c, tk, res)
 	if res.Emotion != nil {
 		card(c, tk, "情绪", func() { a.scoreEmotion(c, res) })
@@ -148,6 +151,10 @@ func (a *app) scorePage(c *ui.Context, tk *fluent.Tokens) {
 // scoreCardMinWidth 是音乐分析页并排卡片的最小宽度：分析表单在约 560 宽时文件名与按钮仍放得下一行
 // （窄于此的窗口里卡片各占一行，与原来的单列布局相同）。
 const scoreCardMinWidth = 560
+
+// scoreRollSheetMinWidth 是卷帘与乐谱并排时每张卡片的最小宽度：卷帘左侧音轨栏 236 加上可读的卷帘宽度，
+// 乐谱每行 4 小节各约 150 宽（窗口最大化时内容区约 1530 宽，放得下两张）。
+const scoreRollSheetMinWidth = 700
 
 // midiNoteName 把 MIDI 音高写成科学音名（60 = C4），用升号拼写。
 func midiNoteName(m int) string {
@@ -456,7 +463,10 @@ func (a *app) scoreSummary(c *ui.Context, tk *fluent.Tokens, run *score.Run, st 
 			generated("导出 MIDI…", "score.mid", name, res.MIDI)
 			// 歌声合成工程只含旋律线（与歌词），没有旋律时不列出。ACE Studio / VOCALOID 用带歌词的 MIDI 导入。
 			if res.Melody != nil && len(res.Melody.Notes) > 0 {
-				generated("导出 Synthesizer V 工程…", "score.svp", name, func() ([]byte, error) { return res.SVP(name) })
+				// SV 工程可选歌姬、预设与原唱表情，经对话框导出（scoresv.go）。
+				if ui.Button(c.Key("export-svp"), "导出 Synthesizer V 工程…").Clicked() {
+					a.openSVExport(run, name)
+				}
 				generated("导出 OpenUtau 工程…", "score.ustx", name, func() ([]byte, error) { return res.USTX(name) })
 			}
 		})

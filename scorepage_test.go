@@ -309,6 +309,65 @@ func TestScoreTrackMixer(t *testing.T) {
 	}
 }
 
+// 导出 SV 工程的对话框：概览中的按钮打开对话框；选定歌姬后保存的预设写入用户数据目录，重新选择时读回。
+func TestScoreSVExportDialog(t *testing.T) {
+	dir := t.TempDir()
+	wav, js := filepath.Join(dir, "audio.wav"), filepath.Join(dir, "analysis.json")
+	writeTestWav(t, wav, 8000, 16000)
+	os.WriteFile(js, []byte(`{"duration": 2, "beats": [0,0.5,1,1.5], "downbeats": [0],
+		"key": {"label": "C 大调", "tonic_pc": 0, "mode": "major"},
+		"chords": [{"start":0,"end":2,"label":"C","root":0,"quality":"maj"}],
+		"melody": {"notes": [{"start":0,"end":0.5,"pitch":64},{"start":0.5,"end":1,"pitch":67}], "source": "lead_vocal"}}`), 0o644)
+	l := paths.New(t.TempDir())
+	cond, _ := conductor.New(l, engines.FS, nil)
+	a := newApp()
+	a.be, a.current = backend{layout: l, cond: cond, userData: t.TempDir()}, "score"
+	a.post = func(fn func()) { fn() }
+	run, _ := score.Start(artifactJobs{[]string{wav, js}}, score.Request{Input: "/x/歌.flac", Options: score.DefaultOptions()}, nil)
+	for run.Snapshot().Running() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	a.score.runs = []*score.Run{run}
+	tt := ui.NewTester(a.view, 1200, 4000)
+	if err := tt.Click("导出 Synthesizer V 工程…"); err != nil {
+		t.Fatal(err)
+	}
+	d := &a.score.sv
+	if !d.open || !tt.HasText("表情强度（从原唱提取，0 为由 SV 自行生成）") {
+		t.Fatalf("dialog not shown: %q", tt.Texts())
+	}
+	// 用固定的目标与歌姬代替本机检测的结果：普通话、音域合适的排第一并被选中，演唱模式自动按歌曲建议。
+	fit := score.SVSinger{Name: "Mo Xu", Languages: []string{"mandarin"}, PitchRange: "A#3 - G#4",
+		Modes: []string{"Soft", "Clear", "Power"}, Database: map[string]any{"name": "Mo Xu"}}
+	other := score.SVSinger{Name: "Kevin", Languages: []string{"english"}, PitchRange: "E3 - E4", Database: map[string]any{"name": "Kevin"}}
+	d.targets = []score.SVTarget{{Key: "flat", Title: "Synthesizer V Studio Flat", Singers: []score.SVSinger{other, fit}}}
+	d.target = 0
+	a.recommendSingers()
+	if s, _ := d.selectedSinger(); s == nil || s.Name != "Mo Xu" || d.preset.VocalModes != "Clear=50" {
+		t.Fatalf("recommended %+v modes %q options %q", s, d.preset.VocalModes, d.options)
+	}
+	d.preset.Gender = 0.3
+	tt.Frame()
+	if !tt.HasText("该声库的演唱模式：Soft、Clear、Power") {
+		t.Errorf("modes not listed: %q", tt.Texts())
+	}
+	if err := tt.Click("保存为 Mo Xu 的预设"); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := score.LoadSVPresets(a.be.userData)
+	if err != nil || saved["flat:Mo Xu"].Gender != 0.3 {
+		t.Fatalf("saved presets %+v %v", saved, err)
+	}
+	d.preset = score.DefaultSVPreset()
+	a.loadSVPreset()
+	if d.preset.Gender != 0.3 {
+		t.Errorf("preset not reloaded: %+v", d.preset)
+	}
+	if err := tt.Click("取消"); err != nil || d.open {
+		t.Errorf("cancel: %v open=%v", err, d.open)
+	}
+}
+
 // 多轨卷帘：多乐器转录出的每种乐器各一条音轨；独奏一种乐器时只合成它并切到混音结果。
 func TestScoreRollInstruments(t *testing.T) {
 	dir := t.TempDir()
@@ -362,6 +421,52 @@ func TestScoreRollInstruments(t *testing.T) {
 	drain(func() bool { return pv.player != pv.original && s.synthPCM[bass] != nil })
 	if s.synthPCM[bass+1] != nil || s.synthPCM[score.TrackChords] != nil {
 		t.Error("only the soloed instrument should be synthesized")
+	}
+
+	// 卷帘上的滚轮：不按 Ctrl 时不改卷帘（交给页面滚动）；Ctrl+Shift 横向放大（可见时长变短），Ctrl 加高音轨。
+	// 测试器发出的滚轮事件不带修饰键（Windows 后端会带上），按修饰键的情形直接把事件交给处理函数。
+	r, ok := tt.Find("电贝斯卷帘")
+	if !ok {
+		t.Fatal("no lane")
+	}
+	tt.Scroll(r.X+r.W/2, r.Y+r.H/2, 0, -120)
+	tt.Frame()
+	if s.roll.span != 0 || s.roll.laneH != 0 {
+		t.Errorf("plain wheel changed the roll: %+v", s.roll)
+	}
+	scroll := func(mods ui.Modifiers) ui.InputEvent {
+		return ui.InputEvent{Kind: ui.InputScroll, DY: -120, Mods: mods, X: 100, Y: 20}
+	}
+	if !s.roll.wheel(scroll(ui.Ctrl|ui.Shift), 30, 0.5, 60) || s.roll.span <= 0 || s.roll.span >= 20 {
+		t.Errorf("ctrl+shift wheel span %v (20 s before)", s.roll.span)
+	}
+	if !s.roll.wheel(scroll(ui.Ctrl), 1, 0.5, 2) || s.roll.laneH <= rollLaneHeight {
+		t.Errorf("ctrl wheel lane height %v", s.roll.laneH)
+	}
+	if s.roll.wheel(scroll(0), 1, 0.5, 2) {
+		t.Error("plain wheel taken by the roll")
+	}
+	tt.Frame() // 音轨高度变了：按新的布局点击
+
+	// 放大查看：音轨栏的按钮打开对话框，「关闭」关上；Ctrl+滚轮加大行高，Ctrl+Shift+滚轮缩短可见时长。
+	if err := tt.Click("放大查看电贝斯"); err != nil {
+		t.Fatal(err)
+	}
+	if z := s.roll.zoom; !z.open || z.track != bass || !tt.HasText("查看的音轨") {
+		t.Fatalf("zoom %+v texts %q", z, tt.Texts())
+	}
+	z := &s.roll.zoom
+	rowH, span := z.rowH, z.span
+	z.wheel(scroll(ui.Ctrl), 800, 0, 2, true)
+	z.wheel(scroll(ui.Ctrl|ui.Shift), 800, 0, 2, true)
+	if z.rowH <= rowH || z.span >= span {
+		t.Errorf("zoom wheel rowH %v→%v span %v→%v", rowH, z.rowH, span, z.span)
+	}
+	if err := tt.Click("关闭"); err != nil {
+		t.Fatal(err)
+	}
+	if s.roll.zoom.open {
+		t.Error("close button did not close the zoom dialog")
 	}
 }
 
