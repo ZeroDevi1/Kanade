@@ -467,6 +467,11 @@ func (a *app) scoreSummary(c *ui.Context, tk *fluent.Tokens, run *score.Run, st 
 			}
 			generated("导出和弦谱 .txt…", "chord_chart.txt", name+"_和弦谱", func() ([]byte, error) { return []byte(res.ChordChart(name)), nil })
 			generated("导出 MIDI…", "score.mid", name, res.MIDI)
+			// 歌声合成工程只含旋律线（与歌词），没有旋律时不列出。ACE Studio / VOCALOID 用带歌词的 MIDI 导入。
+			if res.Melody != nil && len(res.Melody.Notes) > 0 {
+				generated("导出 Synthesizer V 工程…", "score.svp", name, func() ([]byte, error) { return res.SVP(name) })
+				generated("导出 OpenUtau 工程…", "score.ustx", name, func() ([]byte, error) { return res.USTX(name) })
+			}
 		})
 	})
 }

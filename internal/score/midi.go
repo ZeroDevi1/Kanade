@@ -116,11 +116,14 @@ func (a *Analysis) newMidiTimeMap(end float64) *midiTimeMap {
 	t0 := float64(n * midiPPQ)
 	if n > 0 {
 		m.anchors = append(m.anchors, midiAnchor{0, 0})
-		if n%bpb != 0 {
-			m.sigs = append(m.sigs, struct{ tick, beats int }{0, n})
-		}
 	}
-	m.sigs = append(m.sigs, struct{ tick, beats int }{int(t0), bpb})
+	if n%bpb != 0 {
+		m.sigs = append(m.sigs, struct{ tick, beats int }{0, n}, struct{ tick, beats int }{int(t0), bpb})
+	} else {
+		// 弱起正好是整小节（或没有弱起）：拍号写在 0 处，强拍自然落在小节线上。
+		// 不能只写在第一个强拍处，否则之前的小节按 MIDI 默认的 4/4 计，非 4/4 拍的歌小节线会错位。
+		m.sigs = append(m.sigs, struct{ tick, beats int }{0, bpb})
+	}
 	m.anchors = append(m.anchors, midiAnchor{fd, t0})
 
 	stable := a.Tempo.Stable != nil && *a.Tempo.Stable
@@ -140,9 +143,15 @@ func (a *Analysis) newMidiTimeMap(end float64) *midiTimeMap {
 	return m
 }
 
-// tempoEvents 返回各段的速度（微秒每四分音符），相邻相同的合并。
-func (m *midiTimeMap) tempoEvents() []midiEvent {
-	var out []midiEvent
+// midiTempo 是从 tick 起的一段速度：每四分音符 us 微秒。
+type midiTempo struct {
+	tick int
+	us   uint32
+}
+
+// tempos 返回各段的速度，相邻相同的合并。歌声合成工程导出（vocal.go）也用这份速度表，与 MIDI 保持一致。
+func (m *midiTimeMap) tempos() []midiTempo {
+	var out []midiTempo
 	prev := uint32(0)
 	for i := 0; i+1 < len(m.anchors); i++ {
 		p, q := m.anchors[i], m.anchors[i+1]
@@ -155,7 +164,16 @@ func (m *midiTimeMap) tempoEvents() []midiEvent {
 			continue
 		}
 		prev = us
-		out = append(out, midiEvent{tick: int(math.Round(p.tick)), data: []byte{0xFF, 0x51, 3, byte(us >> 16), byte(us >> 8), byte(us)}})
+		out = append(out, midiTempo{int(math.Round(p.tick)), us})
+	}
+	return out
+}
+
+// tempoEvents 返回各段速度的 MIDI 事件。
+func (m *midiTimeMap) tempoEvents() []midiEvent {
+	var out []midiEvent
+	for _, t := range m.tempos() {
+		out = append(out, midiEvent{tick: t.tick, data: []byte{0xFF, 0x51, 3, byte(t.us >> 16), byte(t.us >> 8), byte(t.us)}})
 	}
 	return out
 }

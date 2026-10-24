@@ -148,6 +148,27 @@ func TestMIDIVariableTempo(t *testing.T) {
 	}
 }
 
+// 弱起正好是整小节（3/4 拍、强拍前 3 拍）：拍号写在 0 处，之前的小节不按 MIDI 默认的 4/4 计。
+func TestMIDIWholeBarPickup(t *testing.T) {
+	a := midiSample(true)
+	a.Meter.BeatsPerBar = 3
+	a.Downbeats = []float64{1.5, 3} // 0.5 秒起每拍 0.5 秒：强拍前（从 0 秒起）是 3 拍
+	data, err := a.MIDI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, tracks := parseMIDI(t, data)
+	var sigs []parsedEvent
+	for _, e := range tracks[0] {
+		if e.data[0] == 0xFF && e.data[1] == 0x58 {
+			sigs = append(sigs, e)
+		}
+	}
+	if len(sigs) != 1 || sigs[0].tick != 0 || sigs[0].data[3] != 3 {
+		t.Errorf("time signatures %v", sigs)
+	}
+}
+
 func us(e parsedEvent) int { return int(e.data[3])<<16 | int(e.data[4])<<8 | int(e.data[5]) }
 
 func TestMIDIEmpty(t *testing.T) {
