@@ -135,54 +135,19 @@ func (a *app) scorePage(c *ui.Context, tk *fluent.Tokens) {
 	s.preview.load(a, st.Audio)
 	s.preview.title = filepath.Base(run.Request.Input)
 	res := st.Result
+	a.syncMix(res)
 	card(c, tk, "试听", func() { a.scorePlayer(c, tk, res) })
+	a.scoreRollCard(c, tk, res)
 	a.scoreSheetCard(c, tk, res)
 	a.scoreColorCard(c, tk, res)
-	var emotion, instruments func() ui.Element
 	if res.Emotion != nil {
-		emotion = func() ui.Element { return card(c, tk, "情绪", func() { a.scoreEmotion(c, res) }) }
+		card(c, tk, "情绪", func() { a.scoreEmotion(c, res) })
 	}
-	if tr := res.Transcription; tr != nil {
-		instruments = func() ui.Element { return card(c, tk, "乐器", func() { scoreInstruments(c, tr, res.Duration) }) }
-	}
-	cardRow(c, scoreCardMinWidth, emotion, instruments)
 }
 
 // scoreCardMinWidth 是音乐分析页并排卡片的最小宽度：分析表单在约 560 宽时文件名与按钮仍放得下一行
 // （窄于此的窗口里卡片各占一行，与原来的单列布局相同）。
 const scoreCardMinWidth = 560
-
-// scoreInstruments 列出多乐器转录识别出的乐器：音符数、音域与出现的时间范围。
-func scoreInstruments(c *ui.Context, tr *score.Transcription, duration float64) {
-	t := c.Theme()
-	if len(tr.Instruments) == 0 {
-		ui.Text(c, "没有转录出音符。").FontSize(12).TextColor(t.TextMuted)
-		return
-	}
-	for _, in := range tr.Instruments {
-		if len(in.Notes) == 0 {
-			continue
-		}
-		lo, hi := in.Notes[0].Pitch, in.Notes[0].Pitch
-		first, last := in.Notes[0].Start, in.Notes[0].End
-		for _, n := range in.Notes {
-			lo, hi = min(lo, n.Pitch), max(hi, n.Pitch)
-			first, last = min(first, n.Start), max(last, n.End)
-		}
-		ui.Row(c.Key("instrument-" + in.Name)).Gap(12).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, in.Title()).Width(140)
-			ui.Textf(c, "%d 个音", len(in.Notes)).FontSize(12).Font("monospace").Width(90)
-			if !in.Drum {
-				ui.Text(c, midiNoteName(lo)+" – "+midiNoteName(hi)).FontSize(12).Font("monospace").Width(90)
-			} else {
-				ui.Box(c).Width(90)
-			}
-			ui.Text(c, score.Clock(first)+" – "+score.Clock(min(last, duration))).FontSize(12).TextColor(t.TextMuted)
-		})
-	}
-	ui.Text(c, "导出 MIDI 时每种乐器一轨（鼓在第 10 通道）。转录由 MuScriptor 完成，其权重为 CC BY-NC 4.0 许可，仅限非商业用途。").
-		FontSize(12).TextColor(t.TextMuted)
-}
 
 // midiNoteName 把 MIDI 音高写成科学音名（60 = C4），用升号拼写。
 func midiNoteName(m int) string {
@@ -517,7 +482,6 @@ func (a *app) scorePlayer(c *ui.Context, tk *fluent.Tokens, res *score.Analysis)
 	t := c.Theme()
 	s := &a.score
 	s.preview.show(c, tk, "", nil)
-	a.scoreTracks(c, tk, res)
 	pos, seek := a.scorePosition()
 	bar, beat := res.BarAt(pos)
 	cur, next := "—", ""

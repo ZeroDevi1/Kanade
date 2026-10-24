@@ -57,12 +57,12 @@ func (a *Analysis) MelodyPiano() []PianoNote {
 	return out
 }
 
-// PianoTracks 分别合成和弦铺底与旋律两条钢琴音轨（单声道，rate Hz，长度与 Duration 一致），供分轨静音 / 独奏混音；
-// 没有旋律线时 melody 为 nil。两条音轨各自按峰值归一化前的同一增益合成，相加时电平关系与一起合成一致。
-func (a *Analysis) PianoTracks(rate int) (chords, melody []float32) {
-	chords = renderRaw(a.ChordPad(), rate, a.Duration)
-	if notes := a.MelodyPiano(); len(notes) > 0 {
-		melody = renderRaw(notes, rate, a.Duration)
+// TrackPCM 合成 tracks（a.Tracks() 的结果）中的第 i 条音轨（单声道，rate Hz，长度与 Duration 一致），
+// 供分轨静音 / 独奏混音。钢琴两轨不做电平处理，和弦铺底与旋律保持一起合成时的相对电平；
+// 乐器音轨按 RMS 调到相近的响度。原曲轨与没有音符的音轨返回 nil。
+func (a *Analysis) TrackPCM(tracks []Track, i, rate int) []float32 {
+	if i == TrackOriginal {
+		return nil
 	}
-	return chords, melody
+	return RenderTrack(tracks[i], rate, a.Duration, i >= TrackInstruments)
 }

@@ -38,23 +38,27 @@ type sheetState struct {
 	lastRow  int    // 上一帧所在的行，用于只在换行时滚动
 	lastView int    // 上一帧的视图；切换视图后立即滚到当前行
 
-	// mix 是试听的分轨混音设置（原曲、钢琴和弦、钢琴旋律）。
+	// mix 是试听的分轨混音设置，与 tracks 等长（原曲、钢琴和弦、钢琴旋律、各乐器）。
 	mix score.TrackMix
-	// pianoFor 是已合成钢琴音轨所对应的分析结果；chordsPCM / melodyPCM 为单声道采样（pianoRate Hz）。
-	pianoFor             *score.Analysis
-	chordsPCM, melodyPCM []float32
-	pianoRate            int
-	pianoBusy            bool
+	// tracksFor 是 tracks / synthPCM 所对应的分析结果，换了结果时由 useTracks 重建。
+	// synthPCM[i] 是第 i 条音轨合成好的单声道采样（synthRate Hz），nil 为还没合成（只在需要发声时合成）。
+	tracksFor *score.Analysis
+	tracks    []score.Track
+	synthPCM  [][]float32
+	synthRate int
+	synthBusy bool
 	// mixVer 在每次请求混音时递增，后台混音完成时只应用最新一次的结果。
 	mixVer int
 	// mixApplied 是混音结果所基于的原曲播放器：原曲重新载入（播放器变化）后需要重新混音。
 	mixApplied *audio.Player
 	mixPending bool // 后台混音进行中
 	mixErr     string
+
+	roll rollState // 多轨卷帘的显示设置（scoreroll.go）
 }
 
 func newSheetState() sheetState {
-	return sheetState{style: symbolStyles[0].Title, follow: true, lastRow: -1, mix: score.DefaultTrackMix()}
+	return sheetState{style: symbolStyles[0].Title, follow: true, lastRow: -1, roll: newRollState()}
 }
 
 func (s *sheetState) styleKey() string {
@@ -66,72 +70,40 @@ func (s *sheetState) styleKey() string {
 	return score.SymbolJazz
 }
 
-// trackTitles 是三条音轨的名称。
-var trackTitles = [score.TrackCount]string{"原曲", "钢琴 · 和弦", "钢琴 · 旋律"}
+// useTracks 让音轨缓存对应 res：换了分析结果时重建音轨与混音设置（乐器数可能不同），丢弃已合成的采样。
+// 返回是否重建了（此时需要按新结果重新混音）。
+func (s *sheetState) useTracks(res *score.Analysis) bool {
+	if s.tracksFor == res {
+		return false
+	}
+	s.tracksFor, s.tracks = res, res.Tracks()
+	s.synthPCM = make([][]float32, len(s.tracks))
+	s.mix.Resize(len(s.tracks))
+	return true
+}
 
-// scoreTracks 是试听卡片中的分轨混音：每条音轨的静音（M）、独奏（S）与音量，规则与混音台一致；
-// 改动后在后台重新混合并保持播放位置切换过去。钢琴音轨首次发声时先合成（模态钢琴模型）。
-func (a *app) scoreTracks(c *ui.Context, tk *fluent.Tokens, res *score.Analysis) {
-	t := c.Theme()
+// trackAvailable 报告各音轨是否可用：原曲总是可用，其余音轨需要有音符（旋律轨需要识别出的旋律线）。
+func (s *sheetState) trackAvailable() []bool {
+	out := make([]bool, len(s.tracks))
+	for i, tr := range s.tracks {
+		out[i] = i == score.TrackOriginal || len(tr.Notes) > 0
+	}
+	return out
+}
+
+// syncMix 在每帧构建时调用：换了分析结果，或原曲（重新）载入后还没有为它混过音且混音不是「只有原曲」时，
+// 重新应用混音。混音或合成进行中、或上次失败时不重复触发。
+func (a *app) syncMix(res *score.Analysis) {
 	s := &a.score.sheet
 	pv := &a.score.preview
-	available := trackAvailable(res)
-	audible := s.mix.Audible(available)
-	changed := false
-	ui.Column(c).Gap(4).AlignItems(ui.Stretch).Children(func() {
-		for i := range score.TrackCount {
-			ui.Row(c.Key(fmt.Sprintf("track-%d", i))).Gap(10).AlignItems(ui.Center).Children(func() {
-				name := ui.Text(c, trackTitles[i]).FontSize(13).Width(96)
-				if !audible[i] {
-					name.TextColor(t.TextMuted)
-				}
-				if !available[i] {
-					ui.Text(c, "未识别旋律（分析时勾选「识别旋律线」）").FontSize(12).TextColor(t.TextMuted)
-					return
-				}
-				if trackButton(c, tk, "M", "静音"+trackTitles[i], s.mix.Mute[i], t.Warning) {
-					s.mix.Mute[i], changed = !s.mix.Mute[i], true
-				}
-				if trackButton(c, tk, "S", "独奏"+trackTitles[i], s.mix.Solo[i], t.Accent) {
-					s.mix.Solo[i], changed = !s.mix.Solo[i], true
-				}
-				if ui.Slider(c, &s.mix.Gain[i], 0, 2).Label(trackTitles[i] + "音量").Width(200).Changed() {
-					changed = true
-				}
-				ui.Textf(c, "%.0f%%", s.mix.Gain[i]*100).FontSize(12).Font("monospace").TextColor(t.TextMuted).Width(44)
-			})
-		}
-	})
-	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-		switch {
-		case s.pianoBusy:
-			ui.Spinner(c)
-			ui.Text(c, "正在合成钢琴…").FontSize(12).TextColor(t.TextMuted)
-		case s.mixErr != "":
-			ui.Text(c, s.mixErr).FontSize(12).TextColor(t.Danger)
-		case s.mix.NeedsPiano(available):
-			ui.Text(c, "钢琴为模态钢琴模型：和弦以弱力度柱式和弦铺底（每小节重新弹奏），旋律按识别出的音高弹奏。").
-				FontSize(12).TextColor(t.TextMuted).Grow(1)
-		}
-	})
-	// 切换到别的分析结果后，钢琴缓存失效。
-	if s.pianoFor != nil && s.pianoFor != res {
-		s.pianoFor, s.chordsPCM, s.melodyPCM = nil, nil, nil
-		changed = true
-	}
-	// 原曲（重新）载入后还没有为它混过音：混音不是「只有原曲」时需要应用。混音进行中或失败时不重复触发。
-	if pv.player != nil && pv.player == pv.original && s.mixApplied != pv.original && !s.mix.OriginalOnly(available) &&
-		!s.pianoBusy && !s.mixPending && s.mixErr == "" {
+	changed := s.useTracks(res)
+	if pv.player != nil && pv.player == pv.original && s.mixApplied != pv.original && !s.mix.OriginalOnly(s.trackAvailable()) &&
+		!s.synthBusy && !s.mixPending && s.mixErr == "" {
 		changed = true
 	}
 	if changed {
 		a.applyMix(res)
 	}
-}
-
-// trackAvailable 报告各音轨是否可用：旋律轨需要识别出的旋律线。
-func trackAvailable(res *score.Analysis) [score.TrackCount]bool {
-	return [score.TrackCount]bool{true, true, res.Melody != nil && len(res.Melody.Notes) > 0}
 }
 
 // trackButton 是音轨的 M / S 按钮，on 时以 color 填充；返回是否被点击。
@@ -154,12 +126,13 @@ func trackButton(c *ui.Context, tk *fluent.Tokens, text, label string, on bool, 
 	return b.Clicked()
 }
 
-// applyMix 按当前混音设置切换播放器音源：只有原曲时直接播放原文件；需要钢琴时先在后台合成；
+// applyMix 按当前混音设置切换播放器音源：只有原曲时直接播放原文件；有发声的音轨还没合成时先在后台合成；
 // 然后在后台混合并保持播放位置切换。连续改动时只应用最后一次的结果。
 func (a *app) applyMix(res *score.Analysis) {
 	s := &a.score.sheet
 	pv := &a.score.preview
-	available := trackAvailable(res)
+	s.useTracks(res)
+	available := s.trackAvailable()
 	s.mixErr = ""
 	if s.mix.OriginalOnly(available) {
 		s.mixVer++ // 作废进行中的混音
@@ -174,16 +147,37 @@ func (a *app) applyMix(res *score.Analysis) {
 	if rate == 0 {
 		rate = 44100
 	}
-	if s.mix.NeedsPiano(available) && (s.pianoFor != res || s.pianoRate != rate) {
-		if s.pianoBusy {
+	if s.synthRate != rate {
+		s.synthPCM, s.synthRate = make([][]float32, len(s.tracks)), rate // 采样率变了，已合成的作废
+	}
+	var missing []int
+	for _, i := range s.mix.Synthesized(available) {
+		if s.synthPCM[i] == nil {
+			missing = append(missing, i)
+		}
+	}
+	if len(missing) > 0 {
+		if s.synthBusy {
 			return // 合成完成后会再次调用
 		}
-		s.pianoBusy = true
+		s.synthBusy = true
+		tracks := s.tracks
 		go func() {
-			chords, melody := res.PianoTracks(rate)
+			pcm := make([][]float32, len(missing))
+			for k, i := range missing {
+				pcm[k] = res.TrackPCM(tracks, i, rate)
+			}
 			a.post(func() {
-				s.pianoBusy = false
-				s.pianoFor, s.chordsPCM, s.melodyPCM, s.pianoRate = res, chords, melody, rate
+				s.synthBusy = false
+				// 期间换了分析结果或采样率：丢弃（新的请求会自己合成）。
+				if s.tracksFor == res && s.synthRate == rate {
+					for k, i := range missing {
+						s.synthPCM[i] = pcm[k]
+						if s.synthPCM[i] == nil {
+							s.synthPCM[i] = []float32{} // 合成结果为空（音符都在音频之外）：记为已合成，避免反复请求
+						}
+					}
+				}
 				a.applyMix(res)
 			})
 		}()
@@ -195,10 +189,11 @@ func (a *app) applyMix(res *score.Analysis) {
 	}
 	s.mixVer++
 	s.mixPending = true
-	ver, mix, orig, ch, original := s.mixVer, s.mix, pv.samples, pv.ch, pv.original
-	chords, melody := s.chordsPCM, s.melodyPCM
+	// 混音设置复制一份交给后台：界面线程之后的改动不影响这次混音。
+	mix := score.TrackMix{Mute: slices.Clone(s.mix.Mute), Solo: slices.Clone(s.mix.Solo), Gain: slices.Clone(s.mix.Gain)}
+	ver, orig, ch, original, synth := s.mixVer, pv.samples, pv.ch, pv.original, slices.Clone(s.synthPCM)
 	go func() {
-		out := score.MixTracks(orig, ch, chords, melody, mix, available)
+		out := score.MixTracks(orig, ch, synth, mix, available)
 		a.post(func() {
 			// 期间又改了设置或换了文件时丢弃这次结果（更新的请求会自己完成）。
 			if ver != s.mixVer {

@@ -296,13 +296,72 @@ func TestScoreTrackMixer(t *testing.T) {
 	if !tt.HasText("钢琴 · 旋律") || tt.HasText("未识别旋律（分析时勾选「识别旋律线」）") {
 		t.Fatalf("texts %q", tt.Texts())
 	}
-	a.score.sheet.mix.Solo = [score.TrackCount]bool{false, false, true}
+	a.score.sheet.mix.Solo[score.TrackMelody] = true
 	a.applyMix(run.Snapshot().Result)
-	drain(func() bool { return pv.player != pv.original && a.score.sheet.melodyPCM != nil })
-	a.score.sheet.mix.Solo = [score.TrackCount]bool{}
+	drain(func() bool { return pv.player != pv.original && a.score.sheet.synthPCM[score.TrackMelody] != nil })
+	if a.score.sheet.synthPCM[score.TrackChords] != nil {
+		t.Error("muted chord track should not be synthesized")
+	}
+	a.score.sheet.mix.Solo[score.TrackMelody] = false
 	a.applyMix(run.Snapshot().Result)
 	if pv.player != pv.original {
 		t.Error("original-only mix should play the original player")
+	}
+}
+
+// 多轨卷帘：多乐器转录出的每种乐器各一条音轨；独奏一种乐器时只合成它并切到混音结果。
+func TestScoreRollInstruments(t *testing.T) {
+	dir := t.TempDir()
+	wav, js := filepath.Join(dir, "audio.wav"), filepath.Join(dir, "analysis.json")
+	writeTestWav(t, wav, 8000, 16000)
+	os.WriteFile(js, []byte(`{"duration": 2, "beats": [0,0.5,1,1.5], "downbeats": [0],
+		"key": {"label": "C 大调", "tonic_pc": 0, "mode": "major"},
+		"chords": [{"start":0,"end":2,"label":"C","root":0,"quality":"maj"}],
+		"transcription": {"model": "muscriptor-medium", "onset_delay": 0, "instruments": [
+			{"name": "electric_bass", "program": 33, "drum": false, "notes": [{"start":0,"end":0.5,"pitch":36},{"start":0.5,"end":1,"pitch":43}]},
+			{"name": "drums", "program": -1, "drum": true, "notes": [{"start":0,"end":0.05,"pitch":36},{"start":0.5,"end":0.55,"pitch":38}]}]}}`), 0o644)
+	l := paths.New(t.TempDir())
+	cond, _ := conductor.New(l, engines.FS, nil)
+	a := newApp()
+	a.be, a.current = backend{layout: l, cond: cond}, "score"
+	updates := make(chan func(), 64)
+	a.post = func(fn func()) { updates <- fn }
+	run, _ := score.Start(artifactJobs{[]string{wav, js}}, score.Request{Input: "/x/歌.flac", Options: score.DefaultOptions()}, nil)
+	for run.Snapshot().Running() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	a.score.runs = []*score.Run{run}
+	tt := ui.NewTester(a.view, 1200, 4000)
+	pv := &a.score.preview
+	drain := func(until func() bool) {
+		t.Helper()
+		deadline := time.After(10 * time.Second)
+		for !until() {
+			select {
+			case fn := <-updates:
+				fn()
+				tt.Frame()
+			case <-deadline:
+				t.Fatal("timed out")
+			}
+		}
+	}
+	drain(func() bool { return pv.player != nil })
+	for _, want := range []string{"多轨卷帘", "电贝斯", "鼓", "2 击", "2 音 · C2–G2"} {
+		if !tt.HasText(want) {
+			t.Fatalf("missing %q in %q", want, tt.Texts())
+		}
+	}
+	s := &a.score.sheet
+	if len(s.tracks) != score.TrackInstruments+2 {
+		t.Fatalf("tracks %d", len(s.tracks))
+	}
+	bass := score.TrackInstruments
+	s.mix.Solo[bass] = true
+	a.applyMix(run.Snapshot().Result)
+	drain(func() bool { return pv.player != pv.original && s.synthPCM[bass] != nil })
+	if s.synthPCM[bass+1] != nil || s.synthPCM[score.TrackChords] != nil {
+		t.Error("only the soloed instrument should be synthesized")
 	}
 }
 
