@@ -103,36 +103,37 @@ func (a *app) scoreRequest() score.Request {
 	return r
 }
 
-// 转录的乐器提示（scoreState.instrMode）。
+// 转录的乐器提示（scoreState.instrMode）。没有「排除勾选的乐器」：排除三种吉他等于把其余 32 个乐器组都作为条件传给
+// 模型，《我不想念》实测几乎整首被识别成圆号、合成主音与合成铺底（钢琴只有 56 个音），比自动识别更糟。
 const (
-	instrAuto    = iota // 自动识别
-	instrOnly           // 只在勾选的乐器中识别
-	instrExclude        // 排除勾选的乐器
+	instrAuto = iota // 自动识别
+	instrOnly        // 只在勾选的乐器中识别
 )
+
+// instrManyWarn 是乐器提示勾选数的提醒线：上游的乐器条件按一首歌实际出现的乐器训练，勾得太多时与排除模式一样容易乱认
+// （经验值，32 个时已实测失效）。
+const instrManyWarn = 8
 
 // instrCommon 是乐器提示默认列出的常见乐器组；其余在「显示全部乐器组」后列出。
 var instrCommon = []string{"acoustic_piano", "electric_piano", "organ", "acoustic_guitar", "clean_electric_guitar",
 	"distorted_electric_guitar", "electric_bass", "acoustic_bass", "drums", "voice", "string_ensemble", "violin", "cello",
 	"synth_strings", "synth_pad", "synth_lead", "brass_section", "flutes", "chromatic_percussion"}
 
-// instrumentHint 按乐器提示返回转录可用的乐器组：自动或没有勾选时为 nil（不限）；排除全部时也为 nil。
+// instrumentHint 按乐器提示返回转录可用的乐器组：自动或没有勾选时为 nil（不限）。
 func (s *scoreState) instrumentHint() []string {
 	if !s.transcribe || s.instrMode == instrAuto {
 		return nil
 	}
 	var out []string
 	for _, g := range score.InstrumentGroups {
-		if s.instrPicked[g.Key] == (s.instrMode == instrOnly) {
+		if s.instrPicked[g.Key] {
 			out = append(out, g.Key)
 		}
-	}
-	if len(out) == 0 || len(out) == len(score.InstrumentGroups) {
-		return nil
 	}
 	return out
 }
 
-// scoreInstrumentHint 是转录的乐器提示：自动、只识别勾选的乐器、排除勾选的乐器。
+// scoreInstrumentHint 是转录的乐器提示：自动识别，或只识别勾选的乐器。
 func (a *app) scoreInstrumentHint(c *ui.Context) {
 	t := c.Theme()
 	s := &a.score
@@ -140,19 +141,17 @@ func (a *app) scoreInstrumentHint(c *ui.Context) {
 		s.instrPicked = map[string]bool{}
 	}
 	ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-		ui.Segmented(c, &s.instrMode, "自动识别", "只识别勾选的乐器", "排除勾选的乐器").Label("乐器提示")
+		ui.Segmented(c, &s.instrMode, "自动识别", "只识别勾选的乐器").Label("乐器提示")
 	})
-	switch s.instrMode {
-	case instrAuto:
-		ui.Text(c, "音色相近的乐器可能整首认错（例如钢琴伴奏被识别成吉他）：可以指定歌里有的乐器，或排除没有的乐器后重新分析。").
-			FontSize(12).TextColor(t.TextMuted)
+	if s.instrMode == instrAuto {
+		ui.Text(c, "音色相近的乐器可能整首认错（例如钢琴伴奏被识别成吉他）：分析后可在多轨卷帘中把音轨「改为」正确的乐器，"+
+			"或指定歌里有的乐器后重新分析。").FontSize(12).TextColor(t.TextMuted)
 		return
-	case instrOnly:
-		ui.Text(c, "转录只会在勾选的乐器中选择：请把歌里的乐器都勾上（包括鼓、贝斯、人声），没勾的乐器会被归到勾选的乐器里。").
-			FontSize(12).TextColor(t.TextMuted)
-	default:
-		ui.Text(c, "勾选歌里没有、却被识别出来的乐器（例如钢琴被认成吉他时排除各种吉他），其余照常识别。").
-			FontSize(12).TextColor(t.TextMuted)
+	}
+	ui.Text(c, "转录只会在勾选的乐器中选择：请把歌里的乐器都勾上（包括鼓、贝斯、人声），没勾的乐器会被归到勾选的乐器里。").
+		FontSize(12).TextColor(t.TextMuted)
+	if n := len(s.instrumentHint()); n > instrManyWarn {
+		ui.Textf(c, "已勾选 %d 种：勾得太多时模型容易乱认，建议只勾歌里确实有的几种。", n).FontSize(12).TextColor(t.Warning)
 	}
 	keys := instrCommon
 	if s.instrAll {

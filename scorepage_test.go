@@ -524,20 +524,15 @@ func TestScoreHistory(t *testing.T) {
 	}
 }
 
-// 乐器提示：排除勾选的乐器时其余乐器组都可用；只识别勾选的乐器时就是勾选的那些；自动或没有勾选时不限。
+// 乐器提示：只识别勾选的乐器时就是勾选的那些；自动或没有勾选时不限；未知的乐器组被拒绝。
 func TestScoreInstrumentHint(t *testing.T) {
 	s := newScoreState()
-	s.transcribe, s.instrPicked = true, map[string]bool{"acoustic_guitar": true, "distorted_electric_guitar": true}
+	s.transcribe, s.instrPicked = true, map[string]bool{"acoustic_piano": true, "drums": true}
 	if s.instrumentHint() != nil {
 		t.Error("auto mode should not restrict")
 	}
-	s.instrMode = instrExclude
-	hint := s.instrumentHint()
-	if len(hint) != len(score.InstrumentGroups)-2 || slices.Contains(hint, "acoustic_guitar") || !slices.Contains(hint, "acoustic_piano") {
-		t.Errorf("exclude hint %v", hint)
-	}
 	s.instrMode = instrOnly
-	if got := s.instrumentHint(); !slices.Equal(got, []string{"acoustic_guitar", "distorted_electric_guitar"}) {
+	if got := s.instrumentHint(); !slices.Equal(got, []string{"acoustic_piano", "drums"}) {
 		t.Errorf("only hint %v", got)
 	}
 	r := score.Request{Input: "/x.flac", Options: score.DefaultOptions()}
