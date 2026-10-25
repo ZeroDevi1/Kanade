@@ -1,6 +1,6 @@
 # 灵感页调研：哼唱动机 → 乐句 → 和声配置 → 动机发展
 
-状态：M1（哼唱转乐句）已实现，见 `inspire.go` 与 `internal/score/phrase.go`；M2 起未开始。日期：2026-10-25。
+状态：M1（哼唱转乐句，含自由哼唱的自适应速度，`internal/score/phrase.go`、`tempo.go`）与 M2（规则和声配置，`internal/score/reharm.go`）已实现，界面见 `inspire.go`；M3（动机发展）未开始。日期：2026-10-25。
 
 **应用不调用 LLM**：灵感页的全部功能都是本地的确定性算法，离线可用。开发时遇到算法设计问题，由开发者向 Claude Fable 5.1（effort high）咨询，咨询结论整理进本文档或代码注释。
 

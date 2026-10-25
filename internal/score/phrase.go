@@ -97,6 +97,26 @@ type Hum struct {
 	// Tuning 是整体音高偏移（音分，正值为偏高）；Shift 是整体节奏偏移（秒，负值为抢拍）。都已在结果中扣除。
 	Tuning, Shift float64
 	Voiced        int // 有声帧数；为 0 时没有录到哼唱
+	// Beats 是跟踪出的逐拍时刻（录音时间，秒），Origin 是乐谱第一拍在其中的拍坐标（可为负：弱起前补的空拍）。
+	// 乐谱按 Settings.BPM 等速；RecTime / ScoreTime 在乐谱时间与录音时间之间换算。Beats 为 nil 时为等距网格。
+	Beats  []float64
+	Origin float64
+}
+
+// RecTime 把乐谱时间（秒，相对第一拍）换算成录音时间。
+func (h Hum) RecTime(tau float64) float64 {
+	if h.Beats == nil {
+		return tau + h.Settings.Start() + h.Shift
+	}
+	return beatTime(h.Beats, h.Origin+tau/h.Settings.Beat())
+}
+
+// ScoreTime 是 RecTime 的反映射。
+func (h Hum) ScoreTime(t float64) float64 {
+	if h.Beats == nil {
+		return t - h.Settings.Start() - h.Shift
+	}
+	return (beatCoord(h.Beats, t) - h.Origin) * h.Settings.Beat()
 }
 
 // rawNote 是切分阶段的音符：帧区间 [a, b)、半音 m、是否为音节起点。
@@ -110,6 +130,12 @@ type rawNote struct {
 // TranscribeHum 把录音帧整理成乐句。frames 的时间轴是节拍器的播放位置（含预备拍）。
 func TranscribeHum(frames []KaraokeFrame, s HumSettings) Hum {
 	h := Hum{Settings: s, Mode: "major"}
+	if s.Free {
+		// 没有录到音符时提前返回：自由模式的设置里速度与拍号可能还是「自动」（0），先给出默认值，结果仍是合法的节拍。
+		h.Settings.BPM = cmp.Or(s.BPM, defaultHumBPM)
+		h.Settings.BeatsPerBar = cmp.Or(s.BeatsPerBar, 4)
+		h.Settings.Bars, h.Settings.CountIn = 1, 0
+	}
 	if len(frames) == 0 {
 		return h
 	}
@@ -131,13 +157,29 @@ func TranscribeHum(frames []KaraokeFrame, s HumSettings) Hum {
 		notes[i].cents = humNoteCents(cents, frames, notes[i])
 	}
 	midi := h.tune(notes)
-	// 帧时间换成相对第一拍的秒数，再量化。
-	t0 := s.Start()
 	starts, ends := make([]float64, len(notes)), make([]float64, len(notes))
 	for i, n := range notes {
-		starts[i], ends[i] = frames[n.a].T-t0, frames[n.b-1].T+humFrame-t0
+		starts[i], ends[i] = frames[n.a].T, frames[n.b-1].T+humFrame
 	}
-	h.Notes = h.quantize(starts, ends, midi, notes)
+	// 节拍跟踪：把录音时间按逐拍时刻映射成等速的乐谱时间（相对第一拍）后量化；节拍器模式下哼唱与节拍器脱节时
+	// 退回等距网格（扣除预备拍，量化时再估计整体偏移）。
+	ev := humEvents(notes, frames, midi)
+	beats, origin, set, ok := rhythm(ev, ends[len(ends)-1], s)
+	h.Settings = set
+	if ok {
+		h.Beats, h.Origin = beats, origin
+		beat := set.Beat()
+		for i := range starts {
+			starts[i] = (beatCoord(beats, starts[i]) - origin) * beat
+			ends[i] = (beatCoord(beats, ends[i]) - origin) * beat
+		}
+	} else {
+		for i := range starts {
+			starts[i] -= s.Start()
+			ends[i] -= s.Start()
+		}
+	}
+	h.Notes = h.quantize(starts, ends, midi, notes, !ok)
 	return h
 }
 
@@ -594,14 +636,18 @@ var (
 // quantize 扣除整体节奏偏移后，把音符边界量化到网格：每拍按边界离网格的距离选 1/16 或八分三连音，
 // 再对边界序列做动态规划（每个边界在网格上取下取整、上取整或再后一格），保证每个音时长不为零、相邻不重叠；
 // 与下一音的间隙不到半个网格时连奏。超出动机范围的音丢弃或截断。
-func (h *Hum) quantize(starts, ends []float64, midi []int, notes []rawNote) []MelodyNote {
+// estimateShift 为 false 时（节拍跟踪已经对齐了拍点）不估计整体偏移。
+func (h *Hum) quantize(starts, ends []float64, midi []int, notes []rawNote, estimateShift bool) []MelodyNote {
 	s := h.Settings
 	beat := s.Beat()
 	g := beat / 4
 	// 整体节奏偏移：时长足够的音符起点相对 1/16 网格的圆均值。
 	var sx, sy, sw float64
+	if !estimateShift {
+		sw = math.Inf(-1) // 跳过下面的估计
+	}
 	for i := range starts {
-		if d := ends[i] - starts[i]; d >= humShiftMinDur {
+		if d := ends[i] - starts[i]; d >= humShiftMinDur && estimateShift {
 			th := 2 * math.Pi * starts[i] / g
 			sx, sy, sw = sx+d*math.Cos(th), sy+d*math.Sin(th), sw+d
 		}

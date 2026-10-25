@@ -129,8 +129,9 @@ func TestTranscribeHum(t *testing.T) {
 			if tc.opts.tune != 0 && math.Abs(h.Tuning-tc.opts.tune) > 8 {
 				t.Errorf("tuning %.1f, want %.0f", h.Tuning, tc.opts.tune)
 			}
-			if tc.opts.shift != 0 && math.Abs(h.Shift-tc.opts.shift) > 0.012 {
-				t.Errorf("shift %.3f, want %.3f", h.Shift, tc.opts.shift)
+			// 整体抢拍 / 拖拍由节拍跟踪吸收：乐谱第一拍对应的录音时刻随之移动。
+			if want := testHum.Start() + tc.opts.shift; math.Abs(h.RecTime(0)-want) > 0.025 { // 点击的伪起音会把拍点稍微拉回节拍器
+				t.Errorf("first beat at %.3f s, want %.3f", h.RecTime(0), want)
 			}
 		})
 	}
@@ -140,6 +141,13 @@ func TestTranscribeHum(t *testing.T) {
 func TestTranscribeHumProperties(t *testing.T) {
 	if h := TranscribeHum(synthFrames(testHum, nil, synthOpts{}), testHum); h.Voiced != 0 || len(h.Notes) != 0 {
 		t.Fatalf("silence: %+v", h)
+	}
+	// 自由模式没有录到音符时，节拍设置仍合法（速度与拍号为默认值）。
+	for _, frames := range [][]KaraokeFrame{nil, synthFrames(testHum, nil, synthOpts{})} {
+		h := TranscribeHum(frames, HumSettings{Free: true})
+		if h.Settings.BPM <= 0 || h.Settings.BeatsPerBar <= 0 || h.Settings.Bars <= 0 || math.IsNaN(h.Settings.Length()) {
+			t.Fatalf("free silence settings %+v", h.Settings)
+		}
 	}
 	rng := rand.New(rand.NewPCG(7, 8))
 	for trial := range 30 {
@@ -205,5 +213,32 @@ func TestMetronomePCM(t *testing.T) {
 	}
 	if pcm[1] == 0 || pcm[int(testHum.Beat()*8000)+1] == 0 || pcm[int(testHum.Beat()*8000/2)] != 0 {
 		t.Errorf("clicks not on beats")
+	}
+}
+
+// 任意帧（噪声、提前停止、只有预备拍）都不应让整理崩溃。
+func TestTranscribeHumRobust(t *testing.T) {
+	rng := rand.New(rand.NewPCG(3, 4))
+	for trial := range 200 {
+		n := rng.IntN(600)
+		frames := make([]KaraokeFrame, n)
+		for i := range frames {
+			f := KaraokeFrame{T: float64(i) * humFrame, DB: -70 + 60*rng.Float64(), Clarity: rng.Float64()}
+			if rng.IntN(3) > 0 {
+				f.F0 = 60 + 1000*rng.Float64()
+			}
+			frames[i] = f
+		}
+		for _, set := range []HumSettings{testHum, {Free: true}} {
+			h := TranscribeHum(frames, set)
+			FillLyrics(h.Notes, trial%len(FillerSets), h.Settings.Beat())
+			_ = h.Analysis()
+			for style := range HarmonyStyles {
+				Harmonize(h, style, 3)
+			}
+			if l := h.Settings.Length(); math.IsNaN(l) || l <= 0 {
+				t.Fatalf("trial %d settings %+v", trial, h.Settings)
+			}
+		}
 	}
 }

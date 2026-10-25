@@ -2,12 +2,19 @@ package score
 
 import "math"
 
-// HumSettings 是录一段哼唱动机时的节拍设置。录音时先播放 CountIn 小节预备拍，再播放 Bars 小节节拍器供跟唱。
+// HumSettings 是录一段哼唱动机时的节拍设置。节拍器模式下先播放 CountIn 小节预备拍，再播放 Bars 小节节拍器供跟唱；
+// 自由模式（Free）不播放节拍器，速度、拍号与小节数由 TranscribeHum 从哼唱估计后写回。
 type HumSettings struct {
+	// Free 为 true 时自由哼唱：BPM 非 0 时作为速度提示（例如用户把估计的速度减半或加倍），BeatsPerBar 非 0 时固定拍号，
+	// 0 为自动估计；CountIn 与 Bars 不使用。
+	Free        bool
 	BPM         float64 // 每分钟拍数（以四分音符为一拍）
 	BeatsPerBar int     // 每小节拍数（2、3、4）
 	Bars        int     // 动机的小节数
 	CountIn     int     // 预备拍的小节数
+	// BarShift 是自由模式下对估计出的小节线的手动调整（拍）：正值把小节线往后挪（例如 1 使第一个音变成一拍弱起），
+	// 负值往前挪，0 为不调整。
+	BarShift int
 }
 
 // Beat 返回一拍的时长（秒）。
@@ -34,17 +41,22 @@ func MetronomePCM(s HumSettings, rate int) []float32 {
 	beat := s.Beat()
 	beats := (s.CountIn + s.Bars) * s.BeatsPerBar
 	out := make([]float32, int((float64(beats)+1)*beat*float64(rate)))
-	n := int(clickLen * float64(rate))
 	for b := range beats {
-		hz, gain := clickWeakHz, 0.35
-		if b%s.BeatsPerBar == 0 {
-			hz, gain = clickStrongHz, 0.6
-		}
-		at := int(float64(b) * beat * float64(rate))
-		for i := 0; i < n && at+i < len(out); i++ {
-			t := float64(i) / float64(rate)
-			out[at+i] = float32(gain * math.Exp(-t/clickDecay) * math.Sin(2*math.Pi*float64(hz)*t))
-		}
+		AddClick(out, rate, float64(b)*beat, b%s.BeatsPerBar == 0)
 	}
 	return out
+}
+
+// AddClick 在 pcm 的时刻 t（秒）叠加一声节拍器点击；strong 为强拍。超出 pcm 范围的部分丢弃。
+func AddClick(pcm []float32, rate int, t float64, strong bool) {
+	hz, gain := clickWeakHz, 0.35
+	if strong {
+		hz, gain = clickStrongHz, 0.6
+	}
+	at := int(math.Round(t * float64(rate)))
+	n := int(clickLen * float64(rate))
+	for i := max(0, -at); i < n && at+i < len(pcm); i++ {
+		x := float64(i) / float64(rate)
+		pcm[at+i] += float32(gain * math.Exp(-x/clickDecay) * math.Sin(2*math.Pi*float64(hz)*x))
+	}
 }
