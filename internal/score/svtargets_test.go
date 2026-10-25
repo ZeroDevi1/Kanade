@@ -68,20 +68,4 @@ func TestRecommendSingers(t *testing.T) {
 	if picks[2].Transpose != -24 || !strings.Contains(strings.Join(picks[0].Reasons, "；"), "Power") {
 		t.Errorf("picks %+v", picks[:3])
 	}
-	// 激昂（唤醒度 0.8）：没有中性模式时只轻度加上 Power；以其他角色命名的模式（Random1）不建议。
-	if got := a.SuggestModes(singers[2]); got != "Power=35" {
-		t.Errorf("modes %q", got)
-	}
-	// 有中性模式时以它为基底；情绪不明显（唤醒度 0.55）时不加倾向模式。
-	withClear := SVSinger{Modes: []string{"Soft", "Clear", "Power"}}
-	if got := a.SuggestModes(withClear); got != "Clear=50, Power=35" {
-		t.Errorf("modes with neutral %q", got)
-	}
-	a.Emotion.Arousal = 0.55
-	if got := a.SuggestModes(withClear); got != "Clear=50" {
-		t.Errorf("mild song modes %q", got)
-	}
-	if got := a.SuggestModes(SVSinger{Modes: []string{"Random1"}}); got != "" {
-		t.Errorf("unknown modes suggested %q", got)
-	}
 }

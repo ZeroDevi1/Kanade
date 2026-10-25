@@ -20,6 +20,8 @@
         emotion:       是否做情绪识别，默认 true
         transcribe:    是否做多乐器转录（MuScriptor，见 transcribe.py），默认 false；权重为 CC BY-NC 4.0 非商用许可，
                        下载需要 Hugging Face 访问令牌
+        instruments:   转录只在这些乐器组中识别（上游组名，如 ["acoustic_piano", "electric_bass", "drums"]），
+                       默认不限（自动）；用于纠正钢琴被识别成吉他之类的误判
     }
 
 melody 为 {notes: [{start, end, pitch, lyric?, slur?}], source, lyrics?}，没有 melody_input 时为 null。有歌词时
@@ -106,6 +108,7 @@ def run_analyze(job: Job) -> None:
     fold = tuple(o["tempo_range"]) if o.get("tempo_range") else None
     want_emotion = o.get("emotion", True)
     want_transcribe = bool(o.get("transcribe", False))
+    instruments = [str(x) for x in (o.get("instruments") or [])] or None
     slur_model = o.get("slur_model") or "align"
     if slur_model not in ("align", "game"):
         raise ValueError(f"未知的连音方法：{slur_model}")
@@ -179,7 +182,7 @@ def run_analyze(job: Job) -> None:
         mood = emotion.analyze(job, y.mean(axis=1), sr, 0.7, mood_hi)
     parts = None
     if want_transcribe:
-        parts = transcribe.transcribe(job, y.mean(axis=1), sr, beats, downbeats, mood_hi, 0.97)
+        parts = transcribe.transcribe(job, y.mean(axis=1), sr, beats, downbeats, mood_hi, 0.97, instruments)
 
     result = {
         "version": 1,
@@ -197,7 +200,7 @@ def run_analyze(job: Job) -> None:
         "transcription": parts,
         "options": {"beat_method": beat_method, "key_profile": profile, "chord_vocab": vocab,
                     "chord_self_prob": self_prob, "chord_min_beats": min_beats, "slur_model": slur_model,
-                    "transcribe": want_transcribe},
+                    "transcribe": want_transcribe, "instruments": instruments},
     }
     js = out_dir / "analysis.json"
     js.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

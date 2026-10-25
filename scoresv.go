@@ -1,12 +1,15 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"maps"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/egoist/mygo/ui"
@@ -16,8 +19,8 @@ import (
 )
 
 // 导出 Synthesizer V 工程的对话框：选择目标软件（本机装的 SV Studio Flat / SV Studio 2）与歌姬（按分析结果推荐排序，
-// 附推荐理由），编辑该歌姬的预设（音色、演唱模式、移调与表情强度，可保存；没有保存过时自动按歌曲建议演唱模式），
-// 导出时按需从主唱提取表情特征（score.expression）并换算成参数曲线，导出后可直接在目标软件中打开。
+// 附推荐理由），编辑该歌姬的预设（音色、演唱模式、移调与表情强度，可保存），导出后可直接在目标软件中打开。
+// 表情曲线默认不写（实验性，见 docs/roadmap.md 第 3 节）；打开时按需从主唱提取表情特征（score.expression）换算成参数曲线。
 
 // svNoSinger 是「不指定歌姬」的选项：SV 打开工程后由用户选择声库。
 const svNoSinger = "不指定（打开后在 SV 中选择）"
@@ -50,7 +53,20 @@ type svExportState struct {
 	err       string
 	cancel    context.CancelFunc
 	exported  string // 刚导出的文件（提供「在 … 中打开」）；换目标或重新打开对话框时清空
+	// tab 是对话框的页：svTabExport 导出、svTabCompare 渲染对比。
+	tab int
+	// base 是引导式音高的基准渲染（同一工程不写表情曲线时 SV 渲染的人声），空为覆盖式；换记录时清空。
+	base string
+	// render 是要与原唱对比的 SV 渲染，comparison 是上一次的对比结果（对应 compared 这个文件）。
+	render, compared string
+	comparison       *score.RenderComparison
 }
+
+// 对话框的页。
+const (
+	svTabExport = iota
+	svTabCompare
+)
 
 var svLanguageTitles = map[string]string{"mandarin": "普通话", "cantonese": "粤语", "japanese": "日语", "english": "英语",
 	"korean": "韩语", "spanish": "西班牙语"}
@@ -77,6 +93,9 @@ func singerLabel(s score.SVSinger, rank int) string {
 // openSVExport 打开对话框：第一次时检测目标软件并读取预设；按当前记录重新推荐歌姬并选中第一名。
 func (a *app) openSVExport(run *score.Run, name string) {
 	d := &a.score.sv
+	if d.run != run {
+		d.base, d.render, d.compared, d.comparison = "", "", "", nil
+	}
 	d.open, d.run, d.name, d.err, d.status, d.exported = true, run, name, "", "", ""
 	if !d.scanned {
 		d.scanned = true
@@ -134,7 +153,7 @@ func (d *svExportState) presetKey(s *score.SVSinger) string {
 	return d.targets[d.target].Key + ":" + s.Name
 }
 
-// loadSVPreset 把正在编辑的预设换成所选歌姬已保存的预设；没有保存过时用默认预设，并按歌曲建议演唱模式。
+// loadSVPreset 把正在编辑的预设换成所选歌姬已保存的预设；没有保存过时用默认预设（演唱模式沿用声库默认）。
 func (a *app) loadSVPreset() {
 	d := &a.score.sv
 	s, _ := d.selectedSinger()
@@ -142,9 +161,6 @@ func (a *app) loadSVPreset() {
 	p, ok := d.presets[key]
 	if !ok {
 		p = score.DefaultSVPreset()
-		if res := d.run.Snapshot().Result; s != nil && res != nil {
-			p.VocalModes = res.SuggestModes(*s)
-		}
 	}
 	d.preset, d.presetFor, d.transpose = p, key, float64(p.Transpose)
 }
@@ -164,6 +180,7 @@ func (a *app) scoreSVDialog(c *ui.Context, tk *fluent.Tokens) {
 	ui.Modal(c, &d.open, func() {
 		ui.Column(c).Width(620).Gap(12).AlignItems(ui.Stretch).Children(func() {
 			ui.Text(c, "导出 Synthesizer V 工程").FontSize(20).FontWeight(600)
+			ui.Segmented(c, &d.tab, "导出", "渲染对比").Label("页")
 
 			// 目标软件与歌姬（按推荐排序）。
 			if len(d.targets) > 1 {
@@ -192,8 +209,12 @@ func (a *app) scoreSVDialog(c *ui.Context, tk *fluent.Tokens) {
 				}
 			}
 
-			// 音色（整首生效，写入音轨的默认值）。
 			p := &d.preset
+			if d.tab == svTabCompare {
+				a.svCompareTab(c, res, s)
+				return
+			}
+			// 音色（整首生效，写入音轨的默认值）。
 			ui.Text(c, "音色").FontSize(14).FontWeight(600)
 			svSlider(c, "性别", &p.Gender, -1, 1, "%+.2f", "负值偏男声（共振峰下移），正值偏女声")
 			svSlider(c, "音区偏移", &p.ToneShift, -1200, 1200, "%+.0f 音分", "像在更高（正）或更低（负）的音区演唱，音高不变")
@@ -215,18 +236,28 @@ func (a *app) scoreSVDialog(c *ui.Context, tk *fluent.Tokens) {
 			ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 				ui.Text(c, "演唱模式").Width(72)
 				ui.TextInput(c, &p.VocalModes).Label("演唱模式").Grow(1).
-					Placeholder("可选，例如 Clear=60, Belt=20（名称见 SV 中该声库的演唱模式面板，0–150）")
-				if s != nil && len(s.Modes) > 0 && ui.Button(c, "按歌曲建议").Clicked() {
-					p.VocalModes = res.SuggestModes(*s)
-				}
+					Placeholder("留空沿用声库默认；例如 Clear=60, Belt=20（名称见 SV 中该声库的演唱模式面板，0–150）")
 			})
 			if s != nil && len(s.Modes) > 0 {
 				ui.Text(c, "该声库的演唱模式："+strings.Join(s.Modes, "、")).FontSize(12).TextColor(t.TextMuted)
 			}
 
+			ui.Checkbox(c, &p.Breaths, "在乐句前插入换气（br 音素；声库没有 br 时该处不发声）").
+				Tooltip("停顿 0.3 秒以上的乐句前加一个 br 音符，最长 0.45 秒，紧接乐句第一个字。没有换气时 SV 一句接一句唱，容易听起来憋着气。")
+
 			// 表情（从原唱提取）。
-			ui.Text(c, "表情强度（从原唱提取，0 为由 SV 自行生成）").FontSize(14).FontWeight(600)
+			ui.Text(c, "原唱表情（实验性）").FontSize(14).FontWeight(600)
+			ui.Text(c, "这些曲线是声学特征到 SV 参数的经验映射，未按声库标定，实测听感不如不写，默认全部为 0。"+
+				"打开前建议先用「渲染对比」看看差在哪里。").FontSize(12).TextColor(t.Warning)
 			svStrength(c, "音高", &p.PitchStrength, "音高曲线：转音、颤音与滑音跟随原唱")
+			if p.PitchStrength > 0 {
+				a.audioPicker(c, "基准渲染", &d.base, directAudioExts)
+				mode := "未选基准：覆盖式——音符改为手动音高、关闭 SV 的颤音与滑音，整条贴上原唱音高（容易不自然）。"
+				if d.base != "" {
+					mode = "引导式：保留 SV 的 AI 音高，只在与原唱差 40 音分以上的段落补上差值。"
+				}
+				ui.Text(c, mode+"基准渲染是把表情强度全设为 0、其余相同的工程在 SV 中导出的人声。").FontSize(12).TextColor(t.TextMuted)
+			}
 			svStrength(c, "动态", &p.DynamicsStrength, "响度曲线")
 			svStrength(c, "气声", &p.BreathStrength, "由高频噪声与非周期性推测")
 			svStrength(c, "张力", &p.TensionStrength, "由频谱亮度推测")
@@ -239,9 +270,6 @@ func (a *app) scoreSVDialog(c *ui.Context, tk *fluent.Tokens) {
 				}
 				if ui.Button(c, "恢复默认").Disabled(d.busy).Clicked() {
 					d.preset, d.transpose = score.DefaultSVPreset(), 0
-					if s != nil {
-						d.preset.VocalModes = res.SuggestModes(*s)
-					}
 				}
 				ui.Box(c).Grow(1)
 				if ui.Button(c, "取消").Clicked() {
@@ -335,8 +363,11 @@ func (a *app) exportSV(res *score.Analysis, singer *score.SVSinger) {
 		return
 	}
 	p := d.preset
-	o := score.SVExport{Singer: singer, Preset: p}
-	run, name := d.run, d.name
+	o := score.SVExport{Singer: singer, Preset: p, Breaths: p.Breaths}
+	run, name, base := d.run, d.name, d.base
+	if p.PitchStrength == 0 {
+		base = ""
+	}
 	finish := func(o score.SVExport) {
 		data, err := res.SVPExport(name, o)
 		path := filepath.Join(a.be.layout.Scratch, "score.svp")
@@ -371,14 +402,124 @@ func (a *app) exportSV(res *score.Analysis, singer *score.SVSinger) {
 	d.busy, d.err, d.status, d.cancel = true, "", "正在提取主唱表情（首次导出这首歌约需 10 秒）…", cancel
 	go func() {
 		e, err := run.Expression(ctx, a.be.cond)
+		var b *score.Expression
+		if err == nil && base != "" {
+			a.post(func() { d.status = "正在提取基准渲染的音高…" })
+			b, err = score.ExtractExpression(ctx, a.be.cond, base)
+		}
 		a.post(func() {
 			d.cancel = nil
 			if err != nil {
 				d.busy, d.err = false, err.Error()
 				return
 			}
-			o.Expr = e
+			o.Expr, o.Base = e, b
 			finish(o)
+		})
+	}()
+}
+
+// svCompareTab 是「渲染对比」页：选一份 SV 渲染的人声，与原唱逐帧对比音高、响度、频谱倾斜与高频噪声，
+// 按乐句列出差异最大的地方。移调按当前预设换算（渲染须用同一移调导出）。
+func (a *app) svCompareTab(c *ui.Context, res *score.Analysis, singer *score.SVSinger) {
+	t := c.Theme()
+	d := &a.score.sv
+	ui.Text(c, "把 SV 渲染导出的人声（只含这一轨）拖进来，与原唱的主唱分轨对比。用于判断表情参数是否让渲染更接近原唱："+
+		"同一乐句分别导出「不写表情」与「写表情」两版，各对比一次。").FontSize(12).TextColor(t.TextMuted)
+	a.audioPicker(c, "SV 渲染", &d.render, directAudioExts)
+	transpose := d.preset.Transpose
+	if d.preset.AutoTranspose {
+		transpose = 0
+		if singer != nil {
+			transpose = res.SuggestTranspose(*singer)
+		}
+	}
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.Textf(c, "按移调 %+d 个半音换算（与「导出」页当前的设置相同）", transpose).FontSize(12).TextColor(t.TextMuted).Grow(1)
+		if ui.Button(c, "关闭").Clicked() {
+			if d.cancel != nil {
+				d.cancel()
+			}
+			d.open = false
+		}
+		if ui.PrimaryButton(c, "对比").Disabled(d.busy || d.render == "").Clicked() {
+			a.compareRender(res, d.render, transpose)
+		}
+	})
+	switch {
+	case d.busy:
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Spinner(c)
+			ui.Text(c, d.status).FontSize(12).TextColor(t.TextMuted)
+		})
+	case d.err != "":
+		ui.Text(c, d.err).FontSize(12).TextColor(t.Danger).Selectable()
+	}
+	rc := d.comparison
+	if rc == nil || d.compared != d.render {
+		return
+	}
+	if rc.Frames == 0 {
+		ui.Text(c, "渲染与原唱没有同时发声的帧：请确认导出的是这首歌的人声，且从 0 秒开始。").FontSize(12).TextColor(t.Warning)
+		return
+	}
+	row := func(label, value, note string) {
+		ui.Row(c.Key("cmp-" + label)).Gap(12).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, label).Width(72)
+			ui.Text(c, value).Font("monospace").FontSize(12).Width(150)
+			ui.Text(c, note).FontSize(12).TextColor(t.TextMuted).Grow(1)
+		})
+	}
+	row("音高", fmt.Sprintf("中位偏差 %.0f 音分", rc.PitchMedianAbs), fmt.Sprintf("%.0f%% 的帧在 ±50 音分内", rc.PitchWithin50*100))
+	row("响度", fmt.Sprintf("%+.1f dB", rc.LoudnessDiff), fmt.Sprintf("起伏 原唱 %.1f dB / 渲染 %.1f dB，走向相关 %.2f",
+		rc.LoudnessRangeOrig, rc.LoudnessRangeRender, rc.LoudnessCorr))
+	row("亮度", fmt.Sprintf("%+.1f dB", rc.TiltDiff), "1.5–5 kHz 相对低频：正值更亮更紧（张力），负值更闷")
+	row("高频噪声", fmt.Sprintf("%+.1f dB", rc.NoiseDiff), "5–8 kHz：正值气声或沙哑更多")
+	row("发声", fmt.Sprintf("%.0f%% / %.0f%%", rc.VoicedOrig*100, rc.VoicedRender*100), "音符内有声帧：原唱 / 渲染")
+	// 差异最大的乐句：按音高偏差与响度差的绝对值综合排序（100 音分约当 6 dB）。
+	ps := slices.Clone(rc.Phrases)
+	slices.SortStableFunc(ps, func(x, y score.PhraseComparison) int {
+		dx := x.PitchMedianAbs/100 + math.Abs(x.LoudnessDiff)/6
+		dy := y.PitchMedianAbs/100 + math.Abs(y.LoudnessDiff)/6
+		return cmp.Compare(dy, dx)
+	})
+	if len(ps) > 0 {
+		ui.Text(c, "差异最大的乐句").FontSize(14).FontWeight(600)
+	}
+	for _, p := range ps[:min(6, len(ps))] {
+		ui.Row(c.Key(fmt.Sprintf("cmp-ph-%.2f", p.Start))).Gap(12).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, score.Clock(p.Start)).FontSize(12).Font("monospace").TextColor(t.TextMuted).Width(56)
+			ui.Text(c, p.Lyric).FontSize(12).Grow(1).SingleLine()
+			ui.Textf(c, "%.0f 音分 · %+.1f dB · 亮度 %+.1f · 噪声 %+.1f", p.PitchMedianAbs, p.LoudnessDiff, p.TiltDiff, p.NoiseDiff).
+				FontSize(12).Font("monospace").TextColor(t.TextMuted)
+		})
+	}
+}
+
+// compareRender 在后台提取原唱与渲染的特征并对比，结果写入 d.comparison。
+func (a *app) compareRender(res *score.Analysis, render string, transpose int) {
+	d := &a.score.sv
+	if a.be.cond == nil {
+		d.err = "后端未启动，无法提取特征"
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	d.busy, d.err, d.status, d.cancel = true, "", "正在提取原唱与渲染的特征…", cancel
+	run := d.run
+	go func() {
+		orig, err := run.Expression(ctx, a.be.cond)
+		var r *score.Expression
+		if err == nil {
+			r, err = score.ExtractExpression(ctx, a.be.cond, render)
+		}
+		a.post(func() {
+			d.busy, d.cancel = false, nil
+			if err != nil {
+				d.err = err.Error()
+				return
+			}
+			c := res.CompareRender(orig, r, transpose)
+			d.comparison, d.compared = &c, render
 		})
 	}()
 }

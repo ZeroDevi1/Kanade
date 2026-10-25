@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -333,17 +334,18 @@ func TestScoreSVExportDialog(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := &a.score.sv
-	if !d.open || !tt.HasText("表情强度（从原唱提取，0 为由 SV 自行生成）") {
+	if !d.open || !tt.HasText("原唱表情（实验性）") {
 		t.Fatalf("dialog not shown: %q", tt.Texts())
 	}
-	// 用固定的目标与歌姬代替本机检测的结果：普通话、音域合适的排第一并被选中，演唱模式自动按歌曲建议。
+	// 用固定的目标与歌姬代替本机检测的结果：普通话、音域合适的排第一并被选中；演唱模式沿用声库默认（不自动填强度），
+	// 表情强度默认全为 0。
 	fit := score.SVSinger{Name: "Mo Xu", Languages: []string{"mandarin"}, PitchRange: "A#3 - G#4",
 		Modes: []string{"Soft", "Clear", "Power"}, Database: map[string]any{"name": "Mo Xu"}}
 	other := score.SVSinger{Name: "Kevin", Languages: []string{"english"}, PitchRange: "E3 - E4", Database: map[string]any{"name": "Kevin"}}
 	d.targets = []score.SVTarget{{Key: "flat", Title: "Synthesizer V Studio Flat", Singers: []score.SVSinger{other, fit}}}
 	d.target = 0
 	a.recommendSingers()
-	if s, _ := d.selectedSinger(); s == nil || s.Name != "Mo Xu" || d.preset.VocalModes != "Clear=50" {
+	if s, _ := d.selectedSinger(); s == nil || s.Name != "Mo Xu" || d.preset.VocalModes != "" || d.preset.PitchStrength != 0 {
 		t.Fatalf("recommended %+v modes %q options %q", s, d.preset.VocalModes, d.options)
 	}
 	d.preset.Gender = 0.3
@@ -363,7 +365,20 @@ func TestScoreSVExportDialog(t *testing.T) {
 	if d.preset.Gender != 0.3 {
 		t.Errorf("preset not reloaded: %+v", d.preset)
 	}
-	if err := tt.Click("取消"); err != nil || d.open {
+	// 音高强度 > 0 时出现基准渲染；没有基准时提示为覆盖式。
+	d.preset.PitchStrength = 0.5
+	tt.Frame()
+	if !tt.HasText("基准渲染") || !tt.HasText("未选基准：覆盖式——音符改为手动音高、关闭 SV 的颤音与滑音，整条贴上原唱音高（容易不自然）。基准渲染是把表情强度全设为 0、其余相同的工程在 SV 中导出的人声。") {
+		t.Errorf("guided pitch picker: %q", tt.Texts())
+	}
+	// 渲染对比页：没选文件时「对比」不可用。
+	if err := tt.Click("渲染对比"); err != nil || d.tab != svTabCompare || !tt.HasText("SV 渲染") {
+		t.Fatalf("compare tab: %v %q", err, tt.Texts())
+	}
+	if err := tt.Click("对比"); err == nil && d.busy {
+		t.Error("compare started without a file")
+	}
+	if err := tt.Click("关闭"); err != nil || d.open {
 		t.Errorf("cancel: %v open=%v", err, d.open)
 	}
 }
@@ -506,5 +521,98 @@ func TestScoreHistory(t *testing.T) {
 	}
 	if len(a.score.runs) != 0 || len(score.LoadHistory(score.HistoryDir(l))) != 0 {
 		t.Errorf("record not deleted: runs %d", len(a.score.runs))
+	}
+}
+
+// 乐器提示：排除勾选的乐器时其余乐器组都可用；只识别勾选的乐器时就是勾选的那些；自动或没有勾选时不限。
+func TestScoreInstrumentHint(t *testing.T) {
+	s := newScoreState()
+	s.transcribe, s.instrPicked = true, map[string]bool{"acoustic_guitar": true, "distorted_electric_guitar": true}
+	if s.instrumentHint() != nil {
+		t.Error("auto mode should not restrict")
+	}
+	s.instrMode = instrExclude
+	hint := s.instrumentHint()
+	if len(hint) != len(score.InstrumentGroups)-2 || slices.Contains(hint, "acoustic_guitar") || !slices.Contains(hint, "acoustic_piano") {
+		t.Errorf("exclude hint %v", hint)
+	}
+	s.instrMode = instrOnly
+	if got := s.instrumentHint(); !slices.Equal(got, []string{"acoustic_guitar", "distorted_electric_guitar"}) {
+		t.Errorf("only hint %v", got)
+	}
+	r := score.Request{Input: "/x.flac", Options: score.DefaultOptions()}
+	r.Options.Transcribe, r.Options.Instruments = true, s.instrumentHint()
+	p, err := r.Params("", "")
+	if err != nil || !slices.Equal(p["options"].(map[string]any)["instruments"].([]string), r.Options.Instruments) {
+		t.Errorf("params %v %v", p, err)
+	}
+	r.Options.Instruments = []string{"kazoo"}
+	if _, err := r.Params("", ""); err == nil {
+		t.Error("unknown instrument accepted")
+	}
+	s.instrPicked = map[string]bool{}
+	if s.instrumentHint() != nil {
+		t.Error("nothing picked should not restrict")
+	}
+}
+
+// 改乐器：把识别成原声吉他的音轨改为钢琴后与已有的钢琴轨合并，analysis.json 随之更新；鼓轨没有这个菜单，
+// 鼓与有音高的乐器不能互改。
+func TestScoreRelabelInstrument(t *testing.T) {
+	dir := t.TempDir()
+	wav, js := filepath.Join(dir, "audio.wav"), filepath.Join(dir, "analysis.json")
+	writeTestWav(t, wav, 8000, 16000)
+	os.WriteFile(js, []byte(`{"duration": 2, "beats": [0,0.5,1,1.5], "downbeats": [0],
+		"key": {"label": "C 大调", "tonic_pc": 0, "mode": "major"},
+		"chords": [{"start":0,"end":2,"label":"C","root":0,"quality":"maj"}],
+		"transcription": {"model": "muscriptor-medium", "onset_delay": 0, "instruments": [
+			{"name": "acoustic_guitar", "program": 24, "drum": false, "notes": [{"start":0,"end":0.5,"pitch":60},{"start":1,"end":1.5,"pitch":64}]},
+			{"name": "acoustic_piano", "program": 0, "drum": false, "notes": [{"start":0.5,"end":1,"pitch":62}]},
+			{"name": "drums", "program": -1, "drum": true, "notes": [{"start":0,"end":0.05,"pitch":36}]}]}}`), 0o644)
+	l := paths.New(t.TempDir())
+	cond, _ := conductor.New(l, engines.FS, nil)
+	a := newApp()
+	a.be, a.current = backend{layout: l, cond: cond}, "score"
+	a.post = func(fn func()) {}
+	run, _ := score.Start(artifactJobs{[]string{wav, js}}, score.Request{Input: "/x/歌.flac", Options: score.DefaultOptions()}, nil)
+	for run.Snapshot().Running() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	a.score.runs = []*score.Run{run}
+	tt := ui.NewTester(a.view, 1200, 4000)
+	if !tt.HasText("原声吉他") {
+		t.Fatalf("texts %q", tt.Texts())
+	}
+	if _, ok := tt.Find("把鼓改为其他乐器"); ok {
+		t.Error("drum track should not offer relabeling")
+	}
+	if err := tt.Click("把原声吉他改为其他乐器"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tt.ChooseMenuItem("原声钢琴"); err != nil {
+		t.Fatalf("%v; menu %q", err, tt.Menu())
+	}
+	tt.Frame()
+	tr := run.Snapshot().Result.Transcription
+	if len(tr.Instruments) != 2 || tr.Instruments[0].Name != "acoustic_piano" || len(tr.Instruments[0].Notes) != 3 ||
+		tr.Instruments[0].Notes[1].Pitch != 62 {
+		t.Fatalf("instruments %+v", tr.Instruments)
+	}
+	if tt.HasText("原声吉他") || len(a.score.sheet.tracks) != score.TrackInstruments+2 {
+		t.Errorf("tracks not rebuilt: %q", tt.Texts())
+	}
+	saved, err := score.ReadAnalysis(js)
+	if err != nil || len(saved.Transcription.Instruments) != 2 || saved.Key.Label != "C 大调" {
+		t.Errorf("saved %+v %v", saved, err)
+	}
+	// 改成没有的乐器：改名并换成该组的代表音色。
+	if err := run.RelabelInstrument("acoustic_piano", "electric_piano"); err != nil {
+		t.Fatal(err)
+	}
+	if in := run.Snapshot().Result.Transcription.Instruments[0]; in.Name != "electric_piano" || in.Program != 2 {
+		t.Errorf("renamed %+v", in)
+	}
+	if err := run.RelabelInstrument("drums", "acoustic_piano"); err == nil {
+		t.Error("drums relabeled to a pitched instrument")
 	}
 }

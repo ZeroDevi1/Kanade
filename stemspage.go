@@ -42,8 +42,8 @@ func (a *app) stemsPage(c *ui.Context, tk *fluent.Tokens) {
 		return
 	}
 	a.stemsModelsCard(c, tk)
-	a.stemsRunCard(c, tk)
-	card(c, tk, "结果", func() { a.stemsResults(c, tk) })
+	cardRow(c, cardMinWidth, func() ui.Element { return a.stemsRunCard(c, tk) },
+		func() ui.Element { return card(c, tk, "结果", func() { a.stemsResults(c, tk) }) })
 }
 
 // stemsModelsCard 选择各步骤的模型并显示下载状态。默认与 VoiceLab 一致，「评估推荐」一键切换到评估最优组合。
@@ -116,10 +116,10 @@ func (a *app) stemsModelsCard(c *ui.Context, tk *fluent.Tokens) {
 }
 
 // stemsRunCard 选择输入与步骤并提交任务。
-func (a *app) stemsRunCard(c *ui.Context, tk *fluent.Tokens) {
+func (a *app) stemsRunCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
 	t := c.Theme()
 	s := &a.stems
-	card(c, tk, "处理", func() {
+	return card(c, tk, "处理", func() {
 		a.audioPicker(c, "输入音频", &s.input, anyAudioExts())
 		ui.Text(c, "步骤（勾选后会自动补上前置步骤）").FontSize(12).TextColor(t.TextMuted)
 		ui.Row(c).Gap(16).Children(func() {

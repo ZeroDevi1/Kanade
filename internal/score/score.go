@@ -36,7 +36,38 @@ type Options struct {
 	SlurModel string
 	// Transcribe 为 true 时用 MuScriptor 对原曲做多乐器转录（权重为 CC BY-NC 4.0 非商用许可，下载需要 HF 令牌）。
 	Transcribe bool
+	// Instruments 非空时转录只在这些乐器组（InstrumentGroups 的 Key）中识别：作为条件输入模型，其余乐器的事件在解码时
+	// 被屏蔽（上游 transcribe 的 instruments 参数）。用于纠正音色相近的误判，例如钢琴伴奏被识别成吉他。
+	Instruments []string
 }
+
+// InstrumentGroup 是 MuScriptor 的一个乐器组：Program 是它的代表 GM 音色（上游 MT3_FULL_PLUS 分组中的第一个音色，
+// 与上游写 MIDI 时相同），鼓为 -1。
+type InstrumentGroup struct {
+	Key, Title string
+	Program    int
+}
+
+// InstrumentGroups 是 MuScriptor 的全部乐器组（上游 MT3_FULL_PLUS_GROUP_NAMES 与 get_group_program_map，顺序同上游）。
+var InstrumentGroups = func() []InstrumentGroup {
+	groups := []struct {
+		key     string
+		program int
+	}{
+		{"acoustic_piano", 0}, {"electric_piano", 2}, {"chromatic_percussion", 8}, {"organ", 16}, {"acoustic_guitar", 24},
+		{"clean_electric_guitar", 26}, {"distorted_electric_guitar", 29}, {"acoustic_bass", 32}, {"electric_bass", 33},
+		{"violin", 40}, {"viola", 41}, {"cello", 42}, {"contrabass", 43}, {"orchestral_harp", 46}, {"timpani", 47},
+		{"string_ensemble", 48}, {"synth_strings", 50}, {"voice", 52}, {"orchestra_hit", 55}, {"trumpet", 56},
+		{"trombone", 57}, {"tuba", 58}, {"french_horn", 60}, {"brass_section", 61}, {"soprano_and_alto_sax", 64},
+		{"tenor_sax", 66}, {"baritone_sax", 67}, {"oboe", 68}, {"english_horn", 69}, {"bassoon", 70}, {"clarinet", 71},
+		{"flutes", 72}, {"synth_lead", 80}, {"synth_pad", 88}, {"drums", -1},
+	}
+	out := make([]InstrumentGroup, len(groups))
+	for i, g := range groups {
+		out[i] = InstrumentGroup{g.key, instrumentTitles[g.key], g.program}
+	}
+	return out
+}()
 
 // 可选值，与引擎一致。Title 用于界面。
 var (
@@ -69,6 +100,14 @@ func (o Options) params() (map[string]any, error) {
 		return nil, errors.New("最短和弦与分段长度不能为负")
 	}
 	p := map[string]any{"emotion": o.Emotion, "key_segment_s": o.KeySegmentS, "transcribe": o.Transcribe}
+	if o.Transcribe && len(o.Instruments) > 0 {
+		for _, k := range o.Instruments {
+			if _, ok := instrumentTitles[k]; !ok {
+				return nil, fmt.Errorf("未知的乐器组 %q", k)
+			}
+		}
+		p["instruments"] = o.Instruments
+	}
 	for k, v := range map[string]string{"beat_method": o.BeatMethod, "key_profile": o.KeyProfile, "chord_vocab": o.ChordVocab,
 		"slur_model": o.SlurModel} {
 		if v != "" {
@@ -440,6 +479,8 @@ type Transcription struct {
 	// OnsetDelay 是已从全部音符中扣除的整体起音延迟（秒），0 为未校正。
 	OnsetDelay  float64      `json:"onset_delay"`
 	Instruments []Instrument `json:"instruments"` // 按音符数从多到少
+	// Hint 是分析时给的乐器提示（Options.Instruments），为空时是自动识别。
+	Hint []string `json:"hint,omitempty"`
 }
 
 // Instrument 是一种乐器（上游的乐器组）的音符。
@@ -471,11 +512,14 @@ var instrumentTitles = map[string]string{
 }
 
 // Title 返回乐器的中文名；没有译名时返回原名。
-func (i Instrument) Title() string {
-	if t, ok := instrumentTitles[i.Name]; ok {
+func (i Instrument) Title() string { return InstrumentTitle(i.Name) }
+
+// InstrumentTitle 返回乐器组 name 的中文名；没有译名时返回原名。
+func InstrumentTitle(name string) string {
+	if t, ok := instrumentTitles[name]; ok {
 		return t
 	}
-	return i.Name
+	return name
 }
 
 // TrackName 返回 MIDI 轨道名：上游组名换成首字母大写的英文词，如 electric_bass → Electric Bass。

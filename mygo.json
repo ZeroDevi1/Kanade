@@ -2,5 +2,10 @@
   "name": "Kanade",
   "identifier": "dev.zerodevi1.kanade",
   "version": "0.1.0",
-  "out": "build"
+  "out": "build",
+  "macos": {
+    "infoPlist": {
+      "NSMicrophoneUsageDescription": "K 歌跟唱时录下你的演唱，用于实时显示音高并评价音准与气息；录音只保存在本机。"
+    }
+  }
 }

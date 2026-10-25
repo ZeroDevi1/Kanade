@@ -295,7 +295,16 @@ func (a *app) jobStatus(c *ui.Context, id string) (conductor.Job, bool) {
 
 func (a *app) timbreConvert(c *ui.Context, tk *fluent.Tokens) {
 	s := &a.timbre
-	card(c, tk, "转换", func() {
+	cardRow(c, cardMinWidth, func() ui.Element { return a.timbreConvertCard(c, tk) },
+		func() ui.Element {
+			return card(c, tk, "结果", func() { s.convertOut.show(c, tk, a, "转换结果会显示在这里。") })
+		})
+}
+
+// timbreConvertCard 是转换表单：模型、输入人声与参数，提交 timbre.infer 并把完成的结果加入结果列表。
+func (a *app) timbreConvertCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
+	s := &a.timbre
+	return card(c, tk, "转换", func() {
 		if !a.timbreModelSelect(c) {
 			return
 		}
@@ -317,7 +326,6 @@ func (a *app) timbreConvert(c *ui.Context, tk *fluent.Tokens) {
 			s.convertOut.add(a, j.Artifacts[0], in+" → "+m.Name, fmt.Sprintf("%s_%s", in, m.Name), true)
 		}
 	})
-	card(c, tk, "结果", func() { s.convertOut.show(c, tk, a, "转换结果会显示在这里。") })
 }
 
 // jobStatusPeek 返回任务快照与是否进行中，不构建界面。
@@ -368,53 +376,57 @@ func (a *app) timbreCover(c *ui.Context, tk *fluent.Tokens) {
 	if s.cover != nil {
 		st = s.cover.Snapshot()
 	}
-	card(c, tk, "一键翻唱", func() {
-		ui.Text(c, "整首歌：分轨净化 → 主唱与和声转换音色 → 对齐原曲响度、加混响后与伴奏混音。纯干声：跳过分轨，直接转换并混音。").
-			FontSize(12).TextColor(t.TextMuted)
-		if !a.timbreModelSelect(c) {
-			return
-		}
-		ui.Segmented(c, &s.coverSource, "整首歌（自动分轨）", "纯干声").Label("输入类型")
-		if timbre.CoverSource(s.coverSource) == timbre.SourceSong {
-			a.audioPicker(c, "歌曲", &s.song, anyAudioExts())
-		} else {
-			a.audioPicker(c, "主唱干声", &s.vocal, directAudioExts)
-			a.audioPicker(c, "伴奏（可选）", &s.inst, directAudioExts)
-			a.audioPicker(c, "和声（可选）", &s.harmonyFile, directAudioExts)
-		}
-		a.timbreParams(c, true)
-		a.coverMixParams(c)
-		if timbre.CoverSource(s.coverSource) == timbre.SourceSong {
-			if files, mb := stems.Missing(a.be.layout, []string{"other", "dry"}, a.coverStemModels()); len(files) > 0 {
-				ui.Textf(c, "首次运行会下载 %d 个分轨模型（约 %.1f GB）。", len(files), float64(mb)/1000).FontSize(12).TextColor(t.TextMuted)
+	// 结果卡片在表单之后构建：表单在本帧开始翻唱时更新 st。
+	cardRow(c, cardMinWidth, func() ui.Element {
+		return card(c, tk, "一键翻唱", func() {
+			ui.Text(c, "整首歌：分轨净化 → 主唱与和声转换音色 → 对齐原曲响度、加混响后与伴奏混音。纯干声：跳过分轨，直接转换并混音。").
+				FontSize(12).TextColor(t.TextMuted)
+			if !a.timbreModelSelect(c) {
+				return
 			}
-		}
-		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			if ui.PrimaryButton(c, "开始翻唱").Disabled(s.cover != nil && st.Running()).Clicked() {
-				r := a.coverRequest()
-				cv, err := timbre.StartCover(a.be.cond, r, func() { a.post(func() {}) })
-				if err == nil {
-					src := r.Song
-					if r.Source == timbre.SourceDry {
-						src = r.Vocal
-					}
-					s.cover, s.coverName = cv, strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
-					st = cv.Snapshot()
+			ui.Segmented(c, &s.coverSource, "整首歌（自动分轨）", "纯干声").Label("输入类型")
+			if timbre.CoverSource(s.coverSource) == timbre.SourceSong {
+				a.audioPicker(c, "歌曲", &s.song, anyAudioExts())
+			} else {
+				a.audioPicker(c, "主唱干声", &s.vocal, directAudioExts)
+				a.audioPicker(c, "伴奏（可选）", &s.inst, directAudioExts)
+				a.audioPicker(c, "和声（可选）", &s.harmonyFile, directAudioExts)
+			}
+			a.timbreParams(c, true)
+			a.coverMixParams(c)
+			if timbre.CoverSource(s.coverSource) == timbre.SourceSong {
+				if files, mb := stems.Missing(a.be.layout, []string{"other", "dry"}, a.coverStemModels()); len(files) > 0 {
+					ui.Textf(c, "首次运行会下载 %d 个分轨模型（约 %.1f GB）。", len(files), float64(mb)/1000).FontSize(12).TextColor(t.TextMuted)
 				}
-				s.err = errText(err)
+			}
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				if ui.PrimaryButton(c, "开始翻唱").Disabled(s.cover != nil && st.Running()).Clicked() {
+					r := a.coverRequest()
+					cv, err := timbre.StartCover(a.be.cond, r, func() { a.post(func() {}) })
+					if err == nil {
+						src := r.Song
+						if r.Source == timbre.SourceDry {
+							src = r.Vocal
+						}
+						s.cover, s.coverName = cv, strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
+						st = cv.Snapshot()
+					}
+					s.err = errText(err)
+				}
+			})
+			if s.cover == nil {
+				return
+			}
+			a.coverStages(c, st)
+		})
+	}, func() ui.Element {
+		return card(c, tk, "结果", func() {
+			a.registerCoverOutputs(st)
+			s.coverOut.show(c, tk, a, "翻唱成品会显示在这里。")
+			if rep := st.Report; rep != nil {
+				coverReport(c, rep)
 			}
 		})
-		if s.cover == nil {
-			return
-		}
-		a.coverStages(c, st)
-	})
-	card(c, tk, "结果", func() {
-		a.registerCoverOutputs(st)
-		s.coverOut.show(c, tk, a, "翻唱成品会显示在这里。")
-		if rep := st.Report; rep != nil {
-			coverReport(c, rep)
-		}
 	})
 }
 
@@ -670,9 +682,15 @@ func (a *app) pickFile(title string, filter mygo.FileFilter, fn func(path string
 }
 
 func (a *app) timbreModels(c *ui.Context, tk *fluent.Tokens) {
+	cardRow(c, cardMinWidth, func() ui.Element { return a.timbreModelList(c, tk) },
+		func() ui.Element { return a.timbreImportCard(c, tk) })
+}
+
+// timbreModelList 列出已有的 RVC 模型，可删除。
+func (a *app) timbreModelList(c *ui.Context, tk *fluent.Tokens) ui.Element {
 	t := c.Theme()
 	s := &a.timbre
-	card(c, tk, fmt.Sprintf("模型（%d）", len(s.models)), func() {
+	return card(c, tk, fmt.Sprintf("模型（%d）", len(s.models)), func() {
 		if ui.Button(c, "刷新").AlignSelf(ui.Start).Clicked() {
 			s.modelsStale = true
 		}
@@ -712,7 +730,13 @@ func (a *app) timbreModels(c *ui.Context, tk *fluent.Tokens) {
 			})
 		}
 	})
-	card(c, tk, "导入模型", func() {
+}
+
+// timbreImportCard 导入外部训练的 RVC v2 模型（.pth 与可选的 .index）。
+func (a *app) timbreImportCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
+	t := c.Theme()
+	s := &a.timbre
+	return card(c, tk, "导入模型", func() {
 		ui.Text(c, "导入 RVC v2 模型（.pth，可附带 .index），例如 VoiceLab 或 RVC WebUI 训练的模型。").FontSize(12).TextColor(t.TextMuted)
 		ui.Field(c, "模型名", func() { ui.TextInput(c, &s.importName).Width(240) })
 		filePicker := func(label string, path *string, ext string) {

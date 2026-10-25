@@ -134,10 +134,10 @@ func (a *app) cantusPage(c *ui.Context, tk *fluent.Tokens) {
 		}
 	}
 	a.cantusModelCard(c, tk)
-	a.cantusInputCard(c, tk)
-	card(c, tk, "结果", func() { a.cantusResults(c, tk) })
-	a.cantusSpeakersCard(c, tk)
-	a.cantusSFTCard(c, tk)
+	cardRow(c, cardMinWidth, func() ui.Element { return a.cantusInputCard(c, tk) },
+		func() ui.Element { return card(c, tk, "结果", func() { a.cantusResults(c, tk) }) })
+	cardRow(c, cardMinWidth, func() ui.Element { return a.cantusSpeakersCard(c, tk) },
+		func() ui.Element { return a.cantusSFTCard(c, tk) })
 }
 
 // cantusModelCard 选择模型并管理下载。
@@ -216,10 +216,10 @@ func (a *app) downloadModel(m cantus.Model) {
 }
 
 // cantusInputCard 显示当前模型支持的模式与对应输入，并提交合成任务。
-func (a *app) cantusInputCard(c *ui.Context, tk *fluent.Tokens) {
+func (a *app) cantusInputCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
 	s := &a.cantus
 	m := s.model()
-	card(c, tk, "合成", func() {
+	return card(c, tk, "合成", func() {
 		modeSwitch(c, "synth-mode", &s.synthMode, "只需选音色、填文本；按是否有参考文本与风格自动选择克隆方式。")
 		if s.synthMode == modeSmart {
 			a.cantusSmartInput(c, tk, m)
@@ -597,10 +597,10 @@ func (a *app) cantusResults(c *ui.Context, tk *fluent.Tokens) {
 }
 
 // cantusSpeakersCard 列出已保存音色，可删除。
-func (a *app) cantusSpeakersCard(c *ui.Context, tk *fluent.Tokens) {
+func (a *app) cantusSpeakersCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
 	t := c.Theme()
 	s := &a.cantus
-	card(c, tk, fmt.Sprintf("音色库（%d）", len(s.speakers)), func() {
+	return card(c, tk, fmt.Sprintf("音色库（%d）", len(s.speakers)), func() {
 		if len(s.speakers) == 0 {
 			ui.Text(c, "选择参考音频后可「保存为音色」，之后在任意模型中直接选用。").TextColor(t.TextMuted)
 			return
@@ -637,10 +637,10 @@ func (a *app) cantusSpeakersCard(c *ui.Context, tk *fluent.Tokens) {
 // cantusSFTCard 是 CosyVoice 3 说话人微调：准备数据（文本取自 .list，缺失时可用 Whisper 转写）→ 训练 → 组装模型。
 // 训练需要 NVIDIA CUDA；微调出的模型以「<音色名>（微调音色）」出现在模型列表，使用预训练音色模式。
 // 智能模式一键完成两步：准备任务成功后自动提交训练。
-func (a *app) cantusSFTCard(c *ui.Context, tk *fluent.Tokens) {
+func (a *app) cantusSFTCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
 	t := c.Theme()
 	s := &a.cantus
-	card(c, tk, "说话人微调（SFT）", func() {
+	return card(c, tk, "说话人微调（SFT）", func() {
 		ui.Text(c, "用几百条带文本的干净人声，把一个说话人微调进 Fun-CosyVoice 3。数据集目录中的同名 .list 提供文本；"+
 			"训练需要 NVIDIA CUDA（数据准备可在本机完成）。").FontSize(12).TextColor(t.TextMuted)
 		modeSwitch(c, "sft-mode", &s.sftMode, "缺文本时用 Whisper medium 转写，只训 LLM，训练层数按显存自动选择。")

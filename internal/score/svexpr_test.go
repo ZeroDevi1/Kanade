@@ -37,6 +37,13 @@ func syntheticExpression(a *Analysis, cents float64, octave bool) *Expression {
 	return e
 }
 
+// exprPreset 是打开全部表情曲线的预设（默认预设不写表情，见 DefaultSVPreset）。
+func exprPreset() SVPreset {
+	p := DefaultSVPreset()
+	p.PitchStrength, p.DynamicsStrength, p.BreathStrength, p.TensionStrength, p.VoicingStrength = 1, 0.7, 0.3, 0.25, 0.3
+	return p
+}
+
 // curvePoints 把 SV 曲线拆成（位置, 值）对。
 func curvePoints(t *testing.T, c svpCurve) (pos, val []float64) {
 	t.Helper()
@@ -58,7 +65,7 @@ func TestExpressionCurves(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := DefaultSVPreset()
+	p := exprPreset()
 	for _, octave := range []bool{false, true} {
 		curves := expressionCurves(notes, tm, syntheticExpression(a, 30, octave), p)
 		for _, k := range []string{"pitchDelta", "loudness", "breathiness", "tension", "voicing"} {
@@ -119,7 +126,7 @@ func TestSVPExport(t *testing.T) {
 	a := vocalSample()
 	singer := &SVSinger{Name: "Mo Xu", PitchRange: "A#3 - G#4",
 		Database: map[string]any{"name": "Mo Xu", "language": "mandarin", "backendType": "SVR3", "version": "201"}}
-	preset := DefaultSVPreset()
+	preset := exprPreset()
 	preset.AutoTranspose, preset.Transpose = false, 2
 	preset.Gender, preset.VocalModes = 0.25, "Clear=60, Belt=20"
 	data, err := a.SVPExport("秋天", SVExport{Singer: singer, Preset: preset, Expr: syntheticExpression(a, 30, false)})

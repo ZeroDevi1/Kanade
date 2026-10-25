@@ -76,6 +76,21 @@ func (m *midiTimeMap) tick(sec float64) int {
 	return max(0, int(math.Round(t)))
 }
 
+// seconds 是 tick 的逆换算：tick 对应的时间（秒），超出末端时按最后一段的速度外推。
+func (m *midiTimeMap) seconds(tick int) float64 {
+	a := m.anchors
+	t := float64(tick)
+	i := sort.Search(len(a), func(i int) bool { return a[i].tick > t })
+	switch {
+	case i == 0:
+		return a[0].sec
+	case i >= len(a):
+		i = len(a) - 1
+	}
+	p, q := a[i-1], a[i]
+	return p.sec + (t-p.tick)/(q.tick-p.tick)*(q.sec-p.sec)
+}
+
 // newMidiTimeMap 由拍点与小节线建立速度图；end 是需要覆盖到的最晚时间（秒）。
 func (a *Analysis) newMidiTimeMap(end float64) *midiTimeMap {
 	bpb := a.Meter.BeatsPerBar

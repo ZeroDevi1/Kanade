@@ -31,6 +31,8 @@ type SVPreset struct {
 	// AutoTranspose 为 true 时按歌姬音域以八度移调（SuggestTranspose），否则用 Transpose（半音）。
 	AutoTranspose bool `json:"autoTranspose"`
 	Transpose     int  `json:"transpose"`
+	// Breaths 为 true 时在乐句前插入 br 换气音符（SVExport.Breaths）；需要声库有 br 音素，默认关闭。
+	Breaths bool `json:"breaths"`
 	// 表情强度（0–1）：从原唱提取的曲线乘以强度后写入，0 为不写该曲线（Synthesizer V 自行生成）。
 	PitchStrength    float64 `json:"pitchStrength"`
 	DynamicsStrength float64 `json:"dynamicsStrength"`
@@ -39,12 +41,11 @@ type SVPreset struct {
 	VoicingStrength  float64 `json:"voicingStrength"`
 }
 
-// DefaultSVPreset 是没有保存过预设的歌姬所用的设置：音色不变，自动移调；音高完全跟随原唱，
-// 动态大部分跟随，气声、张力、发声只轻度跟随（这三者是声学特征的推测，强度过高容易失真：Weina 的渲染实测
-// 高频噪声本就比原唱高约 9 dB，气声再往上推会发沙；张力与偏紧的演唱模式叠加会显得用力）。
+// DefaultSVPreset 是没有保存过预设的歌姬所用的设置：音色不变，自动移调，不写任何表情曲线（音高、动态等全部由 SV
+// 自行生成）。原唱表情曲线是未标定的经验映射，《我不想念》用 Weina 渲染的两版（音高覆盖 + 动态 / 气声 / 张力）听起来
+// 都像憋着唱、不如不写（2026-10-24 实测，见 docs/roadmap.md 第 3 节），因此表情强度只作为实验选项由用户手动打开。
 func DefaultSVPreset() SVPreset {
-	return SVPreset{AutoTranspose: true, PitchStrength: 1, DynamicsStrength: 0.7, BreathStrength: 0.3,
-		TensionStrength: 0.25, VoicingStrength: 0.3}
+	return SVPreset{AutoTranspose: true}
 }
 
 // Modes 解析 VocalModes：名称到强度（0–150）。格式错误的项返回错误。

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -209,7 +210,11 @@ func (a *app) scoreRollCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysi
 		ui.Column(c).Gap(2).AlignItems(ui.Stretch).Children(func() {
 			for i, tr := range s.tracks {
 				ui.Row(c.Key(fmt.Sprintf("roll-%d", i))).Gap(8).Height(r.laneHeight()).AlignItems(ui.Stretch).Children(func() {
-					if a.rollHeader(c, tk, i, tr, available[i], audible[i]) {
+					var inst *score.Instrument
+					if k := i - score.TrackInstruments; k >= 0 && res.Transcription != nil && k < len(res.Transcription.Instruments) {
+						inst = &res.Transcription.Instruments[k]
+					}
+					if a.rollHeader(c, tk, i, tr, inst, available[i], audible[i]) {
 						changed = true
 					}
 					a.rollLane(c, tk, res, i, tr, audible[i], v0, v1, seek)
@@ -233,8 +238,9 @@ func (a *app) scoreRollCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysi
 	return el
 }
 
-// rollHeader 是一条音轨左侧的栏：色块、名称与音符概况、静音 / 独奏与音量。返回混音设置是否被改动。
-func (a *app) rollHeader(c *ui.Context, tk *fluent.Tokens, i int, tr score.Track, available, audible bool) (changed bool) {
+// rollHeader 是一条音轨左侧的栏：色块、名称与音符概况、静音 / 独奏与音量；inst 非 nil 时（转录出的乐器音轨）另有
+// 「改为其他乐器」的菜单。返回混音设置是否被改动。
+func (a *app) rollHeader(c *ui.Context, tk *fluent.Tokens, i int, tr score.Track, inst *score.Instrument, available, audible bool) (changed bool) {
 	t := c.Theme()
 	s := &a.score.sheet
 	ui.Row(c).Width(rollHeaderWidth).Shrink(0).Gap(8).AlignItems(ui.Center).Padding(0, 8, 0, 0).Children(func() {
@@ -253,6 +259,9 @@ func (a *app) rollHeader(c *ui.Context, tk *fluent.Tokens, i int, tr score.Track
 					name.TextColor(t.TextMuted)
 				}
 				ui.Text(c, rollSummary(tr)).FontSize(11).Font("monospace").TextColor(t.TextMuted).SingleLine().Grow(1)
+				if inst != nil {
+					a.relabelButton(c, tk, *inst)
+				}
 				zoom := ui.ButtonBase(c.Key("zoom-"+tr.Title)).Size(22, 20).Radius(fluent.ControlRadius).Center().
 					Label("放大查看" + tr.Title).Tooltip("放大查看（也可双击卷帘）")
 				if zoom.Hovered() {
@@ -440,4 +449,57 @@ func rollTick(c *ui.Context, pv *audioPreview) {
 	if p := pv.player; p != nil && p.Playing() {
 		c.After(100 * time.Millisecond)
 	}
+}
+
+// relabelButton 是乐器音轨的「改为…」菜单：常用乐器组直接列出，其余在「其他乐器」子菜单中；改成已有的乐器时合并。
+// 鼓只能与鼓互改，所以鼓轨没有这个菜单。
+func (a *app) relabelButton(c *ui.Context, tk *fluent.Tokens, inst score.Instrument) {
+	if inst.Drum {
+		return
+	}
+	b := ui.ButtonBase(c.Key("relabel-"+inst.Name)).Size(22, 20).Radius(fluent.ControlRadius).Center().
+		Label("把" + inst.Title() + "改为其他乐器").Tooltip("识别错了乐器？改为其他乐器（改成已有的乐器时合并）")
+	if b.Hovered() {
+		b.Background(tk.SubtleHover)
+	}
+	b.Children(func() { ui.Icon(c, iconSwap).Size(12, 12) })
+	item := func(m *ui.Menu, g score.InstrumentGroup) {
+		if g.Key == "drums" {
+			return
+		}
+		if m.Item(g.Title).Checked(g.Key == inst.Name).Disabled(g.Key == inst.Name).Chosen() {
+			a.relabelInstrument(inst.Name, g.Key)
+		}
+	}
+	b.Menu(func(m *ui.Menu) {
+		var rest []score.InstrumentGroup
+		for _, g := range score.InstrumentGroups {
+			if slices.Contains(instrCommon, g.Key) {
+				item(m, g)
+			} else {
+				rest = append(rest, g)
+			}
+		}
+		m.Separator()
+		m.Submenu("其他乐器", func(m *ui.Menu) {
+			for _, g := range rest {
+				item(m, g)
+			}
+		})
+	})
+}
+
+// relabelInstrument 把当前记录转录中的乐器 from 改为 to，并按新的音轨重新开始混音（各音轨的静音、独奏与音量恢复默认）。
+func (a *app) relabelInstrument(from, to string) {
+	s := &a.score
+	if len(s.runs) == 0 {
+		return
+	}
+	if err := s.runs[s.shown].RelabelInstrument(from, to); err != nil {
+		s.err = err.Error()
+		return
+	}
+	// 菜单的选择在本帧构建中途回调，本帧其余部分仍按旧音轨构建：混音设置保持旧音轨数，下一帧 useTracks 按新音轨调整。
+	s.err = ""
+	s.sheet.mix = score.NewTrackMix(len(s.sheet.tracks))
 }

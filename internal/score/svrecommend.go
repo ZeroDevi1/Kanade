@@ -7,7 +7,8 @@ import (
 	"strings"
 )
 
-// 按分析结果给歌姬打分推荐，并为所选歌姬建议演唱模式。打分是可解释的经验规则，每一项都给出理由：
+// 按分析结果给歌姬打分推荐。打分是可解释的经验规则，每一项都给出理由（演唱模式只用于理由与排序，不再自动填强度：
+// 同名模式在不同声库上效果差异很大，强度没有依据，见 docs/roadmap.md 第 3 节）：
 //   - 语言（歌词按普通话写）：普通话母语 +3；能跨语种唱普通话 +1.5；不支持 −4。
 //   - 音域：在 0、±12、±24 半音的移调中，取「落在歌姬推荐音域（两端各放宽 2 个半音）内的旋律音占比 × 4
 //     − 每移一个八度 0.8」最高的；推荐音域未知时不加分，理由注明。
@@ -156,34 +157,4 @@ func genreFits(genres []string, mood string) bool {
 		}
 	}
 	return false
-}
-
-// SuggestModes 按歌曲情绪为歌姬建议演唱模式（VocalModes 的格式），以中性为主、倾向为辅：
-//   - 声库有中性模式（Clear、Lucid 等）时取第一个，强度 50，作为基底；
-//   - 再取与歌曲最匹配的非中性模式，只在匹配度明显（≥ 0.6，即情绪明显偏向一侧）时加上，强度 20–45。
-//
-// 最初按匹配度给到 30–100 时，唤醒度 0.63 的歌给 Weina 选了 Firm=74（偏紧的发声），渲染听起来像憋着唱
-// （2026-10-24 实测），因此倾向模式只轻度叠加。没有可用的模式时返回空串（沿用声库默认）。
-func (a *Analysis) SuggestModes(s SVSinger) string {
-	mood := a.songMood()
-	var parts []string
-	for _, m := range s.Modes {
-		if moodTraits[strings.ToLower(m)] == "neutral" {
-			parts = append(parts, m+"=50")
-			break
-		}
-	}
-	best, bestFit := "", -1.0
-	for _, m := range s.Modes {
-		if moodTraits[strings.ToLower(m)] == "neutral" {
-			continue
-		}
-		if f := modeFit(m, mood); f > bestFit {
-			best, bestFit = m, f
-		}
-	}
-	if bestFit >= 0.6 {
-		parts = append(parts, fmt.Sprintf("%s=%.0f", best, 20+50*(bestFit-0.5)))
-	}
-	return strings.Join(parts, ", ")
 }

@@ -58,6 +58,17 @@ func (r *Run) MelodyStem() string {
 	return findStems(filepath.Dir(dir), r.Request).melody
 }
 
+// AccompanimentStem 返回该记录分离出的伴奏（K 歌时播放）；找不到的情形同 MelodyStem，此时返回空串。
+func (r *Run) AccompanimentStem() string {
+	r.mu.Lock()
+	dir := r.dir
+	r.mu.Unlock()
+	if dir == "" || !r.Request.Separate {
+		return ""
+	}
+	return findStems(filepath.Dir(dir), r.Request).harmonic
+}
+
 // Expression 返回该记录的主唱表情特征：已缓存时直接读取，否则经 jobs 提交 score.expression 提取，
 // 结果移入记录目录缓存。阻塞直到完成或 ctx 取消，应在后台 goroutine 调用。
 func (r *Run) Expression(ctx context.Context, jobs Jobs) (*Expression, error) {
@@ -78,22 +89,41 @@ func (r *Run) Expression(ctx context.Context, jobs Jobs) (*Expression, error) {
 	if stem == "" {
 		return nil, errors.New("找不到分离出的主唱（原曲已移动或修改，或分析时没有识别旋律线）")
 	}
-	id, err := jobs.Submit(Engine, "score.expression", map[string]any{"input": stem})
+	art, err := extractExpression(ctx, jobs, stem)
 	if err != nil {
 		return nil, err
 	}
-	j, err := jobs.Wait(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	switch {
-	case j.State == conductor.JobCanceled:
-		return nil, errors.New("已取消")
-	case j.State != conductor.JobDone || len(j.Artifacts) == 0:
-		return nil, fmt.Errorf("提取主唱表情失败：%s", j.Err)
-	}
-	if err := moveFile(j.Artifacts[0], cached); err != nil {
+	if err := moveFile(art, cached); err != nil {
 		return nil, fmt.Errorf("保存主唱表情：%w", err)
 	}
 	return ReadExpression(cached)
+}
+
+// ExtractExpression 提取任意人声文件（例如 Synthesizer V 渲染出的人声）的表情特征，不缓存。阻塞直到完成或 ctx 取消。
+func ExtractExpression(ctx context.Context, jobs Jobs, path string) (*Expression, error) {
+	art, err := extractExpression(ctx, jobs, path)
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(art)
+	return ReadExpression(art)
+}
+
+// extractExpression 提交 score.expression 并返回产物 expression.json 的路径。
+func extractExpression(ctx context.Context, jobs Jobs, path string) (string, error) {
+	id, err := jobs.Submit(Engine, "score.expression", map[string]any{"input": path})
+	if err != nil {
+		return "", err
+	}
+	j, err := jobs.Wait(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case j.State == conductor.JobCanceled:
+		return "", errors.New("已取消")
+	case j.State != conductor.JobDone || len(j.Artifacts) == 0:
+		return "", fmt.Errorf("提取 %s 的表情特征失败：%s", filepath.Base(path), j.Err)
+	}
+	return j.Artifacts[0], nil
 }

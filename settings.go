@@ -43,15 +43,27 @@ var engineStateLabel = map[conductor.EngineState]string{
 }
 
 func (a *app) settingsPage(c *ui.Context, tk *fluent.Tokens) {
-	t := c.Theme()
-	s := &a.settings
 	pageHeader(c, "设置", "数据根目录、uv 与推理引擎环境。")
 	if a.backendUnavailable(c, tk) {
 		return
 	}
-	l := a.be.layout
+	cardRow(c, cardMinWidth, func() ui.Element { return a.rootCard(c, tk) }, func() ui.Element { return a.uvCard(c, tk) })
+	cardRow(c, cardMinWidth, func() ui.Element {
+		return card(c, tk, "推理引擎", func() {
+			for _, e := range a.be.cond.Engines() {
+				a.engineRow(c, tk, e)
+			}
+		})
+	}, func() ui.Element { return a.mirrorCard(c, tk) })
+	a.doctorCard(c, tk)
+}
 
-	card(c, tk, "数据根目录", func() {
+// rootCard 显示数据根目录，可在文件管理器中打开或更改（重启后生效）。
+func (a *app) rootCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
+	t := c.Theme()
+	s := &a.settings
+	l := a.be.layout
+	return card(c, tk, "数据根目录", func() {
 		ui.Text(c, l.Root).Font("monospace").FontSize(12).Selectable()
 		ui.Text(c, "存放 uv、Python 运行时、引擎虚拟环境、模型与输出，可能占用数十 GB。").FontSize(12).TextColor(t.TextMuted)
 		if paths.SyncedFolderRisk(l.Root) {
@@ -76,8 +88,13 @@ func (a *app) settingsPage(c *ui.Context, tk *fluent.Tokens) {
 			ui.Text(c, s.err).FontSize(12).TextColor(t.Danger)
 		}
 	})
+}
 
-	card(c, tk, "uv", func() {
+// uvCard 显示所用的 uv（系统 PATH 或已下载）与版本；找不到时提供下载。
+func (a *app) uvCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
+	t := c.Theme()
+	s := &a.settings
+	return card(c, tk, "uv", func() {
 		uv := a.be.cond.UV()
 		switch {
 		case uv == nil:
@@ -105,26 +122,17 @@ func (a *app) settingsPage(c *ui.Context, tk *fluent.Tokens) {
 			}
 		}
 	})
-
-	card(c, tk, "推理引擎", func() {
-		for _, e := range a.be.cond.Engines() {
-			a.engineRow(c, tk, e)
-		}
-	})
-
-	a.mirrorCard(c, tk)
-	a.doctorCard(c, tk)
 }
 
 // mirrorCard 设置模型与运行时的下载镜像和 Hugging Face 访问令牌，保存后从下一个任务起生效。
-func (a *app) mirrorCard(c *ui.Context, tk *fluent.Tokens) {
+func (a *app) mirrorCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
 	t := c.Theme()
 	s := &a.settings
 	if !s.mirrorLoaded {
 		s.mirrorLoaded = true
 		s.mirrorCN, s.ghMirror, s.hfToken = a.be.settings.Mirror == settings.MirrorCN, a.be.settings.GitHubMirror, a.be.settings.HFToken
 	}
-	card(c, tk, "下载", func() {
+	return card(c, tk, "下载", func() {
 		ui.Checkbox(c, &s.mirrorCN, "Hugging Face 使用国内镜像（"+settings.HFMirror+"）")
 		ui.TextInput(c, &s.ghMirror).Label("GitHub 镜像前缀").Placeholder("留空直连，例如 https://ghfast.top/").Width(360)
 		ui.Text(c, "GitHub 镜像用于分轨模型、uv 与 Python 运行时的下载；CosyVoice 模型可在语音生成页选择 ModelScope。").

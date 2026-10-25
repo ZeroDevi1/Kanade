@@ -49,9 +49,13 @@ func (a *app) tasksPage(c *ui.Context, tk *fluent.Tokens) {
 		})
 		return
 	}
-	for i := len(jobs) - 1; i >= 0; i-- {
-		a.jobCard(c, tk, jobs[i])
-	}
+	// 新任务在前；宽屏时按 cardMinWidth 排成多列。
+	ui.Row(c).Wrap().Gap(16).AlignItems(ui.Start).Children(func() {
+		for i := len(jobs) - 1; i >= 0; i-- {
+			ui.Column(c.Key("job-cell-" + jobs[i].ID)).Basis(cardMinWidth).Grow(1).MinWidth(0).AlignItems(ui.Stretch).
+				Children(func() { a.jobCard(c, tk, jobs[i]) })
+		}
+	})
 }
 
 // jobCard 显示一个任务：引擎与任务名、状态、进度、错误与输出文件。

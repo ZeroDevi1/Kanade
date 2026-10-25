@@ -25,6 +25,11 @@ type scoreState struct {
 	melody   bool   // 分离主唱并识别旋律线
 	// transcribe 为 true 时用 MuScriptor 对原曲做多乐器转录（智能与专业模式都可选）。
 	transcribe bool
+	// instrMode 是转录的乐器提示（instrAuto 等）；instrPicked 是勾选的乐器组（score.InstrumentGroups 的 Key）；
+	// instrAll 为 true 时列出全部乐器组，否则只列常见的（instrCommon）。
+	instrMode   int
+	instrPicked map[string]bool
+	instrAll    bool
 	// lyrics 是 LRC 歌词（识别旋律线时逐字对到音符上），空为不用歌词。lyricsFor 是上次自动查找同名 .lrc 时的
 	// 歌曲路径：换歌时重新查找（找不到则清空），用户之后手动选择或清除不会被覆盖。
 	lyrics, lyricsFor string
@@ -47,6 +52,7 @@ type scoreState struct {
 	preview       audioPreview
 	sheet         sheetState
 	sv            svExportState // 导出 Synthesizer V 工程的对话框
+	karaoke       karaokeState  // K 歌跟唱
 	// confirmDelete 为 true 时删除按钮处于二次确认状态（针对正在显示的记录）。
 	confirmDelete bool
 	dlJob         string
@@ -77,6 +83,7 @@ func (a *app) scoreRequest() score.Request {
 	r := score.Request{Input: s.input, Separate: s.separate, Melody: s.melody, Lyrics: s.lyrics, StemModels: stems.Recommended,
 		Options: score.DefaultOptions(), History: score.HistoryDir(a.be.layout)}
 	r.Options.Transcribe = s.transcribe
+	r.Options.Instruments = s.instrumentHint()
 	if s.mode == modeSmart {
 		return r
 	}
@@ -94,6 +101,75 @@ func (a *app) scoreRequest() score.Request {
 		o.TempoMin, o.TempoMax = s.foldMin, s.foldMax
 	}
 	return r
+}
+
+// 转录的乐器提示（scoreState.instrMode）。
+const (
+	instrAuto    = iota // 自动识别
+	instrOnly           // 只在勾选的乐器中识别
+	instrExclude        // 排除勾选的乐器
+)
+
+// instrCommon 是乐器提示默认列出的常见乐器组；其余在「显示全部乐器组」后列出。
+var instrCommon = []string{"acoustic_piano", "electric_piano", "organ", "acoustic_guitar", "clean_electric_guitar",
+	"distorted_electric_guitar", "electric_bass", "acoustic_bass", "drums", "voice", "string_ensemble", "violin", "cello",
+	"synth_strings", "synth_pad", "synth_lead", "brass_section", "flutes", "chromatic_percussion"}
+
+// instrumentHint 按乐器提示返回转录可用的乐器组：自动或没有勾选时为 nil（不限）；排除全部时也为 nil。
+func (s *scoreState) instrumentHint() []string {
+	if !s.transcribe || s.instrMode == instrAuto {
+		return nil
+	}
+	var out []string
+	for _, g := range score.InstrumentGroups {
+		if s.instrPicked[g.Key] == (s.instrMode == instrOnly) {
+			out = append(out, g.Key)
+		}
+	}
+	if len(out) == 0 || len(out) == len(score.InstrumentGroups) {
+		return nil
+	}
+	return out
+}
+
+// scoreInstrumentHint 是转录的乐器提示：自动、只识别勾选的乐器、排除勾选的乐器。
+func (a *app) scoreInstrumentHint(c *ui.Context) {
+	t := c.Theme()
+	s := &a.score
+	if s.instrPicked == nil {
+		s.instrPicked = map[string]bool{}
+	}
+	ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+		ui.Segmented(c, &s.instrMode, "自动识别", "只识别勾选的乐器", "排除勾选的乐器").Label("乐器提示")
+	})
+	switch s.instrMode {
+	case instrAuto:
+		ui.Text(c, "音色相近的乐器可能整首认错（例如钢琴伴奏被识别成吉他）：可以指定歌里有的乐器，或排除没有的乐器后重新分析。").
+			FontSize(12).TextColor(t.TextMuted)
+		return
+	case instrOnly:
+		ui.Text(c, "转录只会在勾选的乐器中选择：请把歌里的乐器都勾上（包括鼓、贝斯、人声），没勾的乐器会被归到勾选的乐器里。").
+			FontSize(12).TextColor(t.TextMuted)
+	default:
+		ui.Text(c, "勾选歌里没有、却被识别出来的乐器（例如钢琴被认成吉他时排除各种吉他），其余照常识别。").
+			FontSize(12).TextColor(t.TextMuted)
+	}
+	keys := instrCommon
+	if s.instrAll {
+		keys = nil
+		for _, g := range score.InstrumentGroups {
+			keys = append(keys, g.Key)
+		}
+	}
+	ui.Row(c.Key("instr-picks")).Wrap().Gap(12).Children(func() {
+		for _, k := range keys {
+			on := s.instrPicked[k]
+			if ui.Checkbox(c.Key("instr-"+k), &on, score.InstrumentTitle(k)).Changed() {
+				s.instrPicked[k] = on
+			}
+		}
+	})
+	ui.Checkbox(c, &s.instrAll, "显示全部乐器组")
 }
 
 // scorePage 是音乐分析页：调号、拍号、BPM、和弦与情绪。
@@ -128,7 +204,7 @@ func (a *app) scorePage(c *ui.Context, tk *fluent.Tokens) {
 			return ui.Box(c) // 本帧刚删除了有结果的记录：留空一帧，下一帧这一格不再出现
 		}
 	}
-	cardRow(c, scoreCardMinWidth, func() ui.Element { return a.scoreRunCard(c, tk) }, summary)
+	cardRow(c, cardMinWidth, func() ui.Element { return a.scoreRunCard(c, tk) }, summary)
 	a.scoreSVDialog(c, tk)
 	run, st := current()
 	if st.Result == nil {
@@ -138,7 +214,9 @@ func (a *app) scorePage(c *ui.Context, tk *fluent.Tokens) {
 	s.preview.title = filepath.Base(run.Request.Input)
 	res := st.Result
 	a.syncMix(res)
-	card(c, tk, "试听", func() { a.scorePlayer(c, tk, res) })
+	// 宽屏时试听与 K 歌并排（没有旋律线时没有 K 歌卡片，试听占满一行）。
+	cardRow(c, cardMinWidth, func() ui.Element { return card(c, tk, "试听", func() { a.scorePlayer(c, tk, res) }) },
+		karaokeCardFunc(a, c, tk, run, res))
 	// 宽屏时卷帘与乐谱并排，播放时两边同时可见；乐谱在自己的滚动区里，与卷帘等高。
 	cardRow(c, scoreRollSheetMinWidth, func() ui.Element { return a.scoreRollCard(c, tk, res) },
 		func() ui.Element { return a.scoreSheetCard(c, tk, res) })
@@ -147,10 +225,6 @@ func (a *app) scorePage(c *ui.Context, tk *fluent.Tokens) {
 		card(c, tk, "情绪", func() { a.scoreEmotion(c, res) })
 	}
 }
-
-// scoreCardMinWidth 是音乐分析页并排卡片的最小宽度：分析表单在约 560 宽时文件名与按钮仍放得下一行
-// （窄于此的窗口里卡片各占一行，与原来的单列布局相同）。
-const scoreCardMinWidth = 560
 
 // scoreRollSheetMinWidth 是卷帘与乐谱并排时每张卡片的最小宽度：卷帘左侧音轨栏 236 加上可读的卷帘宽度，
 // 乐谱每行 4 小节各约 150 宽（窗口最大化时内容区约 1530 宽，放得下两张）。
@@ -241,6 +315,7 @@ func (a *app) scoreRunCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
 				}
 			}
 			ui.Text(c, note).FontSize(12).TextColor(t.TextMuted)
+			a.scoreInstrumentHint(c)
 		}
 		if s.input != s.lyricsFor {
 			s.lyricsFor, s.lyrics = s.input, ""
