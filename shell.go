@@ -42,6 +42,7 @@ var (
 // view 是窗口根视图：Fluent 主题、标题栏、导航栏与内容层。
 func (a *app) view(c *ui.Context) {
 	tk := fluent.Apply(c)
+	transports.frame = transports.frame[:0] // 由本帧构建的控制条重新登记
 	ui.Column(c).Fill().Bind(&a.root).AlignItems(ui.Stretch).Children(func() {
 		a.titleBar(c)
 		ui.Row(c).Grow(1).MinHeight(0).AlignItems(ui.Stretch).Children(func() {
@@ -58,6 +59,7 @@ func (a *app) view(c *ui.Context) {
 				})
 		})
 	})
+	playbackShortcuts(c)
 }
 
 // titleBar 绘制隐藏系统标题栏后的自绘标题栏，避开系统窗口按钮并可拖动窗口。

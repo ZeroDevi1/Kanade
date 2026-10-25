@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/egoist/mygo/audio"
@@ -16,6 +17,73 @@ import (
 
 // transportSkip 是后退 / 前进按钮跳过的时长（经验值：约一个乐句，方便回听）。
 const transportSkip = 5 * time.Second
+
+// transports 记录本帧构建的控制条所控制的播放器，供播放快捷键（playbackShortcuts）选择目标；只在 UI 线程读写。
+// view 每帧开始时清空 frame；last 是最近一次通过控制条或快捷键操作过的播放器。
+var transports struct {
+	frame []*audio.Player
+	last  *audio.Player
+}
+
+// shortcutTarget 返回播放快捷键作用的播放器：本帧界面上正在播放的一个；都没有播放时为最近操作过的一个
+// （仍在界面上时）；再不然是本帧第一个。界面上没有控制条时为 nil。
+func shortcutTarget() *audio.Player {
+	for _, p := range transports.frame {
+		if p.Playing() {
+			return p
+		}
+	}
+	if slices.Contains(transports.frame, transports.last) {
+		return transports.last
+	}
+	if len(transports.frame) > 0 {
+		return transports.frame[0]
+	}
+	return nil
+}
+
+// playbackShortcuts 注册窗口级的播放快捷键（焦点在输入框、按钮等会自己处理该键的控件上时不触发）：
+// 空格播放 / 暂停，← / → 后退 / 前进 5 秒，Home 回到开头，L 循环，M 静音。须在 view 的顶层调用。
+func playbackShortcuts(c *ui.Context) {
+	on := func(key ui.Key, fn func(p *audio.Player)) {
+		c.OnShortcut(0, key, func() {
+			if p := shortcutTarget(); p != nil {
+				transports.last = p
+				fn(p)
+			}
+		})
+	}
+	on(ui.KeySpace, func(p *audio.Player) {
+		if p.Playing() {
+			p.Pause()
+		} else {
+			p.Play()
+		}
+	})
+	on(ui.KeyLeft, func(p *audio.Player) { p.Seek(max(p.Position()-transportSkip, 0)) })
+	on(ui.KeyRight, func(p *audio.Player) { p.Seek(min(p.Position()+transportSkip, p.Duration())) })
+	on(ui.KeyHome, func(p *audio.Player) { p.Seek(0) })
+	on(ui.KeyL, func(p *audio.Player) { p.SetLoop(!p.Loop()) })
+	on(ui.KeyM, func(p *audio.Player) { toggleMute(p) })
+}
+
+// toggleMute 在静音与静音前的音量之间切换（静音前的音量记在 mutedVolume，按播放器区分）。
+func toggleMute(p *audio.Player) {
+	if p.Volume() > 0 {
+		mutedVolume[p] = p.Volume()
+		p.SetVolume(0)
+		return
+	}
+	v, ok := mutedVolume[p]
+	if !ok {
+		v = 1
+	}
+	delete(mutedVolume, p)
+	p.SetVolume(v)
+}
+
+// mutedVolume 是被快捷键静音的播放器静音前的音量（只在 UI 线程读写）。
+var mutedVolume = map[*audio.Player]float64{}
 
 var (
 	iconLoop    = icon(`<path d="M2.5 7.5V6.5a2 2 0 0 1 2-2h9l-2-2M13.5 8.5v1a2 2 0 0 1-2 2h-9l2 2"/>`)
@@ -35,18 +103,24 @@ func transport(c *ui.Context, tk *fluent.Tokens, key string, p *audio.Player) {
 	if playing {
 		c.After(100 * time.Millisecond)
 	}
+	if !slices.Contains(transports.frame, p) {
+		transports.frame = append(transports.frame, p)
+	}
 	ui.Column(c.Key("transport-" + key)).Gap(4).AlignItems(ui.Stretch).Children(func() {
 		// 按钮行：两侧的循环与音量对称排列，播放按钮居中。
 		ui.Row(c).Gap(20).Center().Children(func() {
 			loop := p.Loop()
-			if transportButton(c, tk, key+"-loop", iconLoop, map[bool]string{true: "关闭循环", false: "循环播放"}[loop], loop).Clicked() {
+			if transportButton(c, tk, key+"-loop", iconLoop, map[bool]string{true: "关闭循环（L）", false: "循环播放（L）"}[loop], loop).Clicked() {
+				transports.last = p
 				p.SetLoop(!loop)
 			}
-			if transportButton(c, tk, key+"-back", iconBack, fmt.Sprintf("后退 %.0f 秒", transportSkip.Seconds()), false).Clicked() {
+			if transportButton(c, tk, key+"-back", iconBack, fmt.Sprintf("后退 %.0f 秒（←）", transportSkip.Seconds()), false).Clicked() {
+				transports.last = p
 				p.Seek(max(pos-transportSkip, 0))
 			}
 			playButton(c, key, p, playing)
-			if transportButton(c, tk, key+"-fwd", iconForward, fmt.Sprintf("前进 %.0f 秒", transportSkip.Seconds()), false).Clicked() {
+			if transportButton(c, tk, key+"-fwd", iconForward, fmt.Sprintf("前进 %.0f 秒（→）", transportSkip.Seconds()), false).Clicked() {
+				transports.last = p
 				p.Seek(min(pos+transportSkip, dur))
 			}
 			volumeButton(c, tk, key, p)
@@ -83,9 +157,9 @@ func transportButton(c *ui.Context, tk *fluent.Tokens, key string, ic *ui.SVG, l
 // playButton 是居中的播放 / 暂停按钮：强调色胶囊。
 func playButton(c *ui.Context, key string, p *audio.Player, playing bool) {
 	t := c.Theme()
-	label, ic := "播放", iconPlay
+	label, ic := "播放（空格）", iconPlay
 	if playing {
-		label, ic = "暂停", iconPause
+		label, ic = "暂停（空格）", iconPause
 	}
 	b := ui.ButtonBase(c.Key(key+"-play")).Size(56, 36).Radius(18).Center().Label(label).Tooltip(label).
 		TextColor(t.AccentText)
@@ -99,6 +173,7 @@ func playButton(c *ui.Context, key string, p *audio.Player, playing bool) {
 	}
 	b.Children(func() { ui.Icon(c, ic).Size(16, 16) })
 	if b.Clicked() {
+		transports.last = p
 		if playing {
 			p.Pause()
 		} else {
@@ -115,7 +190,7 @@ func volumeButton(c *ui.Context, tk *fluent.Tokens, key string, p *audio.Player)
 	if vol == 0 {
 		ic = iconMuted
 	}
-	b := transportButton(c, tk, key+"-vol", ic, fmt.Sprintf("音量 %.0f%%", vol*100), false)
+	b := transportButton(c, tk, key+"-vol", ic, fmt.Sprintf("音量 %.0f%%（M 静音）", vol*100), false)
 	open := ui.Local(b, "open", func() bool { return false })
 	if b.Clicked() {
 		*open = !*open

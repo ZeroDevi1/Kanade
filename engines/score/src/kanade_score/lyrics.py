@@ -1,7 +1,7 @@
 """歌词对齐：把 LRC 歌词逐字对到主唱上，再把字分配给 SOME 识别出的音符（一字多音即连音 / 转音）。
 
 流程：
-1. 解析 LRC：逐行时间戳 + 文本，去掉作词、作曲等署名行。每个汉字、每个拉丁单词是一个「字」（一个音节）。
+1. 解析 LRC：逐行时间戳 + 文本，去掉标题、作词作曲等署名与版权提示行（这些行不唱）。每个汉字、每个拉丁单词是一个「字」（一个音节）。
 2. 字级强制对齐：中文 wav2vec2 CTC 模型（jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn）逐帧给出字符概率，
    用 CTC Viterbi 求整首歌词的最优路径，得到每个字的起点。两条约束来自 2026-10-21 用真实歌曲的实测：
    - LRC 行首作锚点：每行首字只能落在该行时间戳 ±ANCHOR_S 内。不加锚点时，置信度低的长音处会把下一行首字
@@ -58,16 +58,31 @@ class Line:
 _TAG = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
 _OFFSET = re.compile(r"\[offset:\s*([+-]?\d+)\]", re.I)
 _WORD = re.compile(r"[A-Za-z']+|[㐀-鿿豈-﫿]|\d")
+# 整行包在一对括号里的提示（【】、[]、()、（）、〔〕、「」）。
+_BRACKETED = re.compile(r"[【\[(（〔「].*[】\])）〕」]")
+# 版权提示的常见用语：平台在歌词开头插入的这类行不唱。
+_NOTICE_WORDS = ("未经", "著作权", "版权所有", "翻唱翻录", "禁止翻唱", "商业使用")
+
+
+def _is_meta(body: str) -> bool:
+    """报告一行是否不是唱出来的歌词：含全角或半角冒号的署名行（「词：」「作曲:」「OP:」等）、整行包在括号里的提示
+    （「【未经著作权人许可不得翻唱翻录或使用】」）或含版权提示用语的行。"""
+    if "：" in body or ":" in body:
+        return True
+    if _BRACKETED.fullmatch(body):
+        return True
+    return any(k in body for k in _NOTICE_WORDS)
 
 
 def parse_lrc(text: str) -> list[Line]:
     """解析 LRC 文本，返回按时间排序的歌词行。
 
-    支持一行多个时间戳（副歌复用）与 [offset:毫秒]（正值表示歌词提前）。去掉的行：没有字的行、含全角或半角冒号的
-    署名行（「词：」「作曲:」等），以及 0 秒处含 " - " 的标题行。
+    支持一行多个时间戳（副歌复用）与 [offset:毫秒]（正值表示歌词提前）。去掉的行：没有字的行、署名与版权提示行
+    （_is_meta），以及标题行——0 秒处含 " - " 的行，或 0 秒处、按时间紧随其后的一行是署名或提示行的行（常见的
+    「歌名 / 作词… / 作曲… / 【提示】」开头）。这些行不唱，留下会被强制对齐硬塞进第一句之前，挤乱后面的字。
     """
     offset = 0.0
-    lines: list[Line] = []
+    entries: list[tuple[float, str, bool]] = []  # (时间, 文本, 是否署名或提示行)
     for raw in text.splitlines():
         if m := _OFFSET.search(raw):
             offset = int(m[1]) / 1000
@@ -76,17 +91,21 @@ def parse_lrc(text: str) -> list[Line]:
         if not stamps:
             continue
         body = raw[stamps[-1].end():].strip()
-        if not body or "：" in body or ":" in body:
-            continue
-        words = _WORD.findall(body)
-        if not words:
+        if not body:
             continue
         for s in stamps:
             t = int(s[1]) * 60 + float(s[2]) - offset
-            if t < 0.5 and " - " in body:
-                continue
-            lines.append(Line(max(t, 0.0), body, words))
-    lines.sort(key=lambda l: l.time)
+            entries.append((max(t, 0.0), body, _is_meta(body)))
+    entries.sort(key=lambda e: e[0])
+    lines: list[Line] = []
+    for i, (t, body, meta) in enumerate(entries):
+        if meta:
+            continue
+        if t < 0.5 and (" - " in body or (i + 1 < len(entries) and entries[i + 1][2])):
+            continue
+        words = _WORD.findall(body)
+        if words:
+            lines.append(Line(t, body, words))
     return lines
 
 

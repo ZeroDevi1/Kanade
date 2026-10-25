@@ -144,3 +144,56 @@ func hasPrefix(texts []string, prefix string) bool {
 	}
 	return false
 }
+
+// 播放快捷键：空格播放 / 暂停，← / → 后退 / 前进，Home 回到开头，L 循环，M 静音（作用于界面上的播放器）。
+func TestPlaybackShortcuts(t *testing.T) {
+	a := newApp()
+	a.current = "inspire"
+	s := &a.inspire
+	s.hum = testInspireHum()
+	s.changed()
+	tt := ui.NewTester(a.view, 1200, 1800)
+	tt.Frame()
+	p := s.player
+	if p == nil || shortcutTarget() != p {
+		t.Fatalf("target %p, player %p", shortcutTarget(), p)
+	}
+	tt.Key(0, ui.KeySpace)
+	tt.Frame()
+	if !p.Playing() {
+		t.Fatal("space should play")
+	}
+	tt.Key(0, ui.KeySpace)
+	tt.Frame()
+	if p.Playing() {
+		t.Fatal("space should pause")
+	}
+	p.Seek(time.Second)
+	tt.Key(0, ui.KeyRight)
+	tt.Frame()
+	if got := p.Position(); got < 4*time.Second {
+		t.Errorf("→ moved to %v", got) // 1 秒 + 5 秒，超过时长时停在末尾
+	}
+	before := p.Position()
+	tt.Key(0, ui.KeyLeft)
+	tt.Frame()
+	if want := max(before-transportSkip, 0); p.Position() != want {
+		t.Errorf("← moved from %v to %v, want %v", before, p.Position(), want)
+	}
+	tt.Key(0, ui.KeyHome)
+	tt.Frame()
+	if p.Position() != 0 {
+		t.Errorf("Home: %v", p.Position())
+	}
+	tt.Key(0, ui.KeyL)
+	tt.Key(0, ui.KeyM)
+	tt.Frame()
+	if !p.Loop() || p.Volume() != 0 {
+		t.Errorf("L/M: loop %v volume %v", p.Loop(), p.Volume())
+	}
+	tt.Key(0, ui.KeyM)
+	tt.Frame()
+	if p.Volume() != 1 {
+		t.Errorf("unmute: volume %v", p.Volume())
+	}
+}
