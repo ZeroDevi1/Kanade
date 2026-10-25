@@ -29,6 +29,7 @@ from . import models
 
 ANCHOR_S = 0.5    # 行首字相对 LRC 时间戳的允许偏差（秒）；实测 LRC 与实际演唱差 0.3 s 以内
 SILENT_DB = -50.0  # 帧 RMS 低于它（dBFS）视为静音
+LINE_PAD_S = 0.15  # 通配行按音符铺字时，行范围相对首字起点提前的量（秒）：容纳 CTC 把首字放晚了一点的情况
 CHUNK_S = 20      # 求 CTC 概率的分块长度（秒）：wav2vec2 的自注意力随长度平方增长，整首一次算显存不够
 CONTEXT_S = 1     # 分块两侧附带的上下文（秒），只取中间部分的输出，避免块边界处的概率失真
 SR = 16000
@@ -57,8 +58,9 @@ class Line:
     # 促音、长音并入前一个假名）。morae 与之一一对应：这个字唱几拍（日文汉字为注音的拍数，没有注音时为 1；其余为 1）。
     words: list[str]
     morae: list[int] = field(default_factory=list)
-    # japanese 为 True 表示行内有假名：对齐时不用中文模型对这些字的概率（见 align）。
-    japanese: bool = False
+    # wild 为 True 时对齐不用中文模型对这些字的概率，每个字按拍数放通配 token（见 align）：日文行，以及含日文的
+    # 歌曲里的英文行（中文模型对英文字母的概率同样不可靠，英文单词的拍数按元音组估计音节数）。
+    wild: bool = False
 
 
 _TAG = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
@@ -180,8 +182,23 @@ def parse_lrc(text: str) -> list[Line]:
         if t < 0.5 and (" - " in body or (i + 1 < len(entries) and entries[i + 1][2])):
             continue
         if words:
-            lines.append(Line(t, body, words, morae, japanese=bool(_KANA.search(body))))
+            lines.append(Line(t, body, words, morae, wild=bool(_KANA.search(body))))
+    # 含日文的歌曲：其余各行（多为英文）也按通配对齐，英文单词按音节数占拍。
+    if any(l.wild for l in lines):
+        for l in lines:
+            if not l.wild:
+                l.wild = True
+                l.morae = [_syllables(w) if w.isascii() else m for w, m in zip(l.words, l.morae)]
     return lines
+
+
+def _syllables(word: str) -> int:
+    """英文单词的音节数估计：元音组（a e i o u y）的个数，词尾不发音的 e 不计；至少为 1。"""
+    w = word.lower().strip("'")
+    groups = len(re.findall(r"[aeiouy]+", w))
+    if w.endswith("e") and not w.endswith(("le", "ee")) and groups > 1:
+        groups -= 1
+    return max(1, groups)
 
 
 def _viterbi(lp: np.ndarray, toks: list[int], anchors: dict[int, tuple[int, int]], blank: int,
@@ -237,10 +254,12 @@ def _viterbi(lp: np.ndarray, toks: list[int], anchors: dict[int, tuple[int, int]
     return [(a, b) for a, b in spans]
 
 
-def align(job: Job, y_mono: np.ndarray, sr: int, lines: list[Line], lo: float, hi: float) -> tuple[list[dict], str]:
+def align(job: Job, y_mono: np.ndarray, sr: int, lines: list[Line], lo: float, hi: float,
+          notes: list[dict] | None = None) -> tuple[list[dict], str]:
     """把 lines 逐字对齐到主唱 y_mono，返回 ([{start, end, text, line}]（秒）, 说明)。
 
-    说明非空时表示放宽了约束（锚点或静音约束无法满足），结果可信度较低。
+    说明非空时表示放宽了约束（锚点或静音约束无法满足），结果可信度较低。notes 为识别出的旋律音符（[{start, end}]，
+    可为 None）：给出时通配行的字改按音符铺开（见 _spread_on_notes）。
     """
     import soxr
     import torch
@@ -274,8 +293,8 @@ def align(job: Job, y_mono: np.ndarray, sr: int, lines: list[Line], lo: float, h
     fps = T / (len(y) / SR)
 
     # 2. token 序列：汉字一个 token，拉丁单词按字母（词表为大写）；行首 token 加锚点。
-    #    日文行（模型是中文的，假名不在词表里，汉字的中文读音也与演唱不符）：每个字按拍数放几个通配 token，
-    #    只要求那几帧有人声，字的时长按拍数分配。
+    #    通配行（Line.wild：日文行，以及含日文的歌曲里的英文行；模型是中文的，假名不在词表里，汉字的中文读音与
+    #    英文字母的概率也与演唱不符）：每个字按拍数放几个通配 token，只要求那几帧有人声，字的时长按拍数分配。
     toks: list[int] = []
     owner: list[int] = []  # token → 字序号
     words: list[dict] = []
@@ -284,7 +303,7 @@ def align(job: Job, y_mono: np.ndarray, sr: int, lines: list[Line], lo: float, h
         for wi, w in enumerate(line.words):
             if wi == 0:
                 anchors[len(toks)] = (max(0, round((line.time - ANCHOR_S) * fps)), round((line.time + ANCHOR_S) * fps))
-            if line.japanese:
+            if line.wild:
                 ids = [-1] * (line.morae[wi] if wi < len(line.morae) else 1)
             else:
                 ids = [vocab.get(ch, -1) for ch in (w.upper() if w.isascii() else w)]
@@ -313,9 +332,49 @@ def align(job: Job, y_mono: np.ndarray, sr: int, lines: list[Line], lo: float, h
         if w["start"] is None:
             w["start"], w["end"] = a / fps, b / fps
         w["end"] = b / fps
+    if notes:
+        _spread_on_notes(lines, words, notes)
     for w in words:
         w["start"], w["end"] = round(w["start"], 3), round(w["end"], 3)
     return words, note
+
+
+def _spread_on_notes(lines: list[Line], words: list[dict], notes: list[dict]) -> None:
+    """把通配行（Line.wild）的字按拍数依次铺到该行的旋律音符上，就地改写 words 的起止。
+
+    中文模型对日文、英文演唱几乎只输出 blank，通配 token 找不到可靠的落点，字会挤在行首锚点附近（2026-10-25 用
+    《春日影》《Imprisoned XII》实测）；而行首字有锚点，CTC 给出的行起点仍可信。日文演唱基本一拍一个音、英文一个音节
+    一个音，所以：一行的范围取 [本行首字起点 − LINE_PAD_S, 下一行首字起点 − LINE_PAD_S)，范围内的音符按起点排序；
+    第 k 个字（之前累计 c_k 拍，全行 M 拍、N 个音）落在音符坐标 u = c_k·N/M：第 ⌊u⌋ 个音的起点再加上该音时长的
+    小数部分。拍数与音数相等时一拍一个音，不等时按比例（一个音上有几拍就在音内均分）。范围内没有音符的行保留 CTC 结果。
+    """
+    ns = sorted((n for n in notes if n["end"] > n["start"]), key=lambda n: n["start"])
+    by_line: dict[int, list[dict]] = {}
+    for w in words:
+        by_line.setdefault(w["line"], []).append(w)
+    order = sorted(by_line)
+    for idx, li in enumerate(order):
+        line = lines[li]
+        ws = by_line[li]
+        if not line.wild or ws[0]["start"] is None:
+            continue
+        lo = ws[0]["start"] - LINE_PAD_S
+        nxt = by_line[order[idx + 1]][0]["start"] if idx + 1 < len(order) else None
+        hi = nxt - LINE_PAD_S if nxt is not None else float("inf")
+        inside = [n for n in ns if lo <= n["start"] < hi]
+        if not inside:
+            continue
+        morae = [line.morae[i] if i < len(line.morae) else 1 for i in range(len(ws))]
+        total, count = sum(morae), len(inside)
+        acc = 0
+        for w, m in zip(ws, morae):
+            u = acc * count / total
+            i = min(int(u), count - 1)
+            n = inside[i]
+            w["start"] = n["start"] + (u - i) * (n["end"] - n["start"])
+            acc += m
+        for j, w in enumerate(ws):
+            w["end"] = ws[j + 1]["start"] if j + 1 < len(ws) else max(w["start"], inside[-1]["end"])
 
 
 def attach(notes: list[dict], words: list[dict]) -> tuple[list[dict], int]:

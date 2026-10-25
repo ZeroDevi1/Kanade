@@ -108,3 +108,25 @@ func TestMelodyLayoutLyrics(t *testing.T) {
 		t.Errorf("slur flags %v", slur)
 	}
 }
+
+// 快唱的几个带字的音量化到同一格时，字合并到留下的音上，不丢字；英文单词之间加空格。
+func TestMelodyLayoutKeepsCollidingLyrics(t *testing.T) {
+	a := &Analysis{Beats: []float64{0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4}, Downbeats: []float64{0, 2, 4}}
+	a.Meter.BeatsPerBar = 4
+	a.Melody = &Melody{Notes: []MelodyNote{{Start: 0, End: 0.1, Pitch: 60, Lyric: "to"}, {Start: 0.1, End: 0.25, Pitch: 62, Lyric: "know"},
+		{Start: 0.5, End: 0.6, Pitch: 64, Lyric: "ま"}, {Start: 0.6, End: 1, Pitch: 65, Lyric: "狂"}}}
+	var got []string
+	for _, mm := range a.MelodyLayout(a.Measures(), 0, false) {
+		for _, it := range mm.Items {
+			if it.Lyric != "" {
+				got = append(got, it.Lyric)
+			}
+		}
+	}
+	if len(got) != 2 || got[0] != "to know" || got[1] != "ま狂" {
+		t.Errorf("lyrics %q", got)
+	}
+	if JoinLyric("I", "want") != "I want" || JoinLyric("い", "ま") != "いま" || JoinLyric("so", "い") != "soい" {
+		t.Error("JoinLyric spacing")
+	}
+}

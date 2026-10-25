@@ -169,7 +169,8 @@ def run_analyze(job: Job) -> None:
     if vy is not None:
         tune = {"notes": melody.transcribe(job, vy.mean(axis=1), vsr, 0.58, 0.66 if lines else 0.7), "source": "lead_vocal"}
         if lines:
-            words, note = lyrics.align(job, vy.mean(axis=1), vsr, lines, 0.66, 0.68 if use_game else 0.7)
+            words, note = lyrics.align(job, vy.mean(axis=1), vsr, lines, 0.66, 0.68 if use_game else 0.7,
+                                       notes=tune["notes"])
             if use_game:
                 tune["notes"], lost = lyrics.attach_game(job, vy.mean(axis=1), vsr, words, tune["notes"], 0.68, 0.7)
             else:

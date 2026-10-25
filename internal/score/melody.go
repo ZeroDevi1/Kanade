@@ -4,6 +4,8 @@ import (
 	"math"
 	"slices"
 	"sort"
+	"unicode"
+	"unicode/utf8"
 )
 
 // 旋律线：把 SOME 识别出的音符（连续时间、浮点音高）量化到拍点网格上，排成五线谱可以写出的音符与休止符。
@@ -39,6 +41,20 @@ type MelodyLyrics struct {
 	Matched int    `json:"matched"` // 分到音符的字数；其余的字没有对应的识别音符
 	Note    string `json:"note"`    // 非空时说明对齐放宽了哪些约束（结果可信度较低）
 	Method  string `json:"method"`  // 字与音符的对应方法（SlurModels 的 Key）；旧记录为空，即 align
+}
+
+// JoinLyric 把两段歌词接起来：两边相接处都是拉丁字母或数字（英文单词）时加一个空格，中日文直接相连。
+func JoinLyric(a, b string) string {
+	if a == "" || b == "" {
+		return a + b
+	}
+	word := func(r rune) bool { return r < 128 && (unicode.IsLetter(r) || unicode.IsDigit(r) || r == '\'') }
+	last, _ := utf8.DecodeLastRuneInString(a)
+	first, _ := utf8.DecodeRuneInString(b)
+	if word(last) && word(first) {
+		return a + " " + b
+	}
+	return a + b
 }
 
 // MelodySubdiv 是量化网格：每拍分为 2 格（八分音符）。更细的网格（十六分）在人声识别误差下会写出大量碎音符。
@@ -91,7 +107,7 @@ func (a *Analysis) MelodyLayout(ms []Measure, transpose int, flats bool) []Melod
 	}
 	// 1. 量化：起止时间换算到网格（四舍五入），单音化（后一个音开始时截断前一个），去掉长度为 0 的音。
 	//    快速的转音在八分音符网格上常量化到同一格：同时开始的音只留一个，通常是第一个；但后一个音带字而前一个
-	//    只是连音时留后一个，避免丢字。
+	//    只是连音时留后一个；两个都带字（快唱的英文单词、日文的短促音节）时把字合并到留下的音上，避免丢字。
 	type qn struct {
 		s, e  int
 		pitch int
@@ -112,8 +128,11 @@ func (a *Analysis) MelodyLayout(ms []Measure, transpose int, flats bool) []Melod
 	for _, q := range qs {
 		if n := len(mono); n > 0 && mono[n-1].e > q.s {
 			if mono[n-1].s == q.s {
-				if mono[n-1].lyric == "" && q.lyric != "" {
+				switch {
+				case mono[n-1].lyric == "" && q.lyric != "":
 					mono[n-1] = q
+				case q.lyric != "":
+					mono[n-1].lyric = JoinLyric(mono[n-1].lyric, q.lyric)
 				}
 				continue
 			}

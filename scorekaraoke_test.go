@@ -135,3 +135,30 @@ func TestKaraokeLines(t *testing.T) {
 		}
 	}
 }
+
+// 有歌词对齐结果时按 LRC 的行显示：行内的停顿不分行，英文单词之间加空格。
+func TestKaraokeLyricLines(t *testing.T) {
+	var ly score.MelodyLyrics
+	add := func(text string, line int, start, end float64) {
+		ly.Words = append(ly.Words, struct {
+			Text  string  `json:"text"`
+			Line  int     `json:"line"`
+			Start float64 `json:"start"`
+			End   float64 `json:"end"`
+		}{text, line, start, end})
+	}
+	add("ね", 0, 1, 1.2)
+	add("じ", 0, 1.2, 1.4)
+	add("れ", 0, 3, 3.2) // 行内 1.6 秒的停顿
+	add("た", 0, 3.2, 3.5)
+	add("You", 1, 5, 5.3)
+	add("know", 1, 5.3, 5.8)
+	for _, tc := range []struct {
+		pos       float64
+		cur, next string
+	}{{0, "ねじれた", "You know"}, {2, "ねじれた", "You know"}, {4, "You know", ""}, {6, "（结束）", ""}} {
+		if cur, next := karaokeLyricLines(&ly, tc.pos); cur != tc.cur || next != tc.next {
+			t.Errorf("pos %v: %q / %q", tc.pos, cur, next)
+		}
+	}
+}

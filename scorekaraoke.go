@@ -380,7 +380,11 @@ func (a *app) karaokeLive(c *ui.Context, tk *fluent.Tokens, res *score.Analysis)
 		x := xOf(pos)
 		p.Fill(ui.Rect{X: x - 1, Y: r.Y, W: 2, H: r.H}, rollPaper.playhead, 1)
 	})
+	// 有歌词对齐结果时按 LRC 的行显示（音符之间的停顿不一定是换行）；否则按停顿把音符分成行。
 	cur, next := karaokeLines(notes, pos)
+	if ly := res.Melody.Lyrics; ly != nil && len(ly.Words) > 0 {
+		cur, next = karaokeLyricLines(ly, pos)
+	}
 	ui.Column(c).Gap(2).Children(func() {
 		ui.Text(c, cur).FontSize(22).FontWeight(600)
 		ui.Text(c, next).FontSize(14).TextColor(t.TextMuted)
@@ -422,29 +426,42 @@ func liveNote(notes []score.MelodyNote, t float64) *score.MelodyNote {
 
 // karaokeLines 返回 pos 时正在唱（或即将唱）的一句与下一句歌词；乐句按停顿 ≥ 0.35 秒划分，没有歌词时显示音名。
 func karaokeLines(notes []score.MelodyNote, pos float64) (string, string) {
-	var lines []struct {
-		end  float64
-		text string
-	}
-	var b strings.Builder
+	var lines []lyricLine
+	var b string
 	for i, n := range notes {
-		if n.Lyric != "" {
-			b.WriteString(n.Lyric)
-		}
+		b = score.JoinLyric(b, n.Lyric)
 		if i+1 == len(notes) || notes[i+1].Start-n.End >= 0.35 {
-			lines = append(lines, struct {
-				end  float64
-				text string
-			}{n.End, b.String()})
-			b.Reset()
+			lines = append(lines, lyricLine{n.End, b})
+			b = ""
 		}
 	}
-	i := slices.IndexFunc(lines, func(l struct {
-		end  float64
-		text string
-	}) bool {
-		return l.end > pos
-	})
+	return pickLyricLines(lines, pos)
+}
+
+// lyricLine 是一行歌词：end 为该行最后一个字（音）的结束时间（秒）。
+type lyricLine struct {
+	end  float64
+	text string
+}
+
+// karaokeLyricLines 按 LRC 的行返回当前与下一行歌词：对齐出的字按所在行分组，英文单词之间加空格。
+func karaokeLyricLines(ly *score.MelodyLyrics, pos float64) (string, string) {
+	var lines []lyricLine
+	line := -1
+	for _, w := range ly.Words {
+		if w.Line != line || len(lines) == 0 {
+			lines = append(lines, lyricLine{w.End, ""})
+			line = w.Line
+		}
+		l := &lines[len(lines)-1]
+		l.text, l.end = score.JoinLyric(l.text, w.Text), max(l.end, w.End)
+	}
+	return pickLyricLines(lines, pos)
+}
+
+// pickLyricLines 返回位置 pos 所在（或之后第一）的一行与下一行；空行显示为「♪」，唱完后为「（结束）」。
+func pickLyricLines(lines []lyricLine, pos float64) (string, string) {
+	i := slices.IndexFunc(lines, func(l lyricLine) bool { return l.end > pos })
 	if i < 0 {
 		return "（结束）", ""
 	}
