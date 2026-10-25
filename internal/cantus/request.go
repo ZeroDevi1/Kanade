@@ -32,6 +32,16 @@ type Request struct {
 	Seed *int
 	// Sampling 覆盖 LLM 采样参数；nil 时使用引擎默认（微调模型为保守采样，其他为模型自带）。
 	Sampling *Sampling
+	// PauseScale 是段间停顿的倍数（MinPause–MaxPause），0 视为 1。
+	PauseScale float64
+	// Regenerate 非 nil 时只重新生成此前结果中的一段（其余参数须与当时相同），见 Segments。
+	Regenerate *Regenerate
+}
+
+// Regenerate 指定要重新生成的段：Manifest 是那次合成的 segments.json，Index 从 0 起。
+type Regenerate struct {
+	Manifest string
+	Index    int
 }
 
 // Sampling 是 CosyVoice LLM 的 ras_sampling 参数（专业模式）。
@@ -79,6 +89,12 @@ const (
 	MaxSpeed = 2.0
 )
 
+// PauseScale 的取值范围（引擎接受 0.2–3）。
+const (
+	MinPause = 0.5
+	MaxPause = 2.0
+)
+
 // Task 返回引擎任务名。
 func (r Request) Task() string { return Engine + "." + string(r.Mode) }
 
@@ -97,7 +113,20 @@ func (r Request) Params(l paths.Layout) (map[string]any, error) {
 	if speed < MinSpeed || speed > MaxSpeed {
 		return nil, fmt.Errorf("语速须在 %.1f–%.1f 之间", MinSpeed, MaxSpeed)
 	}
-	p := map[string]any{"model_dir": r.Model.Dir(l), "speed": speed, "text_frontend": r.TextFrontend}
+	pause := r.PauseScale
+	if pause == 0 {
+		pause = 1
+	}
+	if pause < MinPause || pause > MaxPause {
+		return nil, fmt.Errorf("停顿倍数须在 %.1f–%.1f 之间", MinPause, MaxPause)
+	}
+	p := map[string]any{"model_dir": r.Model.Dir(l), "speed": speed, "text_frontend": r.TextFrontend, "pause_scale": pause}
+	if g := r.Regenerate; g != nil {
+		if r.Mode == ModeVC || g.Manifest == "" || g.Index < 0 {
+			return nil, errors.New("无法重新生成这一段")
+		}
+		p["regenerate"] = map[string]any{"manifest": g.Manifest, "index": g.Index}
+	}
 	if r.Seed != nil {
 		p["seed"] = *r.Seed
 	}

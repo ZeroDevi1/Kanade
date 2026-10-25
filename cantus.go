@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -69,9 +74,21 @@ type cantusState struct {
 
 	job       string            // 最近提交的合成任务
 	jobName   string            // 最近提交任务结果的建议文件名
+	jobReq    cantus.Request    // 最近提交任务的请求（结果登记时记入 reqs）
 	downloads map[string]string // 模型 Key → 下载任务 ID
 	results   resultSet
 	err       string
+
+	pauseScale float64 // 段间停顿倍数（专业模式；智能模式为 1）
+	// 长文本的分段结果：reqs / manifests 按结果音频的路径记下合成它的请求与 segments.json，用于列出各段并重新生成。
+	reqs      map[string]cantus.Request
+	manifests map[string]string
+	// regenJob 是正在重新生成某一段的任务；regenIndex 是该段序号，regenFrom 是被修改的结果音频。
+	regenJob   string
+	regenIndex int
+	regenFrom  string
+	segPreview audioPreview // 单段试听
+	segShown   bool         // 分段列表是否展开
 }
 
 // styleNone 是智能模式风格下拉框中的「不指定」。
@@ -83,7 +100,8 @@ func newCantusState() cantusState {
 		sftASR: cantus.ASRModels[0], sftPart: cantus.SFTParts[0].Title, sftEpochs: 30, sftLR: 1e-5, sftWorkers: 4,
 		sftDevRatio: 0.05, sftScope: cantus.SFTLLMScopes[0].Title, style: styleNone,
 		sampling: cantus.DefaultSampling, samplingTop: float64(cantus.DefaultSampling.TopK),
-		samplingWin: float64(cantus.DefaultSampling.WinSize), seed: 1986}
+		samplingWin: float64(cantus.DefaultSampling.WinSize), seed: 1986, pauseScale: 1,
+		reqs: map[string]cantus.Request{}, manifests: map[string]string{}}
 }
 
 func (s *cantusState) model() cantus.Model {
@@ -227,7 +245,7 @@ func (a *app) cantusInputCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
 			a.cantusProInput(c, tk, m)
 		}
 		if s.mode() != cantus.ModeVC {
-			ui.TextArea(c, &s.text).Label("要合成的文本").Placeholder("输入文本，长文本会按句切分后依次合成").Height(120)
+			a.cantusTextInput(c)
 		}
 		if s.synthMode == modePro {
 			a.cantusProTuning(c)
@@ -339,6 +357,13 @@ func (a *app) cantusProTuning(c *ui.Context) {
 	if mode == cantus.ModeVC {
 		return
 	}
+	ui.Row(c).Gap(16).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, "段间停顿").FontSize(12)
+		ui.Slider(c, &s.pauseScale, cantus.MinPause, cantus.MaxPause).Label("段间停顿").Width(200)
+		ui.Textf(c, "%.2f×", s.pauseScale).FontSize(12).Font("monospace").Width(48)
+		ui.Text(c, "逗号处约 0.15 秒、句末 0.3 秒、换行 0.5 秒、空行分段 0.75 秒，按此倍数缩放。").FontSize(12).
+			TextColor(t.TextMuted).Grow(1)
+	})
 	ui.Row(c).Gap(12).AlignItems(ui.End).Children(func() {
 		ui.Checkbox(c, &s.seedFixed, "固定随机种子")
 		if s.seedFixed {
@@ -525,10 +550,40 @@ func (a *app) cantusSubmitRow(c *ui.Context) {
 	if s.err != "" {
 		ui.Text(c, s.err).FontSize(12).TextColor(t.Danger)
 	}
-	// 任务完成后登记结果（resultSet 按路径去重，只登记一次）。
-	if job.State == conductor.JobDone && len(job.Artifacts) > 0 {
-		s.results.add(a, job.Artifacts[0], s.jobName, s.jobName, true)
+	// 任务完成后登记结果（resultSet 按路径去重，只登记一次）。长文本取消时引擎会输出已合成部分的拼接，同样登记。
+	switch {
+	case job.State == conductor.JobDone:
+		a.registerCantusOutput(job, s.jobName, s.jobName, s.jobReq)
+	case job.State == conductor.JobCanceled:
+		if a.registerCantusOutput(job, s.jobName+"（已取消，部分）", s.jobName+"_部分", s.jobReq) {
+			s.err = "已取消：已合成的部分保留在结果中。"
+		}
 	}
+}
+
+// registerCantusOutput 登记任务的输出音频与分段结果（segments.json）；没有音频时返回 false。
+func (a *app) registerCantusOutput(job conductor.Job, title, name string, req cantus.Request) bool {
+	s := &a.cantus
+	var audio, manifest string
+	for _, p := range job.Artifacts {
+		switch strings.ToLower(filepath.Ext(p)) {
+		case ".wav":
+			audio = p
+		case ".json":
+			manifest = p
+		}
+	}
+	if audio == "" {
+		return false
+	}
+	if s.results.add(a, audio, title, name, true) {
+		req.Regenerate = nil
+		s.reqs[audio] = req
+		if manifest != "" {
+			s.manifests[audio] = manifest
+		}
+	}
+	return true
 }
 
 func (a *app) submitCantus() {
@@ -558,6 +613,9 @@ func (a *app) submitCantus() {
 			r.Sampling = &sp
 		}
 	}
+	if s.synthMode == modePro {
+		r.PauseScale = s.pauseScale
+	}
 	params, err := r.Params(a.be.layout)
 	if err != nil {
 		s.err = err.Error()
@@ -568,7 +626,7 @@ func (a *app) submitCantus() {
 		s.err = err.Error()
 		return
 	}
-	s.job, s.err = id, ""
+	s.job, s.err, s.jobReq = id, "", r
 	s.jobName = cantusResultName(r)
 }
 
@@ -591,9 +649,237 @@ func cantusResultName(r cantus.Request) string {
 	return voice + "_" + string(text)
 }
 
-// cantusResults 显示当前预览与本次运行生成的文件列表。
+// cantusResults 显示当前预览与本次运行生成的文件列表，以及当前结果的分段（长文本可逐段试听、重新生成）。
 func (a *app) cantusResults(c *ui.Context, tk *fluent.Tokens) {
 	a.cantus.results.show(c, tk, a, "生成的音频会显示在这里。")
+	a.cantusSegments(c, tk)
+}
+
+// shortcutName 是平台快捷键修饰键的名称（ui.Cmd：macOS 为 Command，其余为 Ctrl）。
+var shortcutName = map[bool]string{true: "⌘", false: "Ctrl"}[runtime.GOOS == "darwin"]
+
+// cantusTextMax 是文本框接受的最大字数（约 2 小时语音）：再长的内容请分成几次合成，便于中途检查效果。
+const cantusTextMax = 30000
+
+// cantusTextInput 是要合成的文本：字数、大致句数与语音时长，从文件导入与清空。
+func (a *app) cantusTextInput(c *ui.Context) {
+	t := c.Theme()
+	s := &a.cantus
+	area := ui.TextArea(c, &s.text).Label("要合成的文本").
+		Placeholder("输入或粘贴文本，" + shortcutName + "+Enter 开始生成。长文本会分段合成：换行与空行处停顿更长，过长的句子在逗号处切开；" +
+			"完成后可逐段试听、单独重新生成。").
+		Height(180)
+	if area.Shortcut(ui.Cmd, ui.KeyEnter) {
+		if _, active := a.jobStatusPeek(s.job); !active {
+			a.submitCantus()
+		}
+	}
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		chars, sents, secs := cantus.TextEstimate(s.text, s.speed)
+		note := "尚未输入文本"
+		if chars > 0 {
+			note = fmt.Sprintf("%d 字 · 约 %d 句 · 预计 %s 语音", chars, sents, clock(secondsDuration(secs)))
+		}
+		over := len([]rune(s.text)) > cantusTextMax
+		if over {
+			note += fmt.Sprintf(" · 超过 %d 字上限，请分几次合成", cantusTextMax)
+		}
+		txt := ui.Text(c, note).FontSize(12).TextColor(t.TextMuted).Grow(1)
+		if over {
+			txt.TextColor(t.Danger)
+		}
+		if ui.Button(c, "从文件导入…").Tooltip("读取 UTF-8 编码的 .txt / .md 文本文件").Clicked() {
+			a.pickFile("导入文本", mygo.FileFilter{Name: "文本", Extensions: []string{"txt", "md"}}, func(p string) {
+				text, err := readTextFile(p, cantusTextMax)
+				if err != nil {
+					s.err = err.Error()
+					return
+				}
+				s.text, s.err = text, ""
+			})
+		}
+		if s.text != "" && ui.Button(c, "清空").Clicked() {
+			s.text = ""
+		}
+	})
+}
+
+// readTextFile 读取 UTF-8 文本文件（去掉 BOM，统一换行）；超过 maxRunes 字或不是 UTF-8 时返回错误。
+func readTextFile(path string, maxRunes int) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
+	if !utf8.Valid(data) {
+		return "", fmt.Errorf("%s 不是 UTF-8 编码，请另存为 UTF-8 后再导入", filepath.Base(path))
+	}
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	if n := utf8.RuneCountInString(text); n > maxRunes {
+		return "", fmt.Errorf("%s 有 %d 字，超过 %d 字上限，请分几次合成", filepath.Base(path), n, maxRunes)
+	}
+	return text, nil
+}
+
+// secondsDuration 把秒数换成 time.Duration（供 clock 显示）。
+func secondsDuration(sec float64) time.Duration { return time.Duration(sec * float64(time.Second)) }
+
+// cantusSegments 列出当前结果的分段：文本、时长、可疑标记，可单独试听与重新生成。只有最新版本的结果可编辑
+// （重新生成会原地更新 segments.json，旧版本的音频仍在结果列表中）。
+func (a *app) cantusSegments(c *ui.Context, tk *fluent.Tokens) {
+	t := c.Theme()
+	s := &a.cantus
+	cur := s.results.preview.path
+	manifest := s.manifests[cur]
+	if manifest == "" {
+		return
+	}
+	segs, err := cantus.ReadSegments(manifest)
+	if err != nil {
+		ui.Text(c, "读取分段失败："+err.Error()).FontSize(12).TextColor(t.Danger)
+		return
+	}
+	a.cantusRegenStatus(c, segs)
+	if len(segs.Items) < 2 {
+		return
+	}
+	latest := filepath.Base(cur) == segs.Audio
+	suspicious := 0
+	for _, it := range segs.Items {
+		if it.Suspicious {
+			suspicious++
+		}
+	}
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		label := fmt.Sprintf("分段（%d 段）", len(segs.Items))
+		if s.segShown {
+			label = "收起分段"
+		}
+		if ui.Button(c, label).Clicked() {
+			s.segShown = !s.segShown
+		}
+		switch {
+		case suspicious > 0:
+			ui.Textf(c, "%d 段时长异常（可能读错、拖长或漏读），建议试听后重新生成", suspicious).FontSize(12).TextColor(t.Warning)
+		case segs.Partial:
+			ui.Text(c, "这是取消时已合成的部分").FontSize(12).TextColor(t.TextMuted)
+		}
+	})
+	if !s.segShown {
+		return
+	}
+	if !latest {
+		ui.Text(c, "这一版本之后又重新生成过段落，分段列表对应最新版本；切换到最新的结果后可继续修改。").FontSize(12).TextColor(t.TextMuted)
+		return
+	}
+	_, busy := a.jobStatusPeek(s.regenJob)
+	ui.Column(c.Key("cantus-segs")).Gap(2).AlignItems(ui.Stretch).Children(func() {
+		for i, it := range segs.Items {
+			ui.Row(c.Key(fmt.Sprintf("seg-%d-%s", i, it.File))).Gap(8).AlignItems(ui.Center).Padding(2, 4).
+				Radius(fluent.ControlRadius).Children(func() {
+				ui.Textf(c, "%d", i+1).FontSize(12).Font("monospace").TextColor(t.TextMuted).Width(28)
+				text := ui.Text(c, it.Text).FontSize(12).Grow(1).SingleLine().Tooltip(it.Text)
+				if it.Suspicious {
+					text.TextColor(t.Warning)
+				}
+				ui.Textf(c, "%.1f 秒", it.Duration).FontSize(12).Font("monospace").TextColor(t.TextMuted).Width(56)
+				path := segs.FilePath(i)
+				playing := s.segPreview.path == path && s.segPreview.player != nil && s.segPreview.player.Playing()
+				label := "试听"
+				if playing {
+					label = "停止"
+					c.After(100 * time.Millisecond)
+				}
+				if ui.Button(c, label).Width(56).Clicked() {
+					a.playSegment(path, playing)
+				}
+				regen := ui.Button(c, "重新生成").Disabled(busy).Tooltip("用新的随机种子重新合成这一段，其余段不变")
+				if busy && s.regenIndex == i {
+					regen = ui.Button(c, "生成中…").Disabled(true)
+				}
+				if regen.Clicked() {
+					a.regenerateSegment(cur, manifest, i)
+				}
+			})
+		}
+	})
+}
+
+// cantusRegenStatus 显示重新生成某段的进度；完成后把新的拼接结果加入列表并切换过去。
+func (a *app) cantusRegenStatus(c *ui.Context, segs *cantus.Segments) {
+	t := c.Theme()
+	s := &a.cantus
+	if s.regenJob == "" {
+		return
+	}
+	j, ok := a.be.cond.Job(s.regenJob)
+	if !ok {
+		return
+	}
+	switch j.State {
+	case conductor.JobDone:
+		from := s.results.find(s.regenFrom)
+		title, name := "重新生成", "重新生成"
+		if from != nil {
+			title = fmt.Sprintf("%s（改第 %d 段）", strings.Split(from.title, "（改第")[0], s.regenIndex+1)
+			name = from.name
+		}
+		req := s.reqs[s.regenFrom]
+		s.regenJob = ""
+		a.registerCantusOutput(j, title, name, req)
+	case conductor.JobFailed:
+		ui.Text(c, fmt.Sprintf("重新生成第 %d 段失败：%s", s.regenIndex+1, j.Err)).FontSize(12).TextColor(t.Danger).Selectable()
+	case conductor.JobCanceled:
+	default:
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Spinner(c)
+			ui.Text(c, j.Message).FontSize(12).TextColor(t.TextMuted).Grow(1).SingleLine()
+			if ui.Button(c, "取消").Clicked() {
+				a.be.cond.Cancel(j.ID)
+			}
+		})
+	}
+}
+
+// playSegment 试听一段（再次点击停止）；与结果预览互斥，开始试听时暂停预览。
+func (a *app) playSegment(path string, stop bool) {
+	s := &a.cantus
+	pv := &s.segPreview
+	if stop {
+		pv.player.Pause()
+		return
+	}
+	if p := s.results.preview.player; p != nil {
+		p.Pause()
+	}
+	if pv.path == path && pv.player != nil && !pv.loading {
+		pv.player.Seek(0)
+		pv.player.Play()
+		return
+	}
+	pv.reset()
+	pv.load(a, path)
+	pv.autoplay = true
+}
+
+// regenerateSegment 用合成 audio 时的请求重新生成第 index 段。
+func (a *app) regenerateSegment(audio, manifest string, index int) {
+	s := &a.cantus
+	r, ok := s.reqs[audio]
+	if !ok {
+		s.err = "找不到这次合成的参数，无法重新生成"
+		return
+	}
+	r.Regenerate = &cantus.Regenerate{Manifest: manifest, Index: index}
+	params, err := r.Params(a.be.layout)
+	if err == nil {
+		s.regenJob, err = a.be.cond.Submit(cantus.Engine, r.Task(), params)
+	}
+	if err != nil {
+		s.err = err.Error()
+		return
+	}
+	s.regenIndex, s.regenFrom, s.err = index, audio, ""
 }
 
 // cantusSpeakersCard 列出已保存音色，可删除。

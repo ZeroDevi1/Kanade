@@ -29,6 +29,8 @@ type audioPreview struct {
 	rate, ch int
 	// original 是文件本身的播放器；swap 换成其他音源后，restore 用它换回。
 	original *audio.Player
+	// autoplay 为 true 时，正在解码的文件解码完成后立即播放（随后清除）。
+	autoplay bool
 }
 
 // load 开始在后台解码 path；与当前文件相同时不做任何事。
@@ -59,6 +61,10 @@ func (pv *audioPreview) load(a *app, path string) {
 			}
 			pv.peaks, pv.player, pv.original = &la.peaks, la.player, la.player
 			pv.samples, pv.rate, pv.ch = la.samples, la.rate, la.ch
+			if pv.autoplay {
+				pv.autoplay = false
+				pv.player.Play()
+			}
 		})
 	}()
 }

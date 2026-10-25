@@ -1,9 +1,11 @@
 """CosyVoice 推理任务处理函数。
 
 worker 同一时间只持有一个已加载的模型（显存约 2–4 GB）；切换模型时先释放旧模型。
-推理以非流式方式逐句执行：文本先经上游 text_normalize 切分成句，每句完成后上报进度并检查取消，
-最后把各句音频拼接为一个 16-bit WAV。取消在句子内部也能生效：LLM 逐 token 采样时检查取消并返回结束 token
-（见 configure_sampling），当前句随即结束。
+推理以非流式方式逐段执行：分段、逐段检查与重试、按标点停顿拼接、保存各段音频见 longtext.py。各模式只提供
+「一段已归一化的文本 → 上游推理」的函数（模式所需的前缀按段加上）。取消在句子内部也能生效：LLM 逐 token 采样时
+检查取消并返回结束 token（见 configure_sampling），当前句随即结束，已合成的部分作为部分结果输出。
+
+带 regenerate {manifest, index} 时只重新合成此前结果（segments.json）中的一段并重新拼接，其余参数须与当时相同。
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from typing import Any, Callable, Iterable
 from kanade_engine import Cancelled, Job
 
 from . import download as dl
+from . import longtext
 
 # 各模型版本支持的模式，与 Go 端 internal/cantus/models.go 保持一致。
 # 依据上游 example.py 中各版本演示的接口：v1 基础模型无指令能力，SFT / Instruct 是单独的模型。
@@ -178,29 +181,23 @@ def speaker(job: Job, model, fam: str, params: dict) -> tuple[str, str, str]:
 
 # ---------- 推理与输出 ----------
 
-def synthesize(job: Job, model, text: str, text_frontend: bool, run: Callable[[], Iterable[dict]]) -> None:
-    """执行 run 返回的推理生成器，逐句上报进度，拼接后写出 WAV。
-
-    句数由上游 text_normalize 以同样参数预先计算；非流式推理对每句恰好产出一段音频。
-    """
+def synthesize(job: Job, model, text: str, text_frontend: bool, generate: Callable[[str], Iterable[dict]]) -> None:
+    """长文本合成（longtext.py）：generate(段落文本) 返回该段的上游推理生成器。带 regenerate 参数时只重做一段。"""
+    p = job.params
+    speed = float(p.get("speed") or 1.0)
+    seed = p.get("seed")
+    fixed = int(seed) if seed is not None and int(seed) >= 0 else None
+    regen = p.get("regenerate")
+    if regen:
+        longtext.regenerate(job, model, Path(regen["manifest"]), int(regen["index"]), generate, speed, fixed)
+        return
     if not text.strip():
         raise ValueError("文本为空")
-    segments = model.frontend.text_normalize(text, split=True, text_frontend=text_frontend)
-    total = max(len(segments), 1)
-    job.progress(0.1, f"共 {total} 句")
-    chunks = []
-    try:
-        for i, out in enumerate(run()):
-            chunks.append(out["tts_speech"])
-            job.progress(0.1 + 0.88 * min(i + 1, total) / total, f"已合成 {min(i + 1, total)}/{total} 句")
-    except Cancelled:
-        raise
-    except Exception as exc:
-        # 取消时 LLM 被提前截断，残缺的 token 序列可能让后续的 flow / 声码器报错；此时按取消处理而不是失败。
-        if job.cancelled:
-            raise Cancelled() from exc
-        raise
-    write_output(job, model, chunks)
+    pause = float(p.get("pause_scale") or 1.0)
+    if not 0.2 <= pause <= 3:
+        raise ValueError("停顿倍数须在 0.2–3 之间")
+    segs = longtext.plan(model, text, text_frontend)
+    longtext.synthesize(job, model, segs, generate, speed, pause, fixed)
 
 
 def write_output(job: Job, model, chunks: list) -> None:
@@ -279,19 +276,23 @@ def zero_shot(job: Job) -> None:
     wav, prompt_text, spk = speaker(job, model, fam, p)
     if not spk and not p.get("prompt_text"):
         raise ValueError("零样本克隆需要填写参考音频对应的文本")
-    text = p["text"]
-    synthesize(job, model, text, tf, lambda: model.inference_zero_shot(
-        text, prompt_text, wav, zero_shot_spk_id=spk, stream=False, speed=speed, text_frontend=tf))
+    # 各段以 text_frontend=False 合成（已归一化），参考文本在这里先归一化一次。
+    prompt_text = model.frontend.text_normalize(prompt_text, split=False, text_frontend=tf)
+    synthesize(job, model, p.get("text") or "", tf, lambda seg: model.inference_zero_shot(
+        seg, prompt_text, wav, zero_shot_spk_id=spk, stream=False, speed=speed, text_frontend=False))
 
 
 def cross_lingual(job: Job) -> None:
     p, model, fam, speed, tf = _common(job, "cross_lingual")
     wav, _, spk = speaker(job, model, fam, p)
-    text = p["text"]
-    if fam == "v3" and END not in text:
-        text = f"{V3_SYSTEM}{END}{text}"
-    synthesize(job, model, text, tf, lambda: model.inference_cross_lingual(
-        text, wav, zero_shot_spk_id=spk, stream=False, speed=speed, text_frontend=tf))
+
+    def generate(seg: str):
+        # CosyVoice 3 的系统提示按段加：加在整段正文前会让上游因 <|…|> 跳过归一化与切分（整篇一次合成）。
+        if fam == "v3" and END not in seg:
+            seg = f"{V3_SYSTEM}{END}{seg}"
+        return model.inference_cross_lingual(seg, wav, zero_shot_spk_id=spk, stream=False, speed=speed, text_frontend=False)
+
+    synthesize(job, model, p.get("text") or "", tf, generate)
 
 
 def sft(job: Job) -> None:
@@ -299,26 +300,29 @@ def sft(job: Job) -> None:
     spk_id = p.get("spk_id") or ""
     if spk_id not in model.list_available_spks():
         raise ValueError(f"预训练音色不存在：{spk_id}，可用：{'、'.join(model.list_available_spks())}")
-    text = p["text"]
+    text = p.get("text") or ""
     if fam == "v3-sft":
-        synthesize(job, model, text, tf, lambda: _sft_v3(model, text, spk_id, p.get("instruct") or "", speed, tf))
+        prompt = _sft_v3_prompt(model, p.get("instruct") or "", tf)
+        synthesize(job, model, text, tf, lambda seg: _sft_v3(model, seg, spk_id, prompt, speed))
         return
-    synthesize(job, model, text, tf, lambda: model.inference_sft(text, spk_id, stream=False, speed=speed, text_frontend=tf))
+    synthesize(job, model, text, tf, lambda seg: model.inference_sft(seg, spk_id, stream=False, speed=speed, text_frontend=False))
 
 
-def _sft_v3(model, text: str, spk_id: str, guide: str, speed: float, tf: bool):
-    """CosyVoice 3 SFT 推理：LLM 要求 <|endofprompt|> 出现在提示或正文中，上游 inference_sft 不提供提示，
-    因此逐句构造输入并注入 prompt_text（默认只有标记本身，减少提示内容泄露到语音；guide 可写情绪 / 风格引导）。
-    采样参数与随机种子已由 configure_sampling 设置。"""
+def _sft_v3_prompt(model, guide: str, tf: bool):
+    """CosyVoice 3 SFT 的提示 token：LLM 要求 <|endofprompt|> 出现在提示或正文中，上游 inference_sft 不提供提示，
+    因此注入 prompt_text（默认只有标记本身，减少提示内容泄露到语音；guide 可写情绪 / 风格引导）。"""
     prompt = guide.strip()
     if END not in prompt:
         prompt += END
     prompt_norm = model.frontend.text_normalize(prompt, split=False, text_frontend=tf)
-    prompt_token, prompt_len = model.frontend._extract_text_token(prompt_norm)
-    for seg in model.frontend.text_normalize(text, split=True, text_frontend=tf):
-        model_input = model.frontend.frontend_sft(seg, spk_id)
-        model_input["prompt_text"], model_input["prompt_text_len"] = prompt_token, prompt_len
-        yield from model.model.tts(**model_input, stream=False, speed=speed)
+    return model.frontend._extract_text_token(prompt_norm)
+
+
+def _sft_v3(model, seg: str, spk_id: str, prompt, speed: float):
+    """CosyVoice 3 SFT 合成一段。采样参数与随机种子已由 configure_sampling 设置。"""
+    model_input = model.frontend.frontend_sft(seg, spk_id)
+    model_input["prompt_text"], model_input["prompt_text_len"] = prompt
+    yield from model.model.tts(**model_input, stream=False, speed=speed)
 
 
 def instruct(job: Job) -> None:
@@ -326,20 +330,20 @@ def instruct(job: Job) -> None:
     instr = instruct_text_for(fam, p.get("instruct") or "")
     if instr == END or not instr.strip():
         raise ValueError("请填写指令文本")
-    text = p["text"]
+    text = p.get("text") or ""
     if fam == "v1-instruct":
         spk_id = p.get("spk_id") or ""
         if spk_id not in model.list_available_spks():
             raise ValueError(f"预训练音色不存在：{spk_id}")
-        synthesize(job, model, text, tf, lambda: model.inference_instruct(
-            text, spk_id, instr, stream=False, speed=speed, text_frontend=tf))
+        synthesize(job, model, text, tf, lambda seg: model.inference_instruct(
+            seg, spk_id, instr, stream=False, speed=speed, text_frontend=False))
         return
     # 不传已注册的 zero_shot_spk_id：上游 frontend_zero_shot 在给定 spk_id 时整体取用 spk2info 中缓存的输入，
     # 其中 prompt_text 是参考音频的文本，instruct 文本被忽略；frontend_instruct2 又删掉了参考语音 token，
     # 结果模型会把参考文本也念出来。直接用参考音频提取特征，每次多花一点提取时间。
     wav, _, _ = speaker(job, model, fam, p)
-    synthesize(job, model, text, tf, lambda: model.inference_instruct2(
-        text, instr, wav, zero_shot_spk_id="", stream=False, speed=speed, text_frontend=tf))
+    synthesize(job, model, text, tf, lambda seg: model.inference_instruct2(
+        seg, instr, wav, zero_shot_spk_id="", stream=False, speed=speed, text_frontend=False))
 
 
 def vc(job: Job) -> None:

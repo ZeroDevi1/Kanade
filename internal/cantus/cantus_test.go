@@ -113,3 +113,24 @@ func TestSFTCheckpoints(t *testing.T) {
 		t.Errorf("%v %v", p, err)
 	}
 }
+
+func TestTextEstimate(t *testing.T) {
+	for _, tc := range []struct {
+		text       string
+		chars, sen int
+		secs       float64
+	}{
+		{"今天天气很好。\n\n明天下雨。", 12, 2, 2.2},
+		{"Hello world. How are you?", 21, 2, 5 * secPerWord},
+		{"没有句号的一句", 7, 1, 7 * secPerHan},
+		{"[laughter]<|zh|>  ", 0, 0, 0},
+	} {
+		c, n, s := TextEstimate(tc.text, 1)
+		if c != tc.chars || n != tc.sen || s < tc.secs-1e-9 || s > tc.secs+1e-9 {
+			t.Errorf("%q: %d 字 %d 句 %.2f 秒", tc.text, c, n, s)
+		}
+	}
+	if _, _, s := TextEstimate("一二三四", 2); s != 4*secPerHan/2 {
+		t.Errorf("speed 2: %v", s)
+	}
+}

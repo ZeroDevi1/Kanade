@@ -11,7 +11,9 @@
 - cosyvoice.sft_prepare / cosyvoice.sft_train / cosyvoice.sft_assemble：CosyVoice 3 说话人 SFT，见 sft.py。
 
 除 vc 外的合成任务都可另带 seed（固定随机种子）与 sampling {top_p, top_k, win_size, tau_r}（LLM 采样），
-见 tasks.configure_sampling。
+见 tasks.configure_sampling；pause_scale（段间停顿倍数，默认 1）；regenerate {manifest, index}（只重新生成此前
+结果中的一段）。长文本分段合成、逐段检查与重试见 longtext.py；产物为拼接后的 WAV（kind audio）与
+segments.json（kind segments）。
 
 模型版本由 model_dir 中的 yaml 判断，各版本支持的模式见 MODES；Go 端按同一张表限制界面选项。
 """
