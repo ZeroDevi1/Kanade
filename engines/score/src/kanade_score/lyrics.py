@@ -1,7 +1,8 @@
 """歌词对齐：把 LRC 歌词逐字对到主唱上，再把字分配给 SOME 识别出的音符（一字多音即连音 / 转音）。
 
 流程：
-1. 解析 LRC：逐行时间戳 + 文本，去掉标题、作词作曲等署名与版权提示行（这些行不唱）。每个汉字、每个拉丁单词是一个「字」（一个音节）。
+1. 解析 LRC：逐行时间戳 + 文本，去掉标题、作词作曲等署名与版权提示行（这些行不唱）。每个汉字、每个拉丁单词是一个「字」（一个音节）；
+   日文的假名按拍成字，汉字按 [kana:] 注音的拍数占时长。
 2. 字级强制对齐：中文 wav2vec2 CTC 模型（jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn）逐帧给出字符概率，
    用 CTC Viterbi 求整首歌词的最优路径，得到每个字的起点。两条约束来自 2026-10-21 用真实歌曲的实测：
    - LRC 行首作锚点：每行首字只能落在该行时间戳 ±ANCHOR_S 内。不加锚点时，置信度低的长音处会把下一行首字
@@ -18,7 +19,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -52,26 +53,77 @@ GAME_MAX_TAIL_S = 4.0
 class Line:
     time: float  # LRC 时间戳（秒）
     text: str
-    words: list[str]  # 字（汉字或拉丁单词）
+    # words 是字：汉字（日文按注音合并的几个汉字，如「今日」）、拉丁单词、数字，或日文的一拍假名（拗音小字、
+    # 促音、长音并入前一个假名）。morae 与之一一对应：这个字唱几拍（日文汉字为注音的拍数，没有注音时为 1；其余为 1）。
+    words: list[str]
+    morae: list[int] = field(default_factory=list)
+    # japanese 为 True 表示行内有假名：对齐时不用中文模型对这些字的概率（见 align）。
+    japanese: bool = False
 
 
 _TAG = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
 _OFFSET = re.compile(r"\[offset:\s*([+-]?\d+)\]", re.I)
-_WORD = re.compile(r"[A-Za-z']+|[㐀-鿿豈-﫿]|\d")
-# 整行包在一对括号里的提示（【】、[]、()、（）、〔〕、「」）。
-_BRACKETED = re.compile(r"[【\[(（〔「].*[】\])）〕」]")
+# 字：拉丁单词、汉字（含「々」）、单个假名、数字。
+_WORD = re.compile(r"[A-Za-z']+|[㐀-鿿豈-﫿々]|[぀-ヿ]|\d")
+_KANJI = re.compile(r"[㐀-鿿豈-﫿々]")
+_KANA = re.compile(r"[぀-ヿ]")
+# 并入前一个假名的字：拗音小字不占拍，促音与长音占一拍但不单独成字（唱的时候通常不另起一个音）。
+_YOON = set("ゃゅょぁぃぅぇぉゎャュョァィゥェォヮ")
+_ATTACH = _YOON | set("っッー")
+# [kana:1はる1ひ1かげ…]：按出现顺序给每个汉字（或连续几个汉字）注读音，数字为这段读音覆盖的汉字个数。
+_KANA_TAG = re.compile(r"\[kana:([^\]]*)\]")
+_KANA_PAIR = re.compile(r"(\d+)([^\d]+)")
+# 整行包在一对【】或〔〕里的提示（「【未经著作权人许可不得翻唱翻录或使用】」）。圆括号里的整行通常是和声歌词
+# （「（せつなくて いとおしい）」），照常对齐。
+_BRACKETED = re.compile(r"[【〔].*[】〕]")
 # 版权提示的常见用语：平台在歌词开头插入的这类行不唱。
 _NOTICE_WORDS = ("未经", "著作权", "版权所有", "翻唱翻录", "禁止翻唱", "商业使用")
 
 
 def _is_meta(body: str) -> bool:
-    """报告一行是否不是唱出来的歌词：含全角或半角冒号的署名行（「词：」「作曲:」「OP:」等）、整行包在括号里的提示
-    （「【未经著作权人许可不得翻唱翻录或使用】」）或含版权提示用语的行。"""
+    """报告一行是否不是唱出来的歌词：含全角或半角冒号的署名行（「词：」「作曲:」「OP:」等）、整行包在【】里的提示
+    或含版权提示用语的行。"""
     if "：" in body or ":" in body:
         return True
     if _BRACKETED.fullmatch(body):
         return True
     return any(k in body for k in _NOTICE_WORDS)
+
+
+def _mora_count(kana: str) -> int:
+    """假名串的拍数：拗音小字不计，其余（含促音、长音、拨音）各一拍；至少为 1。"""
+    return max(1, sum(1 for ch in kana if _KANA.match(ch) and ch not in _YOON))
+
+
+def _tokenize(body: str, readings: dict[int, tuple[int, str]]) -> tuple[list[str], list[int]]:
+    """把一行切成字与每个字的拍数。readings 为 {汉字在 body 中的位置: (覆盖的汉字个数, 读音)}。"""
+    words: list[str] = []
+    morae: list[int] = []
+    skip_to = -1
+    for m in _WORD.finditer(body):
+        i, w = m.start(), m.group()
+        if i < skip_to:
+            continue  # 已并入前一个按注音合并的汉字
+        if _KANA.match(w):
+            # 接在假名或汉字（其读音的最后一拍）后面的拗音小字、促音、长音并入前一个字。
+            if w in _ATTACH and words and (_KANA.match(words[-1][-1]) or _KANJI.match(words[-1][-1])):
+                words[-1] += w
+                if w not in _YOON:
+                    morae[-1] += 1
+                continue
+            words.append(w)
+            morae.append(1)
+            continue
+        if _KANJI.match(w) and i in readings:
+            k, reading = readings[i]
+            end = i + k
+            words.append(body[i:end])
+            morae.append(_mora_count(reading))
+            skip_to = end
+            continue
+        words.append(w)
+        morae.append(1)
+    return words, morae
 
 
 def parse_lrc(text: str) -> list[Line]:
@@ -80,9 +132,17 @@ def parse_lrc(text: str) -> list[Line]:
     支持一行多个时间戳（副歌复用）与 [offset:毫秒]（正值表示歌词提前）。去掉的行：没有字的行、署名与版权提示行
     （_is_meta），以及标题行——0 秒处含 " - " 的行，或 0 秒处、按时间紧随其后的一行是署名或提示行的行（常见的
     「歌名 / 作词… / 作曲… / 【提示】」开头）。这些行不唱，留下会被强制对齐硬塞进第一句之前，挤乱后面的字。
+
+    日文歌词：假名按拍切成字；有 [kana:] 注音时给汉字配上读音，按读音的拍数决定这个字在对齐时占几拍。注音按
+    文件中带时间戳的各行（含被去掉的标题、署名行）里汉字出现的顺序依次消耗。
     """
     offset = 0.0
-    entries: list[tuple[float, str, bool]] = []  # (时间, 文本, 是否署名或提示行)
+    pairs: list[tuple[int, str]] = []
+    if m := _KANA_TAG.search(text):
+        pairs = [(int(k), r) for k, r in _KANA_PAIR.findall(m[1])]
+    next_pair = 0
+    # (时间, 文本, 是否署名或提示行, 字, 拍数)
+    entries: list[tuple[float, str, bool, list[str], list[int]]] = []
     for raw in text.splitlines():
         if m := _OFFSET.search(raw):
             offset = int(m[1]) / 1000
@@ -93,19 +153,34 @@ def parse_lrc(text: str) -> list[Line]:
         body = raw[stamps[-1].end():].strip()
         if not body:
             continue
+        # 按出现顺序给本行的汉字配注音（每个文件行只消耗一次，与时间戳个数无关）。
+        readings: dict[int, tuple[int, str]] = {}
+        i = 0
+        while i < len(body):
+            if _KANJI.match(body[i]) and next_pair < len(pairs):
+                k, reading = pairs[next_pair]
+                next_pair += 1
+                run = 1
+                while run < k and i + run < len(body) and _KANJI.match(body[i + run]):
+                    run += 1
+                readings[i] = (run, reading)
+                i += run
+                continue
+            i += 1
+        words, morae = _tokenize(body, readings)
+        meta = _is_meta(body)
         for s in stamps:
             t = int(s[1]) * 60 + float(s[2]) - offset
-            entries.append((max(t, 0.0), body, _is_meta(body)))
+            entries.append((max(t, 0.0), body, meta, words, morae))
     entries.sort(key=lambda e: e[0])
     lines: list[Line] = []
-    for i, (t, body, meta) in enumerate(entries):
+    for i, (t, body, meta, words, morae) in enumerate(entries):
         if meta:
             continue
         if t < 0.5 and (" - " in body or (i + 1 < len(entries) and entries[i + 1][2])):
             continue
-        words = _WORD.findall(body)
         if words:
-            lines.append(Line(t, body, words))
+            lines.append(Line(t, body, words, morae, japanese=bool(_KANA.search(body))))
     return lines
 
 
@@ -199,6 +274,8 @@ def align(job: Job, y_mono: np.ndarray, sr: int, lines: list[Line], lo: float, h
     fps = T / (len(y) / SR)
 
     # 2. token 序列：汉字一个 token，拉丁单词按字母（词表为大写）；行首 token 加锚点。
+    #    日文行（模型是中文的，假名不在词表里，汉字的中文读音也与演唱不符）：每个字按拍数放几个通配 token，
+    #    只要求那几帧有人声，字的时长按拍数分配。
     toks: list[int] = []
     owner: list[int] = []  # token → 字序号
     words: list[dict] = []
@@ -207,8 +284,12 @@ def align(job: Job, y_mono: np.ndarray, sr: int, lines: list[Line], lo: float, h
         for wi, w in enumerate(line.words):
             if wi == 0:
                 anchors[len(toks)] = (max(0, round((line.time - ANCHOR_S) * fps)), round((line.time + ANCHOR_S) * fps))
-            for ch in (w.upper() if w.isascii() else w):
-                toks.append(vocab.get(ch, -1))
+            if line.japanese:
+                ids = [-1] * (line.morae[wi] if wi < len(line.morae) else 1)
+            else:
+                ids = [vocab.get(ch, -1) for ch in (w.upper() if w.isascii() else w)]
+            for tid in ids:
+                toks.append(tid)
                 owner.append(len(words))
             words.append({"text": w, "line": li})
     hop = SR / fps
