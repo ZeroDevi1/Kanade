@@ -44,6 +44,8 @@ func (a *app) pageColumn(c *ui.Context, tk *fluent.Tokens, maxW float32) {
 			a.stemsPage(c, tk)
 		case "score":
 			a.scorePage(c, tk)
+		case "inspire":
+			a.inspirePage(c, tk)
 		case "tasks":
 			a.tasksPage(c, tk)
 		case "settings":

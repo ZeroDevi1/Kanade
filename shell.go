@@ -30,6 +30,7 @@ var (
 		{"timbre", "音色转换", iconTimbre},
 		{"stems", "分轨", iconStems},
 		{"score", "音乐分析", iconScore},
+		{"inspire", "灵感", iconInspire},
 	}
 	navFooter = []navItem{
 		{"tasks", "任务", iconTasks},
@@ -51,6 +52,9 @@ func (a *app) view(c *ui.Context) {
 				BorderWidth(1, 0, 0, 1).BorderColor(tk.CardStroke).Clip().
 				Children(func() {
 					ui.Scroll(c).Grow(1).Children(func() { a.page(c, tk) })
+					if a.current == "score" {
+						a.scoreDock(c, tk)
+					}
 				})
 		})
 	})

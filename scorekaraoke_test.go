@@ -7,10 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/egoist/mygo/audio"
 	"github.com/egoist/mygo/ui"
 
 	"kanade/engines"
 	"kanade/internal/conductor"
+	"kanade/internal/mic"
 	"kanade/internal/paths"
 	"kanade/internal/score"
 )
@@ -43,7 +45,7 @@ func TestScoreKaraokeCard(t *testing.T) {
 		(<-updates)()
 		tt.Frame()
 	}
-	if !tt.HasText("K 歌跟唱") || !tt.HasText("从头开始跟唱") || !tt.HasText("没有分离出的伴奏（分析时未分离），播放原曲。") {
+	if !tt.HasText("K 歌跟唱") || !tt.HasText("K 歌模式") || !tt.HasText("没有分离出的伴奏（分析时未分离），播放原曲。") {
 		t.Fatalf("karaoke card: %q", tt.Texts())
 	}
 	if !tt.HasText("我不") || !tt.HasText("想念") {
@@ -83,6 +85,41 @@ func TestScoreKaraokeCard(t *testing.T) {
 	}
 	if err := tt.Click("清除结果"); err != nil || a.score.karaoke.report != nil {
 		t.Errorf("clear: %v", err)
+	}
+
+	// K 歌模式：开启后播放控制条与各视图跟随伴奏；录音中暂停即结束并评价；关闭后试听接着伴奏的位置。
+	// 真实录音需要麦克风，这里直接放入进行中的会话代替 record。
+	if !tt.HasText("歌.flac") || !tt.HasText("试听") || a.scoreClock() != a.score.preview.player {
+		t.Fatalf("dock: %q", tt.Texts())
+	}
+	k := &a.score.karaoke
+	acc := audio.NewSound(8000, 1, make([]float32, 48000)).NewPlayer()
+	k.accomp, k.source = "accomp.wav", karaokeAccomp
+	k.accompAudio.path, k.accompAudio.player = "accomp.wav", acc
+	a.score.preview.player.Seek(3 * time.Second)
+	if err := tt.Click("K 歌模式"); err != nil || !k.on {
+		t.Fatalf("toggle on: %v", err)
+	}
+	tt.Frame()
+	if a.scoreClock() != acc || !tt.HasText("K 歌模式 · 伴奏") || math.Abs(acc.Position().Seconds()-3) > 0.01 {
+		t.Fatalf("clock in karaoke mode at %v: %q", acc.Position(), tt.Texts())
+	}
+	acc.Play()
+	k.capture, k.sess, k.start, k.last = &mic.Capture{}, score.NewKaraokeSession(mic.Rate), 3, 3
+	tt.Frame()
+	if !k.singing() || !tt.HasText("K 歌模式 · 伴奏 · 录音中") {
+		t.Fatalf("singing: %q", tt.Texts())
+	}
+	acc.Pause()
+	tt.Frame()
+	if k.singing() || k.report == nil {
+		t.Fatalf("pause should finish and score")
+	}
+	if err := tt.Click("K 歌模式"); err != nil || k.on {
+		t.Fatalf("toggle off: %v", err)
+	}
+	if a.scoreClock() != a.score.preview.player || math.Abs((a.score.preview.player.Position()-acc.Position()).Seconds()) > 0.01 {
+		t.Errorf("preview after karaoke at %v, accompaniment at %v", a.score.preview.player.Position(), acc.Position())
 	}
 }
 

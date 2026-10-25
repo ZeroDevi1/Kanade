@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"slices"
 	"sort"
-	"time"
 
 	"github.com/egoist/mygo/ui"
 
@@ -155,28 +154,12 @@ func (a *app) scoreRollCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysi
 	t := c.Theme()
 	s := &a.score.sheet
 	r := &s.roll
-	pv := &a.score.preview
 	available := s.trackAvailable()
 	audible := s.mix.Audible(available)
 	changed := false
-	rollTick(c, pv)
 	el := card(c, tk, "多轨卷帘", func() {
-		// 顶栏：播放、可视范围、跟随与合成状态。
+		// 顶栏：可视范围、跟随与合成状态（播放由页面底部的控制条控制）。
 		ui.Row(c).Wrap().Gap(12).AlignItems(ui.Center).Children(func() {
-			if p := pv.player; p != nil && !pv.loading {
-				label := "播放"
-				if p.Playing() {
-					label = "暂停"
-				}
-				if ui.Button(c.Key("roll-play"), label).Width(72).Clicked() {
-					if p.Playing() {
-						p.Pause()
-					} else {
-						p.Play()
-					}
-				}
-				ui.Textf(c, "%s / %s", clock(p.Position()), clock(p.Duration())).Font("monospace").FontSize(12).TextColor(t.TextMuted)
-			}
 			if ui.Segmented(c, &r.window, titles(rollWindows, func(w rollWindow) string { return w.title })...).
 				Label("可视范围").Changed() {
 				r.span = 0 // 选择预设时放弃滚轮缩放出的时长
@@ -342,7 +325,7 @@ func (a *app) rollLane(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, i 
 		// 位置在绘制时读取：播放中每帧重画（AnimationFrame），不必重建视图。
 		pos := -1.0
 		playing := false
-		if pl := pv.player; pl != nil && !pv.loading {
+		if pl := a.scoreClock(); pl != nil {
 			pos, playing = pl.Position().Seconds(), pl.Playing()
 		}
 		v0, v1 := r.rollView(pos, res.Duration)
@@ -441,13 +424,6 @@ func rollWaveform(p *ui.Painter, rect ui.Rect, pv *audioPreview, v0, v1 float64,
 			top, bot = mid-0.5, mid+0.5
 		}
 		p.Fill(ui.Rect{X: rect.X + float32(k)*2, Y: top, W: 1.4, H: bot - top}, color, 0)
-	}
-}
-
-// rollTick 让播放中的卡片每 100 ms 重建一次，更新顶栏的时间（卷帘本身在绘制时逐帧更新）。
-func rollTick(c *ui.Context, pv *audioPreview) {
-	if p := pv.player; p != nil && p.Playing() {
-		c.After(100 * time.Millisecond)
 	}
 }
 

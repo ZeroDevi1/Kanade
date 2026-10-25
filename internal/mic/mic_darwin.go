@@ -98,7 +98,12 @@ func load() error {
 	return loadErr
 }
 
-func start(fn func([]float32)) (func(), error) {
+// devices 返回 nil：macOS 只录系统默认输入设备（Audio Queue 指定设备需另经 Core Audio 枚举设备 UID，尚未实现），
+// 界面因此不提供选择。
+func devices() []string { return nil }
+
+// start 忽略 device，总是使用系统默认输入设备（见 devices）。
+func start(_ string, fn func([]float32)) (func(), error) {
 	if err := load(); err != nil {
 		return nil, err
 	}

@@ -15,19 +15,29 @@ import (
 
 	"kanade/internal/mic"
 	"kanade/internal/score"
+	"kanade/internal/settings"
 	"kanade/internal/ui/fluent"
 )
 
-// K 歌跟唱卡片：播放分离出的伴奏（没有时播放原曲），从麦克风录下演唱，实时显示目标旋律与唱出的音高；
-// 停止后对照旋律线给出音准、覆盖与气息的评价（score.AnalyzeKaraoke），并列出最需要练习的乐句。
+// K 歌跟唱卡片：开启「K 歌模式」后，页面底部的播放控制条改为播放分离出的伴奏（没有时播放原曲），播放即从麦克风
+// 录下演唱，实时显示目标旋律与唱出的音高；暂停或播完时对照旋律线给出音准、覆盖与气息的评价
+// （score.AnalyzeKaraoke），并列出最需要练习的乐句。
 //
-// 生命周期：sing 开始录音与播放；每帧检查伴奏是否播完，播完或点「停止」时 finish 停止录音并评价。
+// 生命周期：karaokeFollow 每帧跟随伴奏的播放状态——开始播放时 record 开始录音，暂停、播完或跳转时 finish 结束
+// 这一段并评价（跳转后若仍在播放，下一帧从新位置重新录）。关闭 K 歌模式时结束演唱、把试听移到伴奏的位置。
 // 换记录、离开页面不会自动停止（与试听一致），切换记录时 sync 发现记录变了会先结束当前演唱。
 
 // karaokeView 是实时视图显示的时间范围（秒）：当前位置之前 karaokeBehind、之后 karaokeAhead。
 const (
 	karaokeBehind = 3.0
 	karaokeAhead  = 5.0
+)
+
+// karaokeJumpBack / karaokeJumpAhead 是判定跳转的位置变化（秒）：两次检查之间位置倒退超过前者或前进超过后者
+// 视为用户拖动了进度条（经验值：前进留出界面卡顿时正常播放走过的时长）。
+const (
+	karaokeJumpBack  = 0.3
+	karaokeJumpAhead = 1.5
 )
 
 // karaokeGoodPhrase 是乐句「唱得好」的分数线（经验值：约 80% 的帧在 ±50 音分内且唱满）：达到的不列入多练。
@@ -42,6 +52,8 @@ const (
 // karaokeState 是 K 歌卡片的状态，属于 scoreState。只在 UI 线程修改（录音回调只写 sess）。
 type karaokeState struct {
 	run *score.Run // 所属记录；与当前显示的记录不同时重置
+	// on 是 K 歌模式开关：开启时页面的播放控制条控制伴奏，播放即跟唱（见 karaokeFollow）。
+	on bool
 	// accomp 是该记录分离出的伴奏路径（打开记录时查找一次；空为没有）；source 是所选音源。
 	accomp string
 	source int
@@ -49,14 +61,67 @@ type karaokeState struct {
 	// 不再解码一遍。src 是当前所用的一个，由 sync 设置。
 	accompAudio audioPreview
 	src         *audioPreview
-	// 进行中的演唱：capture 非 nil 时正在录音。start 是开始时的歌曲位置（秒）。
-	capture *mic.Capture
-	sess    *score.KaraokeSession
-	start   float64
+	// 进行中的演唱：capture 非 nil 时正在录音。start 是开始时的歌曲位置（秒），last 是上一次检查时的位置
+	// （用于发现跳转）。
+	capture     *mic.Capture
+	sess        *score.KaraokeSession
+	start, last float64
 	// 上一次的评价与录音（16 位 WAV 字节在保存时才生成）。
 	report    *score.KaraokeReport
 	recording []float32
 	err       string
+	// mics 是可选的录音设备（mic.Devices），micsAt 是上次开始枚举的时间。枚举较慢（设备多时上百毫秒），
+	// 所以在后台进行、至多每 2 秒一次（演唱中不枚举），插拔设备后自动更新；micsBusy 为 true 时正在枚举。
+	mics     []string
+	micsAt   time.Time
+	micsBusy bool
+}
+
+// karaokeMicDefault 是录音设备下拉框中「系统默认」一项（对应设置中的空串）。
+const karaokeMicDefault = "系统默认"
+
+// micChoice 构建录音设备下拉框，所选设备保存在设置中（Settings.KaraokeMic）。
+// 平台不支持选择设备时（mic.Devices 为空）不显示。已保存但当前未连接的设备仍列出并标注，录音时 mic.Start 会报错。
+func (a *app) micChoice(c *ui.Context) {
+	k := &a.score.karaoke
+	if !k.micsBusy && !k.singing() && time.Since(k.micsAt) > 2*time.Second {
+		k.micsBusy, k.micsAt = true, time.Now()
+		go func() {
+			devs := mic.Devices()
+			a.post(func() { k.mics, k.micsBusy = devs, false })
+		}()
+	}
+	if len(k.mics) == 0 {
+		return
+	}
+	saved := a.be.settings.KaraokeMic
+	options := append([]string{karaokeMicDefault}, k.mics...)
+	sel := karaokeMicDefault
+	if saved != "" {
+		sel = saved
+		if !slices.Contains(k.mics, saved) {
+			sel = saved + "（未连接）"
+			options = append(options, sel)
+		}
+	}
+	if !ui.Select(c, &sel, options).Label("录音设备").Width(220).Disabled(k.singing()).
+		Tooltip("跟唱时录音所用的麦克风").Changed() {
+		return
+	}
+	name := sel
+	switch {
+	case sel == karaokeMicDefault:
+		name = ""
+	case !slices.Contains(k.mics, sel): // 重新选了未连接的那一项
+		return
+	}
+	next := a.be.settings
+	next.KaraokeMic = name
+	if err := settings.Save(a.be.userData, next); err != nil {
+		k.err = "保存录音设备失败：" + err.Error()
+		return
+	}
+	a.be.settings = next
 }
 
 // sync 在显示的记录变化时结束演唱并重置状态，查找伴奏；选了伴奏时开始解码它。
@@ -101,42 +166,95 @@ func (k *karaokeState) stop() {
 	}
 }
 
-// sing 从歌曲时间 from（秒）开始播放伴奏并录音。
-func (a *app) sing(from float64) {
+// setKaraoke 打开或关闭 K 歌模式。伴奏与试听是两个播放器：切换时暂停原来的一个，并把新的一个移到它的位置，
+// 各视图（都跟随 scoreClock）不会跳动。关闭时先结束进行中的演唱并评价。
+func (a *app) setKaraoke(on bool, res *score.Analysis) {
 	k := &a.score.karaoke
+	from, to := a.score.preview.player, k.player()
+	if !on {
+		if k.singing() && to != nil {
+			a.finish(res, to.Position().Seconds())
+		}
+		from, to = to, from
+	}
+	k.on = on
+	if from == nil || to == nil || from == to {
+		return
+	}
+	from.Pause()
+	to.Seek(from.Position())
+}
+
+// sing 从歌曲时间 from（秒）开始跟唱（打开 K 歌模式、播放伴奏，下一帧 karaokeFollow 开始录音）。
+func (a *app) sing(from float64, res *score.Analysis) {
+	k := &a.score.karaoke
+	if !k.on {
+		a.setKaraoke(true, res)
+	}
 	p := k.player()
 	if p == nil {
 		return
 	}
-	if pv := a.score.preview.player; pv != nil && pv != p {
-		pv.Pause() // 试听（含分轨混音）与伴奏同时出声会干扰录音
+	if k.singing() {
+		a.finish(res, p.Position().Seconds())
 	}
-	sess := score.NewKaraokeSession(mic.Rate)
 	p.Seek(time.Duration(from * float64(time.Second)))
-	// 录音回调在录音线程上：读取播放位置（audio.Player 内部加锁）后交给会话。
-	capture, err := mic.Start(func(s []float32) { sess.Push(s, p.Position().Seconds()) })
-	if err != nil {
-		k.err = err.Error()
-		return
-	}
-	k.capture, k.sess, k.start, k.report, k.recording, k.err = capture, sess, from, nil, nil, ""
 	p.Play()
 }
 
-// finish 停止演唱并评价 [start, 当前位置] 内的旋律音。
-func (a *app) finish(res *score.Analysis) {
+// karaokeFollow 在每帧构建 K 歌卡片时跟随伴奏的播放状态：K 歌模式下开始播放时开始录音；暂停、播完或跳转时结束
+// 这一段并评价。录音中每 33 ms 重建一次（实时视图与歌词）。
+func (a *app) karaokeFollow(c *ui.Context, res *score.Analysis) {
+	k := &a.score.karaoke
+	p := k.player()
+	if !k.on || p == nil {
+		return
+	}
+	pos := p.Position().Seconds()
+	switch {
+	case k.singing() && !p.Playing():
+		a.finish(res, pos)
+	case k.singing() && (pos < k.last-karaokeJumpBack || pos > k.last+karaokeJumpAhead):
+		a.finish(res, k.last) // 跳转前唱的一段照常评价；仍在播放时下一帧从新位置重新录
+	case !k.singing() && p.Playing():
+		a.record(pos)
+	}
+	if k.singing() {
+		k.last = pos
+		c.After(33 * time.Millisecond)
+	}
+}
+
+// record 在伴奏已经播放时从歌曲时间 from（秒）开始录音。打不开录音设备时暂停伴奏并显示原因
+// （否则下一帧仍在播放，会反复重试）。
+func (a *app) record(from float64) {
+	k := &a.score.karaoke
+	p := k.player()
+	sess := score.NewKaraokeSession(mic.Rate)
+	// 录音回调在录音线程上：读取播放位置（audio.Player 内部加锁）后交给会话。
+	capture, err := mic.Start(a.be.settings.KaraokeMic, func(s []float32) { sess.Push(s, p.Position().Seconds()) })
+	if err != nil {
+		k.err = err.Error()
+		p.Pause()
+		return
+	}
+	k.capture, k.sess, k.start, k.last, k.report, k.recording, k.err = capture, sess, from, from, nil, nil, ""
+}
+
+// finish 停止录音（不暂停伴奏）并评价 [start, end] 内的旋律音；end 是歌曲时间（秒）。
+func (a *app) finish(res *score.Analysis, end float64) {
 	k := &a.score.karaoke
 	if !k.singing() {
 		return
 	}
-	end := k.player().Position().Seconds()
-	k.stop()
+	k.capture.Stop()
+	k.capture = nil
 	frames := k.sess.Frames()
 	k.recording = k.sess.Recording()
 	r := score.AnalyzeKaraoke(res.Melody.Notes, frames, k.start, end)
 	k.report, k.sess = &r, nil
 	if r.Voiced == 0 {
-		k.err = "没有录到演唱：请检查麦克风是否选对、音量是否足够（系统设置中的输入设备）。"
+		k.err = "没有录到演唱：请检查录音设备是否选对、麦克风音量是否足够。"
 	}
 }
 
@@ -144,6 +262,7 @@ func (a *app) finish(res *score.Analysis) {
 func karaokeCardFunc(a *app, c *ui.Context, tk *fluent.Tokens, run *score.Run, res *score.Analysis) func() ui.Element {
 	if res.Melody == nil || len(res.Melody.Notes) == 0 {
 		a.score.karaoke.stop()
+		a.score.karaoke.on = false // 没有卡片就没有开关，页面回到试听
 		return nil
 	}
 	return func() ui.Element { return a.scoreKaraokeCard(c, tk, run, res) }
@@ -155,34 +274,34 @@ func (a *app) scoreKaraokeCard(c *ui.Context, tk *fluent.Tokens, run *score.Run,
 	k.sync(a, run)
 	t := c.Theme()
 	return card(c, tk, "K 歌跟唱", func() {
-		ui.Text(c, "播放伴奏时跟着唱，实时显示目标旋律与你唱出的音高；停止后按旋律线评价音准、是否唱满与长音的气息。"+
-			"建议戴耳机（外放的伴奏会被录进去，干扰音高检测）。").FontSize(12).TextColor(t.TextMuted)
+		ui.Text(c, "开启 K 歌模式后，用页面底部的播放控制条播放伴奏即开始跟唱，实时显示目标旋律与你唱出的音高；"+
+			"暂停或播完时按旋律线评价音准、是否唱满与长音的气息。建议戴耳机（外放的伴奏会被录进去，干扰音高检测）。").
+			FontSize(12).TextColor(t.TextMuted)
 		ui.Row(c).Wrap().Gap(8).AlignItems(ui.Center).Children(func() {
+			on := k.on
+			if ui.Toggle(c, &on, "K 歌模式").Changed() {
+				a.setKaraoke(on, res)
+			}
 			if k.accomp != "" {
+				prev := k.player()
 				if ui.Segmented(c, &k.source, "伴奏", "原曲").Label("音源").Disabled(k.singing()).Changed() {
 					k.sync(a, run)
+					// 模式开启时换音源：停掉原来的音源，新音源接着原来的位置（伴奏解码完之前播放器为 nil，从头开始）。
+					if next := k.player(); k.on && prev != nil && next != nil && next != prev {
+						prev.Pause()
+						next.Seek(prev.Position())
+					}
 				}
 			} else {
 				ui.Text(c, "没有分离出的伴奏（分析时未分离），播放原曲。").FontSize(12).TextColor(t.TextMuted)
 			}
+			a.micChoice(c)
 			ui.Box(c).Grow(1)
-			ready := k.player() != nil
 			if k.src.loading {
 				ui.Spinner(c)
-			}
-			if k.singing() {
-				if ui.PrimaryButton(c, "停止并评分").Clicked() {
-					a.finish(res)
-				}
-			} else {
-				pos, _ := a.scorePosition()
-				if pos > 1 && ui.Button(c, "从试听位置开始").Disabled(!ready).
-					Tooltip(fmt.Sprintf("从 %s 开始", score.Clock(pos))).Clicked() {
-					a.sing(pos)
-				}
-				if ui.PrimaryButton(c, "从头开始跟唱").Disabled(!ready).Clicked() {
-					a.sing(0)
-				}
+				ui.Text(c, "正在载入伴奏…").FontSize(12).TextColor(t.TextMuted)
+			} else if k.singing() {
+				ui.Text(c, "● 录音中").FontSize(12).TextColor(t.Danger)
 			}
 		})
 		if k.src.err != "" {
@@ -191,14 +310,7 @@ func (a *app) scoreKaraokeCard(c *ui.Context, tk *fluent.Tokens, run *score.Run,
 		if k.err != "" {
 			ui.Text(c, k.err).FontSize(12).TextColor(t.Danger).Selectable()
 		}
-		if k.singing() {
-			// 伴奏播完时自动结束；播放中每 33 ms 重建一次（歌词与实时统计）。
-			if p := k.player(); p == nil || !p.Playing() {
-				a.finish(res)
-			} else {
-				c.After(33 * time.Millisecond)
-			}
-		}
+		a.karaokeFollow(c, res)
 		if k.singing() || k.report == nil {
 			a.karaokeLive(c, tk, res)
 		}
@@ -408,7 +520,7 @@ func (a *app) karaokeReport(c *ui.Context, tk *fluent.Tokens, res *score.Analysi
 			ui.Textf(c, "音准 %.0f%% · 唱满 %.0f%%", p.InTune*100, p.Coverage*100).FontSize(12).TextColor(t.TextMuted)
 			ui.Textf(c, "%.0f 分", p.Score).FontSize(12).Font("monospace").Width(48)
 			if ui.Button(c, "重唱这句").Clicked() {
-				a.sing(max(0, p.Start-2)) // 提前 2 秒开始，留出进入的时间
+				a.sing(max(0, p.Start-2), res) // 提前 2 秒开始，留出进入的时间
 			}
 		})
 	}

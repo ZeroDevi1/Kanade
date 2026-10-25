@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/egoist/mygo/audio"
 	"github.com/egoist/mygo/ui"
 
 	"kanade/internal/conductor"
@@ -50,9 +51,11 @@ type scoreState struct {
 	historyLoaded bool
 	shown         int
 	preview       audioPreview
-	sheet         sheetState
-	sv            svExportState // 导出 Synthesizer V 工程的对话框
-	karaoke       karaokeState  // K 歌跟唱
+	// playable 在本帧显示的记录有结果、试听已载入它的音频时为 true，决定是否显示底部的播放控制条（scoreDock）。
+	playable bool
+	sheet    sheetState
+	sv       svExportState // 导出 Synthesizer V 工程的对话框
+	karaoke  karaokeState  // K 歌跟唱
 	// confirmDelete 为 true 时删除按钮处于二次确认状态（针对正在显示的记录）。
 	confirmDelete bool
 	dlJob         string
@@ -206,9 +209,11 @@ func (a *app) scorePage(c *ui.Context, tk *fluent.Tokens) {
 	cardRow(c, cardMinWidth, func() ui.Element { return a.scoreRunCard(c, tk) }, summary)
 	a.scoreSVDialog(c, tk)
 	run, st := current()
+	s.playable = st.Result != nil
 	if st.Result == nil {
 		return
 	}
+	s.preview.clock = a.scoreClock
 	s.preview.load(a, st.Audio)
 	s.preview.title = filepath.Base(run.Request.Input)
 	res := st.Result
@@ -547,18 +552,63 @@ func (a *app) scoreSummary(c *ui.Context, tk *fluent.Tokens, run *score.Run, st 
 	})
 }
 
-// scorePosition 返回当前播放位置（秒，没有播放器时为 -1）与跳转函数。
+// scoreClock 返回音乐分析页各视图跟随的播放器：K 歌模式下为伴奏（或原曲）的播放器，否则为试听（含分轨混音）
+// 的播放器；解码中或没有时为 nil。试听波形、和弦、卷帘、乐谱、和声色彩都按它取位置与跳转，底部的控制条
+// （scoreDock）也控制它，所以跟唱时各视图随伴奏走。
+func (a *app) scoreClock() *audio.Player {
+	if k := &a.score.karaoke; k.on || k.singing() {
+		if p := k.player(); p != nil {
+			return p
+		}
+	}
+	if pv := &a.score.preview; !pv.loading {
+		return pv.player
+	}
+	return nil
+}
+
+// scorePosition 返回当前播放位置（秒，没有播放器时为 -1）与跳转函数（见 scoreClock）。
 func (a *app) scorePosition() (float64, func(float64)) {
-	pv := &a.score.preview
 	pos := -1.0
-	if p := pv.player; p != nil && !pv.loading {
+	if p := a.scoreClock(); p != nil {
 		pos = p.Position().Seconds()
 	}
 	return pos, func(sec float64) {
-		if p := pv.player; p != nil {
+		if p := a.scoreClock(); p != nil {
 			p.Seek(time.Duration(sec * float64(time.Second)))
 		}
 	}
+}
+
+// scoreDock 是音乐分析页底部固定的播放控制条（在滚动区之外，滚动到哪张卡片都能控制播放）。
+// 左侧显示正在播放的音源：试听的歌曲名，K 歌演唱中为伴奏。
+func (a *app) scoreDock(c *ui.Context, tk *fluent.Tokens) {
+	s := &a.score
+	p := a.scoreClock()
+	if !s.playable || p == nil {
+		return
+	}
+	t := c.Theme()
+	ui.Row(c.Key("score-dock")).Shrink(0).Padding(8, 36).Gap(16).AlignItems(ui.Center).
+		Background(tk.Card).BorderWidth(1, 0, 0, 0).BorderColor(tk.CardStroke).Children(func() {
+		ui.Column(c).Basis(0).Grow(1).MinWidth(0).Gap(2).Children(func() {
+			title, sub := s.preview.title, "试听"
+			if k := &s.karaoke; k.on && k.player() != nil {
+				sub = "K 歌模式 · " + map[bool]string{true: "伴奏", false: "原曲"}[k.src == &k.accompAudio]
+				if k.singing() {
+					sub += " · 录音中"
+				}
+			} else if s.sheet.mixApplied != nil && s.preview.player != s.preview.original {
+				sub = "试听 · 分轨混音"
+			}
+			ui.Text(c, title).FontSize(13).SingleLine()
+			ui.Text(c, sub).FontSize(12).TextColor(t.TextMuted).SingleLine()
+		})
+		ui.Column(c).Basis(0).Grow(2).MinWidth(320).MaxWidth(720).AlignItems(ui.Stretch).Children(func() {
+			transport(c, tk, "score", p)
+		})
+		ui.Box(c).Basis(0).Grow(1)
+	})
 }
 
 // scorePlayer 是试听：波形与播放，播放时显示当前小节、拍与和弦。

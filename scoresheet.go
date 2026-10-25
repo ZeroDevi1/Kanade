@@ -237,7 +237,7 @@ func (a *app) scoreSheetCard(c *ui.Context, tk *fluent.Tokens, res *score.Analys
 		if s.view != s.lastView {
 			s.lastView, s.lastRow = s.view, -1
 		}
-		scroll := s.follow && cur >= 0 && row != s.lastRow && a.score.preview.player != nil && a.score.preview.player.Playing()
+		scroll := s.follow && cur >= 0 && row != s.lastRow && a.scoreClock() != nil && a.scoreClock().Playing()
 		if cur >= 0 {
 			s.lastRow = row
 		}

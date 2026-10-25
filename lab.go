@@ -154,25 +154,6 @@ func (a *app) labPage(c *ui.Context, tk *fluent.Tokens) {
 			if ui.PrimaryButton(c, label).Disabled(l.generating).Clicked() {
 				a.generate()
 			}
-			if l.player != nil {
-				label := "播放"
-				if l.player.Playing() {
-					label = "暂停"
-				}
-				if ui.Button(c, label).Width(72).Clicked() {
-					if l.player.Playing() {
-						l.player.Pause()
-					} else {
-						l.player.Play()
-					}
-				}
-				ui.Textf(c, "%s / %s", clock(l.player.Position()), clock(l.player.Duration())).
-					TextColor(t.TextMuted).Font("monospace").FontSize(12)
-				if l.player.Playing() {
-					// 播放头由波形的 Draw 逐帧刷新；时间文本属于视图，每 100 ms 重建一次即可。
-					c.After(100 * time.Millisecond)
-				}
-			}
 			if l.generating {
 				ui.Spinner(c)
 			}
@@ -183,6 +164,9 @@ func (a *app) labPage(c *ui.Context, tk *fluent.Tokens) {
 		}
 		waveform.Show(c, &l.waveHandle, l.peaks, pb).Height(120).Background(tk.Card).
 			Border(1, tk.CardStroke).Radius(fluent.OverlayRadius)
+		if l.player != nil {
+			transport(c, tk, "lab", l.player)
+		}
 		if l.peaks != nil {
 			stats := fmt.Sprintf("%d 帧 · %d 个峰值桶", l.peaks.Frames, len(l.peaks.Min))
 			if l.genCost > 0 { // 只有本地合成的测试音频记录了耗时；任务输出为 0

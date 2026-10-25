@@ -14,6 +14,7 @@ var (
 	iconTimbre   = icon(`<path d="M1.5 8h2l1.5-4 2 8 2-10 2 9 1.5-3h2"/>`)
 	iconStems    = icon(`<path d="M2 4h12M2 8h12M2 12h12"/><circle cx="5" cy="4" r="1.2"/><circle cx="10" cy="8" r="1.2"/><circle cx="7" cy="12" r="1.2"/>`)
 	iconScore    = icon(`<path d="M6 12.5V3l7-1.5v9.5"/><circle cx="4.5" cy="12.5" r="1.5"/><circle cx="11.5" cy="11" r="1.5"/>`)
+	iconInspire  = icon(`<path d="M5.5 10.5a4.5 4.5 0 1 1 5 0V12h-5z"/><path d="M6 14.5h4"/>`)
 	iconTasks    = icon(`<path d="M5.5 4h8M5.5 8h8M5.5 12h8"/><path d="M2 4l.8.8L4 3.5M2 8l.8.8L4 7.5M2 12l.8.8L4 11.5"/>`)
 	iconLab      = icon(`<path d="M6 1.5v5L2.5 13a1 1 0 0 0 .9 1.5h9.2a1 1 0 0 0 .9-1.5L10 6.5v-5M5 1.5h6M4.5 10h7"/>`)
 	iconSwap     = icon(`<path d="M2.5 5.5h10l-2.5-2.5M13.5 10.5h-10l2.5 2.5"/>`)

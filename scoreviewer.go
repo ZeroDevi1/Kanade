@@ -65,12 +65,11 @@ func (a *app) scoreZoomDialog(c *ui.Context, tk *fluent.Tokens, res *score.Analy
 		return
 	}
 	t := c.Theme()
-	pv := &a.score.preview
 	b := a.root.Bounds(c)
 	w, h := max(b.W-2*zoomDialogEdge, 640), max(b.H-2*zoomDialogEdge, 420)
 	ui.Modal(c, &z.open, func() {
 		ui.Column(c).Width(w - 40).Height(h - 40).Gap(12).AlignItems(ui.Stretch).Children(func() {
-			// 顶栏：音轨、播放、缩放与跟随、关闭。
+			// 顶栏：音轨、缩放与跟随、关闭；播放控制条在画布下方。
 			ui.Row(c).Wrap().Gap(12).AlignItems(ui.Center).Children(func() {
 				names := make([]string, len(s.tracks))
 				for i, tr := range s.tracks {
@@ -83,20 +82,6 @@ func (a *app) scoreZoomDialog(c *ui.Context, tk *fluent.Tokens, res *score.Analy
 							z.track, z.top = i, 0
 						}
 					}
-				}
-				if p := pv.player; p != nil && !pv.loading {
-					label := "播放"
-					if p.Playing() {
-						label = "暂停"
-					}
-					if ui.Button(c.Key("zoom-play"), label).Width(72).Clicked() {
-						if p.Playing() {
-							p.Pause()
-						} else {
-							p.Play()
-						}
-					}
-					ui.Textf(c, "%s / %s", clock(p.Position()), clock(p.Duration())).Font("monospace").FontSize(12).TextColor(t.TextMuted)
 				}
 				ui.Text(c, "横向").FontSize(12).TextColor(t.TextMuted)
 				// 滑块向右为放大：可见时长从全曲缩到 2 秒（对数刻度，便于在短窗口间细调）。
@@ -115,6 +100,10 @@ func (a *app) scoreZoomDialog(c *ui.Context, tk *fluent.Tokens, res *score.Analy
 				}
 			})
 			a.zoomCanvas(c, tk, res)
+			// 对话框遮住了页面底部的控制条，在画布下方另放一个，控制同一个播放器（scoreClock）。
+			if p := a.scoreClock(); p != nil {
+				transport(c, tk, "zoom", p)
+			}
 			ui.Text(c, "拖动画布平移，单击跳转；Esc 或点击对话框外关闭。").FontSize(12).TextColor(t.TextMuted)
 		})
 	})
@@ -195,7 +184,7 @@ func (a *app) zoomCanvas(c *ui.Context, tk *fluent.Tokens, res *score.Analysis) 
 	box.Draw(func(p *ui.Painter, r ui.Rect) {
 		pos := -1.0
 		playing := false
-		if pl := pv.player; pl != nil && !pv.loading {
+		if pl := a.scoreClock(); pl != nil {
 			pos, playing = pl.Position().Seconds(), pl.Playing()
 		}
 		v0, v1 := z.zoomView(pos, res.Duration)

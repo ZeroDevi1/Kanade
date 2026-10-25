@@ -2,4 +2,6 @@
 
 package mic
 
-func start(func([]float32)) (func(), error) { return nil, ErrUnsupported }
+func devices() []string { return nil }
+
+func start(string, func([]float32)) (func(), error) { return nil, ErrUnsupported }

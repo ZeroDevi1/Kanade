@@ -37,10 +37,11 @@ type app struct {
 	stems    stemsState
 	timbre   timbreState
 	score    scoreState
+	inspire  inspireState
 }
 
 func newApp() *app {
-	return &app{current: "home", post: func(fn func()) { fn() }, cantus: newCantusState(), timbre: newTimbreState(), score: newScoreState()}
+	return &app{current: "home", post: func(fn func()) { fn() }, cantus: newCantusState(), timbre: newTimbreState(), score: newScoreState(), inspire: newInspireState()}
 }
 
 func main() {

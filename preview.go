@@ -2,7 +2,6 @@ package main
 
 import (
 	"path/filepath"
-	"time"
 
 	"github.com/egoist/mygo/audio"
 	"github.com/egoist/mygo/ui"
@@ -31,6 +30,9 @@ type audioPreview struct {
 	original *audio.Player
 	// autoplay 为 true 时，正在解码的文件解码完成后立即播放（随后清除）。
 	autoplay bool
+	// clock 非 nil 时由页面统一控制播放（例如音乐分析页底部的控制条）：波形的播放头与点击跳转跟随 clock 返回的
+	// 播放器（可能不是 player，例如 K 歌时的伴奏），预览自身不显示控制条。
+	clock func() *audio.Player
 }
 
 // load 开始在后台解码 path；与当前文件相同时不做任何事。
@@ -69,8 +71,8 @@ func (pv *audioPreview) load(a *app, path string) {
 	}()
 }
 
-// show 构建预览：文件名、播放按钮、时间与波形。没有文件时显示 empty。
-// actions 在播放按钮之后构建额外的按钮（例如保存），可为 nil。
+// show 构建预览：文件名、波形与播放控制条（transport；设置了 clock 时不显示）。没有文件时显示 empty。
+// actions 在文件名右侧构建额外的按钮（例如保存），可为 nil。
 func (pv *audioPreview) show(c *ui.Context, tk *fluent.Tokens, empty string, actions func()) {
 	t := c.Theme()
 	if pv.path == "" {
@@ -86,21 +88,6 @@ func (pv *audioPreview) show(c *ui.Context, tk *fluent.Tokens, empty string, act
 		if pv.loading {
 			ui.Spinner(c)
 		}
-		if p := pv.player; p != nil && !pv.loading {
-			label := "播放"
-			if p.Playing() {
-				label = "暂停"
-				c.After(100 * time.Millisecond)
-			}
-			ui.Textf(c, "%s / %s", clock(p.Position()), clock(p.Duration())).Font("monospace").FontSize(12).TextColor(t.TextMuted)
-			if ui.Button(c, label).Width(72).Clicked() {
-				if p.Playing() {
-					p.Pause()
-				} else {
-					p.Play()
-				}
-			}
-		}
 		if actions != nil {
 			actions()
 		}
@@ -109,12 +96,19 @@ func (pv *audioPreview) show(c *ui.Context, tk *fluent.Tokens, empty string, act
 		ui.Text(c, pv.err).FontSize(12).TextColor(t.Danger)
 		return
 	}
+	p := pv.player
+	if pv.clock != nil {
+		p = pv.clock()
+	}
 	var pb waveform.Playback
-	if pv.player != nil {
-		pb = playback{pv.player}
+	if p != nil {
+		pb = playback{p}
 	}
 	waveform.Show(c, &pv.handle, pv.peaks, pb).Height(96).Background(tk.Card).
 		Border(1, tk.CardStroke).Radius(fluent.OverlayRadius)
+	if pv.clock == nil && p != nil && !pv.loading {
+		transport(c, tk, "preview", p)
+	}
 }
 
 // reset 停止播放并清空预览（显示的文件已被删除时使用）；正在后台解码的结果会因 path 不符而被丢弃。
@@ -125,10 +119,10 @@ func (pv *audioPreview) reset() {
 	if pv.original != nil && pv.original != pv.player {
 		pv.original.Stop()
 	}
-	*pv = audioPreview{handle: pv.handle, title: pv.title}
+	*pv = audioPreview{handle: pv.handle, title: pv.title, clock: pv.clock}
 }
 
-// swap 把播放的音源换成 snd（例如合成的和弦伴奏），保留播放位置与播放状态；波形仍显示原文件。
+// swap 把播放的音源换成 snd（例如合成的和弦伴奏），保留播放位置、播放状态、循环与音量；波形仍显示原文件。
 // snd 为 nil 时换回原文件。
 func (pv *audioPreview) swap(snd *audio.Sound) {
 	if pv.player == nil {
@@ -142,10 +136,12 @@ func (pv *audioPreview) swap(snd *audio.Sound) {
 		return
 	}
 	pos, playing := pv.player.Position(), pv.player.Playing()
+	loop, vol := pv.player.Loop(), pv.player.Volume()
 	pv.player.Pause()
 	if pv.player != pv.original {
 		pv.player.Stop()
 	}
+	next.SetLoop(loop).SetVolume(vol) // 控制条上的循环与音量属于播放器，换音源时带过去
 	next.Seek(min(pos, next.Duration()))
 	if playing {
 		next.Play()

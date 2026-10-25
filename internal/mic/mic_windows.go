@@ -23,6 +23,16 @@ type waveFormatEx struct {
 	size           uint16
 }
 
+// waveInCaps 是 WAVEINCAPSW；pname 为 MAXPNAMELEN（32）个 UTF-16 字符，系统截断较长的设备名。
+type waveInCaps struct {
+	mid, pid      uint16
+	driverVersion uint32
+	pname         [32]uint16
+	formats       uint32
+	channels      uint16
+	reserved      uint16
+}
+
 type waveHdr struct {
 	data          *int16
 	bufferLength  uint32
@@ -48,6 +58,8 @@ const (
 var (
 	winmm                 = syscall.NewLazyDLL("winmm.dll")
 	kernel32              = syscall.NewLazyDLL("kernel32.dll")
+	procWaveInGetNumDevs  = winmm.NewProc("waveInGetNumDevs")
+	procWaveInGetDevCaps  = winmm.NewProc("waveInGetDevCapsW")
 	procWaveInOpen        = winmm.NewProc("waveInOpen")
 	procWaveInPrepare     = winmm.NewProc("waveInPrepareHeader")
 	procWaveInUnprepare   = winmm.NewProc("waveInUnprepareHeader")
@@ -63,7 +75,42 @@ var (
 	errNoInputDeviceFound = errors.New("打开麦克风失败：没有可用的录音设备，或在「设置 → 隐私和安全性 → 麦克风」中关闭了桌面应用的麦克风访问")
 )
 
-func start(fn func([]float32)) (func(), error) {
+// devices 按 waveIn 设备编号顺序列出设备名；读取失败的设备跳过。
+func devices() []string {
+	n, _, _ := procWaveInGetNumDevs.Call()
+	out := make([]string, 0, n)
+	for i := range n {
+		var caps waveInCaps
+		if r, _, _ := procWaveInGetDevCaps.Call(i, uintptr(unsafe.Pointer(&caps)), unsafe.Sizeof(caps)); r != mmsysErrNoErr {
+			continue
+		}
+		out = append(out, syscall.UTF16ToString(caps.pname[:]))
+	}
+	return out
+}
+
+// deviceID 把设备名解析为当前的 waveIn 编号（插拔设备后编号会变，所以每次录音前按名称重新查找）；
+// 空串为 WAVE_MAPPER（系统默认）。
+func deviceID(name string) (uintptr, error) {
+	if name == "" {
+		return waveMapper, nil
+	}
+	n, _, _ := procWaveInGetNumDevs.Call()
+	for i := range n {
+		var caps waveInCaps
+		if r, _, _ := procWaveInGetDevCaps.Call(i, uintptr(unsafe.Pointer(&caps)), unsafe.Sizeof(caps)); r == mmsysErrNoErr &&
+			syscall.UTF16ToString(caps.pname[:]) == name {
+			return i, nil
+		}
+	}
+	return 0, fmt.Errorf("找不到录音设备「%s」：可能已断开，请重新选择", name)
+}
+
+func start(device string, fn func([]float32)) (func(), error) {
+	id, err := deviceID(device)
+	if err != nil {
+		return nil, err
+	}
 	if !active.CompareAndSwap(false, true) {
 		return nil, errAlreadyRecording
 	}
@@ -75,7 +122,7 @@ func start(fn func([]float32)) (func(), error) {
 	f := waveFormatEx{formatTag: waveFormatPCM, channels: recordChannels, samplesPerSec: Rate,
 		avgBytesPerSec: Rate * 2, blockAlign: 2, bitsPerSample: 16}
 	var h uintptr
-	if r, _, _ := procWaveInOpen.Call(uintptr(unsafe.Pointer(&h)), waveMapper, uintptr(unsafe.Pointer(&f)), event, 0, callbackEvent); r != mmsysErrNoErr {
+	if r, _, _ := procWaveInOpen.Call(uintptr(unsafe.Pointer(&h)), id, uintptr(unsafe.Pointer(&f)), event, 0, callbackEvent); r != mmsysErrNoErr {
 		procCloseHandle.Call(event)
 		active.Store(false)
 		if r == 2 { // MMSYSERR_BADDEVICEID：没有输入设备

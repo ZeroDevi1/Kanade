@@ -23,6 +23,8 @@ type Settings struct {
 	// HFToken 是 Hugging Face 访问令牌（Read 权限即可），用于下载需要登录并接受许可的门控模型（如 MuScriptor）；
 	// 空串为不带令牌。以明文保存在设置文件中，只经环境变量交给引擎进程，不写入日志。
 	HFToken string `json:"hfToken,omitempty"`
+	// KaraokeMic 是 K 歌跟唱所用录音设备的名称（mic.Devices），空串为系统默认。
+	KaraokeMic string `json:"karaokeMic,omitempty"`
 }
 
 // MirrorCN 表示使用国内镜像。

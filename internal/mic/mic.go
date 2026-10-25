@@ -1,4 +1,4 @@
-// Package mic 从系统默认输入设备录音：单声道 float32、固定采样率，供 K 歌跟唱时实时检测音高并保存演唱。
+// Package mic 从输入设备（默认为系统默认设备）录音：单声道 float32、固定采样率，供 K 歌跟唱时实时检测音高并保存演唱。
 //
 // mygo 的 audio 包只有输出，这里按同样的方式直接调用系统接口：macOS 用 Audio Queue（AudioToolbox，经 purego），
 // Windows 用 winmm 的 waveIn。同一时间只支持一个录音。macOS 首次录音时系统会询问麦克风权限：打包的应用需要
@@ -18,10 +18,14 @@ type Capture struct {
 	stop func()
 }
 
-// Start 打开默认输入设备开始录音。onSamples 在录音线程上按到达顺序调用，每次约 32 ms 的采样；
-// 切片在回调返回后会被复用，需要保留时须复制。设备打不开（没有麦克风、权限被拒绝）时返回错误。
-func Start(onSamples func([]float32)) (*Capture, error) {
-	stop, err := start(onSamples)
+// Devices 列出可选的录音设备名称（不含「系统默认」），按系统顺序；不支持选择设备的平台（macOS）返回 nil。
+// Windows 上名称来自 waveIn，最长 31 个字符（系统截断）；同名设备只能选到第一个。
+func Devices() []string { return devices() }
+
+// Start 打开输入设备 device（Devices 返回的名称；空串为系统默认）开始录音。onSamples 在录音线程上按到达顺序调用，每次约 32 ms 的采样；
+// 切片在回调返回后会被复用，需要保留时须复制。设备打不开（没有麦克风、权限被拒绝、所选设备已断开）时返回错误。
+func Start(device string, onSamples func([]float32)) (*Capture, error) {
+	stop, err := start(device, onSamples)
 	if err != nil {
 		return nil, err
 	}
