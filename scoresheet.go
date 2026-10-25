@@ -245,9 +245,9 @@ func (a *app) scoreSheetCard(c *ui.Context, tk *fluent.Tokens, res *score.Analys
 		ui.Scroll(c.Key("sheet-scroll")).Basis(0).Grow(1).MinHeight(sheetViewportMinH).Children(func() {
 			ui.Column(c).AlignItems(ui.Stretch).Padding(0, 12, 0, 0).Children(func() { // 右侧留出滚动条的位置
 				if s.view == sheetJazz {
-					a.jazzSheet(c, tk, res, measures, pos, cur, scroll, seek)
+					a.jazzSheet(c, tk, res, measures, pos, cur, scroll, seek, s.styleKey())
 				} else {
-					a.staffSheet(c, tk, res, measures, pos, cur, scroll, seek)
+					a.staffSheet(c, tk, res, measures, pos, cur, scroll, seek, s.styleKey())
 				}
 			})
 		})
@@ -258,10 +258,10 @@ func (a *app) scoreSheetCard(c *ui.Context, tk *fluent.Tokens, res *score.Analys
 const sheetViewportMinH = 520
 
 // jazzSheet 是爵士谱：每行 4 小节，按拍放置和弦记号，没有新和弦的拍画斜线，与上一小节相同的小节记为 %。
+// style 为和弦记号的写法（score.Symbol*）；灵感页也用它显示乐句与乐段。
 func (a *app) jazzSheet(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, ms []score.Measure, pos float64, cur int,
-	scroll bool, seek func(float64)) {
+	scroll bool, seek func(float64), style string) {
 	t := c.Theme()
-	style := a.score.sheet.styleKey()
 	header := fmt.Sprintf("%s", res.Key.Label)
 	if res.Meter.Label != nil {
 		header += " · " + *res.Meter.Label
@@ -397,9 +397,9 @@ func stepY(step int, treble bool) float32 {
 
 // staffSheet 是五线谱（大谱表，每行 4 小节）。有旋律线时：高音谱表写旋律（量化到八分音符），低音谱表写和弦
 // （根音加和弦音，整体降一个八度）；没有旋律时：高音谱表写和弦的密集排列，低音谱表写根音。和弦记号写在最上方。
+// style 为和弦记号的写法（score.Symbol*）；灵感页也用它显示乐句与乐段。
 func (a *app) staffSheet(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, ms []score.Measure, pos float64, cur int,
-	scroll bool, seek func(float64)) {
-	style := a.score.sheet.styleKey()
+	scroll bool, seek func(float64), style string) {
 	sig := score.KeySignature(res.Key.TonicPC, res.Key.Mode)
 	if res.Key.Flats && sig == 6 {
 		sig = -6 // F♯ / G♭ 大调按拼写选择升号或降号

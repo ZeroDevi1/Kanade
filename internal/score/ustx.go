@@ -30,7 +30,7 @@ func (a *Analysis) USTX(name string) ([]byte, error) {
 	fmt.Fprintf(&b, "name: %s\ncomment: \"\"\noutput_dir: Vocal\ncache_dir: UCache\nustx_version: %s\n", q(name), q(ustxVersion))
 	b.WriteString("time_signatures:\n")
 	for _, m := range tm.meters() {
-		fmt.Fprintf(&b, "- bar_position: %d\n  beat_per_bar: %d\n  beat_unit: 4\n", m.bar, m.beats)
+		fmt.Fprintf(&b, "- bar_position: %d\n  beat_per_bar: %d\n  beat_unit: %d\n", m.bar, m.beats, m.denom)
 	}
 	b.WriteString("tempos:\n")
 	for _, t := range tm.tempos() {

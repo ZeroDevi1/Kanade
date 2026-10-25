@@ -2,7 +2,6 @@ package score
 
 import (
 	"cmp"
-	"fmt"
 	"math"
 	"slices"
 	"sort"
@@ -129,6 +128,12 @@ type rawNote struct {
 
 // TranscribeHum 把录音帧整理成乐句。frames 的时间轴是节拍器的播放位置（含预备拍）。
 func TranscribeHum(frames []KaraokeFrame, s HumSettings) Hum {
+	return TranscribeHumAudio(frames, nil, 0, s)
+}
+
+// TranscribeHumAudio 同 TranscribeHum，并用原始录音 pcm（rate Hz，样本序号 ≈ 帧时间 × rate）的频谱通量补充音节起音
+// 的证据（连续哼「噜噜」这类字之间没有响度谷的唱法）。pcm 为 nil 时与 TranscribeHum 相同。
+func TranscribeHumAudio(frames []KaraokeFrame, pcm []float32, rate int, s HumSettings) Hum {
 	h := Hum{Settings: s, Mode: "major"}
 	if s.Free {
 		// 没有录到音符时提前返回：自由模式的设置里速度与拍号可能还是「自动」（0），先给出默认值，结果仍是合法的节拍。
@@ -148,7 +153,7 @@ func TranscribeHum(frames []KaraokeFrame, s HumSettings) Hum {
 	if h.Voiced == 0 {
 		return h
 	}
-	onset := humOnsets(frames, voiced)
+	onset := humOnsets(frames, voiced, spectralFlux(pcm, rate, frames))
 	notes := humSegment(cents, voiced, onset)
 	if len(notes) == 0 {
 		return h
@@ -315,9 +320,9 @@ func humFixOctaves(c []float64, frames []KaraokeFrame) {
 	}
 }
 
-// humOnsets 标出音节起音帧：响度回升、谷深、清晰度回升三项证据之和达到阈值且为 ±5 帧内的局部最大，
-// 相邻起音至少隔 humOnsetGap 帧；每个有声段的首帧总是起音。
-func humOnsets(frames []KaraokeFrame, voiced []bool) []bool {
+// humOnsets 标出音节起音帧：响度回升、谷深、清晰度回升三项证据（有录音时再加频谱通量 fx，见 spectralFlux）之和
+// 达到阈值且为 ±5 帧内的局部最大，相邻起音至少隔 humOnsetGap 帧；每个有声段的首帧总是起音。fx 可为 nil。
+func humOnsets(frames []KaraokeFrame, voiced []bool, fx []float64) []bool {
 	n := len(frames)
 	dbs := make([]float64, n)
 	for i := range n {
@@ -339,7 +344,8 @@ func humOnsets(frames []KaraokeFrame, voiced []bool) []bool {
 		clRise := frames[i].Clarity - slices.MinFunc(frames[max(0, i-5):i], func(x, y KaraokeFrame) int {
 			return cmp.Compare(x.Clarity, y.Clarity)
 		}).Clarity
-		o[i] = max(0, rise)/humRiseDBRef + max(0, dip-humDipDBMin)/humDipDBRef + max(0, clRise)/humClarityRise
+		o[i] = max(0, rise)/humRiseDBRef + max(0, dip-humDipDBMin)/humDipDBRef + max(0, clRise)/humClarityRise +
+			fluxEvidence(fx, i)
 	}
 	onset := make([]bool, n)
 	last := -humOnsetGap
@@ -355,10 +361,18 @@ func humOnsets(frames []KaraokeFrame, voiced []bool) []bool {
 			continue
 		}
 		// 证据函数的峰值因平滑与回看窗口比实际起音晚一两帧：起音时刻取此前 humOnsetRefine 帧内（不早于上一个起音）
-		// 原始响度回升最快的帧（响度按 10 ms 子窗计算，比 40 ms 窗的音高更准）。
+		// 原始响度（与通量）回升最快的帧（响度按 10 ms 子窗计算，比 40 ms 窗的音高更准）。只有通量证据时响度平坦，
+		// 通量的回升决定时刻。
+		rise := func(k int) float64 {
+			r := (frames[k].DB - frames[k-1].DB) / humRiseDBRef
+			if fx != nil {
+				r += (fx[k] - fx[k-1]) / humFluxRef
+			}
+			return r
+		}
 		at := i
 		for k := max(last+1, i-humOnsetRefine, 1); k <= i; k++ {
-			if voiced[k] && frames[k].DB-frames[k-1].DB > frames[at].DB-frames[at-1].DB {
+			if voiced[k] && rise(k) > rise(at) {
 				at = k
 			}
 		}
@@ -633,14 +647,15 @@ var (
 	kkMinor = [12]float64{6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17}
 )
 
-// quantize 扣除整体节奏偏移后，把音符边界量化到网格：每拍按边界离网格的距离选 1/16 或八分三连音，
+// quantize 扣除整体节奏偏移后，把音符边界量化到网格：每拍按边界离网格的距离选 1/16 或八分三连音（复合拍只用
+// 十六分音符网格：拍本身已三分），
 // 再对边界序列做动态规划（每个边界在网格上取下取整、上取整或再后一格），保证每个音时长不为零、相邻不重叠；
 // 与下一音的间隙不到半个网格时连奏。超出动机范围的音丢弃或截断。
 // estimateShift 为 false 时（节拍跟踪已经对齐了拍点）不估计整体偏移。
 func (h *Hum) quantize(starts, ends []float64, midi []int, notes []rawNote, estimateShift bool) []MelodyNote {
 	s := h.Settings
 	beat := s.Beat()
-	g := beat / 4
+	g := s.Grid()
 	// 整体节奏偏移：时长足够的音符起点相对 1/16 网格的圆均值。
 	var sx, sy, sw float64
 	if !estimateShift {
@@ -685,7 +700,7 @@ func (h *Hum) quantize(starts, ends []float64, midi []int, notes []rawNote, esti
 				c3 += gridDist(v, beat/3) / g
 			}
 		}
-		if any && c3 < c4 {
+		if any && c3 < c4 && !s.Compound {
 			step[b] = beat / 3
 		}
 	}
@@ -807,13 +822,20 @@ func (h Hum) Analysis() *Analysis {
 	a := &Analysis{Duration: s.Length()}
 	bpm := s.BPM
 	a.Tempo.BPM = &bpm
-	a.Meter.BeatsPerBar = s.BeatsPerBar
-	label := fmt.Sprintf("%d/4", s.BeatsPerBar)
+	// 复合拍以八分音符为拍（拍号分母 8），速度按四分音符写（MIDI 与歌声合成工程的速度都以四分音符计）。
+	per, step := s.BeatsPerBar, s.Beat()
+	if s.Compound {
+		per, step = 3*s.BeatsPerBar, s.Beat()/3
+		bpm = s.BPM * 1.5
+		a.Meter.Denominator = 8
+	}
+	a.Meter.BeatsPerBar = per
+	label := s.MeterLabel()
 	a.Meter.Label, a.Meter.Confidence = &label, 1
-	for b := range s.Bars*s.BeatsPerBar + 1 {
-		t := float64(b) * s.Beat()
+	for b := range s.Bars*per + 1 {
+		t := float64(b) * step
 		a.Beats = append(a.Beats, t)
-		if b%s.BeatsPerBar == 0 {
+		if b%per == 0 && b < s.Bars*per { // 终点那一拍只标出最后一小节的结束，不是新的小节
 			a.Downbeats = append(a.Downbeats, t)
 		}
 	}

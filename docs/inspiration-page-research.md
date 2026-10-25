@@ -1,6 +1,6 @@
 # 灵感页调研：哼唱动机 → 乐句 → 和声配置 → 动机发展
 
-状态：M1（哼唱转乐句，含自由哼唱的自适应速度，`internal/score/phrase.go`、`tempo.go`）与 M2（规则和声配置，`internal/score/reharm.go`）已实现，界面见 `inspire.go`；M3（动机发展）未开始。日期：2026-10-25。
+状态：M1（哼唱转乐句：自由哼唱的自适应速度、6/8 复合拍识别、频谱通量起音，`internal/score/phrase.go`、`tempo.go`、`flux.go`）、M2（规则和声配置与和弦锁定，`internal/score/reharm.go`）、M3（动机发展与逐格编辑变换链，`internal/score/develop.go`）已实现；界面见 `inspire*.go`（卷帘编辑与撤销、五线谱 / 爵士谱预览、灵感记录的保存与历史、MIDI / OpenUtau / Synthesizer V 导出，6/8 写成真正的 6/8 拍号）。已知限制：五线谱 / 爵士谱预览里 6/8 的八分音符拍仍按四分音符画（相当于 6/4 的写法；乐谱排版 `melody.go` 尚不支持拍号分母）；阈值都只在合成数据上验证过，需用灵感记录里保存的真实录音帧再调。日期：2026-10-25。
 
 **应用不调用 LLM**：灵感页的全部功能都是本地的确定性算法，离线可用。开发时遇到算法设计问题，由开发者向 Claude Fable 5.1（effort high）咨询，咨询结论整理进本文档或代码注释。
 

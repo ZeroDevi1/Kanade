@@ -5,7 +5,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"slices"
 	"time"
 
 	"github.com/egoist/mygo/audio"
@@ -27,7 +26,7 @@ import (
 
 // 节拍器模式的选项。
 var (
-	inspireMeters = []int{2, 3, 4}
+	inspireMeters = []inspireMeter{{"2/4", 2, false}, {"3/4", 3, false}, {"4/4", 4, false}, {"6/8", 2, true}}
 	inspireBars   = []int{2, 4, 8}
 )
 
@@ -67,15 +66,29 @@ type inspireState struct {
 	recStart    time.Time
 	recording   []float32 // 上一次的原始录音（mic.Rate）
 	frames      []score.KaraokeFrame
-	// 整理结果：hum 为 nil 时还没有录过；sel 是选中的音符（-1 为未选）。
-	hum    *score.Hum
-	sel    int
-	filler int // score.FillerSets 的序号
+	// 整理结果：hum 为 nil 时还没有录过；sel 是选中的音符（-1 为未选）。undo / redo 是编辑前后的音符快照
+	// （最多 inspireUndoMax 步，重新整理时清空），drag 是卷帘里正在进行的拖动。
+	hum        *score.Hum
+	sel        int
+	filler     int // score.FillerSets 的序号
+	undo, redo [][]score.MelodyNote
+	drag       rollDrag
+	// view 是乐句的显示方式（inspireView*：卷帘可编辑，五线谱、爵士谱只读）。
+	view int
+	// dev 是动机发展；history 是灵感记录（保存与打开），dirty 为 true 时下一帧把当前记录写回磁盘。
+	dev     inspireDevelop
+	history inspireHistory
+	dirty   bool
 	// 和声：style 为 score.Style*；harmonies 是当前风格的方案，pick 为选中的方案，chordSel 为选中查看理由的和弦（-1 为未选）。
-	style     int
-	harmonies []score.Harmony
-	pick      int
-	chordSel  int
+	// locks 是用户锁定或替换的和弦（乐谱时间），重新配和声时保留；重新整理节奏时清空（时间轴变了）。
+	// replaceRoot / replaceQuality 是「替换为」下拉框的当前选择。
+	style          int
+	harmonies      []score.Harmony
+	pick           int
+	chordSel       int
+	locks          []score.ChordLock
+	replaceRoot    string
+	replaceQuality string
 	// 试听：source 为音源，click 叠加节拍器，chords 叠加和弦铺底。播放器的时间轴：合成旋律时为乐谱时间；含原始哼唱
 	// 时为录音时间减去 r0（乐谱第一拍对应的录音时刻），voiceTime 标出这一点。
 	source        int
@@ -89,12 +102,38 @@ type inspireState struct {
 }
 
 func newInspireState() inspireState {
-	return inspireState{free: true, bpm: 90, meter: 2, bars: 1, sel: -1, chordSel: -1, chords: true, playerVersion: 1}
+	return inspireState{free: true, bpm: 90, meter: 2, bars: 1, sel: -1, chordSel: -1, chords: true, playerVersion: 1,
+		dev: inspireDevelop{chords: true, selected: -1}}
 }
 
 // metronomeSettings 返回节拍器模式的节拍设置（预备拍固定一小节）。
 func (s *inspireState) metronomeSettings() score.HumSettings {
-	return score.HumSettings{BPM: math.Round(s.bpm), BeatsPerBar: inspireMeters[s.meter], Bars: inspireBars[s.bars], CountIn: 1}
+	m := inspireMeters[s.meter]
+	return score.HumSettings{BPM: math.Round(s.bpm), BeatsPerBar: m.bpb, Compound: m.compound, Bars: inspireBars[s.bars], CountIn: 1}
+}
+
+// inspireMeter 是一个拍号选项：每小节拍数与是否复合拍（6/8 的一拍为附点四分音符）。
+type inspireMeter struct {
+	title    string
+	bpb      int
+	compound bool
+}
+
+// meterTitles 返回拍号选项的名称。
+func meterTitles() []string {
+	out := make([]string, len(inspireMeters))
+	for i, m := range inspireMeters {
+		out[i] = m.title
+	}
+	return out
+}
+
+// tempoLabel 返回速度的写法：复合拍以附点四分音符计。
+func tempoLabel(set score.HumSettings) string {
+	if set.Compound {
+		return fmt.Sprintf("♩. = %.0f", set.BPM)
+	}
+	return fmt.Sprintf("♩ = %.0f", set.BPM)
 }
 
 // transcribeSettings 返回整理用的节拍设置：节拍器模式为录音时的设置，自由模式带上用户的调整。
@@ -102,11 +141,12 @@ func (s *inspireState) transcribeSettings() score.HumSettings {
 	if !s.recSet.Free {
 		return s.recSet
 	}
-	meter := 0
+	set := score.HumSettings{Free: true, BPM: s.tempoHint, BarShift: s.barShift}
 	if s.meterPick > 0 {
-		meter = inspireMeters[s.meterPick-1]
+		m := inspireMeters[s.meterPick-1]
+		set.BeatsPerBar, set.Compound = m.bpb, m.compound
 	}
-	return score.HumSettings{Free: true, BPM: s.tempoHint, BeatsPerBar: meter, BarShift: s.barShift}
+	return set
 }
 
 func (s *inspireState) recordingNow() bool { return s.capture != nil }
@@ -123,23 +163,26 @@ func (s *inspireState) analysis() *score.Analysis {
 	return an
 }
 
-// changed 标记乐句被修改：重新填拟声字、重新配和声，下一帧重新合成试听。
+// changed 标记乐句被修改：重新填拟声字、重新配和声，作废已发展的乐段，下一帧重新合成试听并保存记录。
 func (s *inspireState) changed() {
 	if s.hum != nil {
 		score.FillLyrics(s.hum.Notes, s.filler, s.set().Beat())
 		s.harmonize()
 	}
+	s.dev.reset()
 	s.playerVersion++
+	s.dirty = true
 }
 
-// harmonize 按当前风格重新配和声；方案数变少时选中的方案退回第一个。
+// harmonize 按当前风格与锁定的和弦重新配和声；方案数变少时选中的方案退回第一个。
 func (s *inspireState) harmonize() {
-	s.harmonies = score.Harmonize(*s.hum, s.style, inspireHarmonies)
+	s.harmonies = score.HarmonizeWith(*s.hum, s.style, inspireHarmonies, score.HarmonyOptions{Locks: s.locks})
 	if s.pick >= len(s.harmonies) {
 		s.pick = 0
 	}
 	s.chordSel = -1
 	s.playerVersion++
+	s.dirty = true
 }
 
 // startHum 开始录音：暂停其他页的播放；节拍器模式播放节拍器并以它的位置为录音时间轴，自由模式以已录到的时长为时间轴。
@@ -186,15 +229,16 @@ func (a *app) finishHum() {
 	}
 	s.capture, s.clickPlayer = nil, nil
 	s.frames, s.recording = s.sess.Frames(), s.sess.Recording()
-	s.sess = nil
+	s.sess, s.history.dir = nil, "" // 新录音：下一次保存时新建记录
 	a.transcribe()
 }
 
 // transcribe 用录到的帧（重新）整理乐句并配和声；手动修改被覆盖。
 func (a *app) transcribe() {
 	s := &a.inspire
-	h := score.TranscribeHum(s.frames, s.transcribeSettings())
-	s.hum, s.sel, s.err = &h, -1, ""
+	// 录音一并传入：频谱通量补充没有辅音谷的字（「噜噜」）之间的起音证据。
+	h := score.TranscribeHumAudio(s.frames, s.recording, mic.Rate, s.transcribeSettings())
+	s.hum, s.sel, s.err, s.locks, s.undo, s.redo = &h, -1, "", nil, nil, nil
 	if h.Voiced == 0 || len(h.Notes) == 0 {
 		s.err = "没有录到哼唱：请检查录音设备是否选对、麦克风音量是否足够。"
 	}
@@ -258,8 +302,8 @@ func (a *app) rebuildInspirePlayer() {
 		}
 	}
 	if s.click {
-		for k := 0; float64(k)*beat < set.Length()+1e-9; k++ {
-			score.AddClick(pcm, inspireRate, toPlayer(float64(k)*beat), k%set.BeatsPerBar == 0)
+		for _, ck := range set.Clicks(set.Bars) {
+			score.AddClick(pcm, inspireRate, toPlayer(ck.T), ck.Level)
 		}
 	}
 	var pos time.Duration
@@ -316,6 +360,10 @@ func (a *app) inspirePage(c *ui.Context, tk *fluent.Tokens) {
 	card(c, tk, "乐句", func() { a.inspirePhrase(c, tk) })
 	if s.hum != nil && len(s.hum.Notes) > 0 && !s.recordingNow() {
 		card(c, tk, "和声", func() { a.inspireHarmony(c, tk) })
+		card(c, tk, "发展", func() { a.inspireDevelopCard(c, tk) })
+	}
+	if s.dirty {
+		a.saveInspireRecord()
 	}
 }
 
@@ -339,9 +387,13 @@ func (a *app) inspireRecordCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
 			ui.Text(c, "按自己的速度哼，速度、拍号和小节线自动识别，哼唱中的渐快渐慢也会跟上；识别得不对可以在「节奏」里调整。"+
 				"音节之间带上辅音（「哒」「啦」）更容易分清每个字。建议戴耳机。").FontSize(12).TextColor(t.TextMuted)
 		} else {
-			labeledSlider(c, "速度（BPM）", &s.bpm, 50, 200, "%.0f").Disabled(busy)
+			label := "速度（♩ BPM）"
+			if inspireMeters[s.meter].compound {
+				label = "速度（♩. BPM）"
+			}
+			labeledSlider(c, label, &s.bpm, 40, 200, "%.0f").Disabled(busy)
 			ui.Row(c).Wrap().Gap(12).AlignItems(ui.Center).Children(func() {
-				ui.Segmented(c, &s.meter, "2/4", "3/4", "4/4").Label("拍号").Disabled(busy)
+				ui.Segmented(c, &s.meter, meterTitles()...).Label("拍号").Disabled(busy)
 				ui.Segmented(c, &s.bars, "2 小节", "4 小节", "8 小节").Label("长度").Disabled(busy)
 			})
 			ui.Text(c, "先响一小节预备拍，然后跟着节拍器哼；整体抢拍、拖拍会自动校正。建议戴耳机。").FontSize(12).TextColor(t.TextMuted)
@@ -367,6 +419,7 @@ func (a *app) inspireRecordCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
 		if s.err != "" {
 			ui.Text(c, s.err).FontSize(12).TextColor(t.Danger).Selectable()
 		}
+		a.inspireHistoryRow(c)
 	})
 }
 
@@ -407,7 +460,7 @@ func (a *app) inspireInfoCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
 		if !h.KeyClear {
 			key += "（不确定，音太少或调性模糊）"
 		}
-		tempo := fmt.Sprintf("♩ = %.0f · %d/4 · %d 小节", set.BPM, set.BeatsPerBar, set.Bars)
+		tempo := fmt.Sprintf("%s · %s · %d 小节", tempoLabel(set), set.MeterLabel(), set.Bars)
 		if set.Free && s.tempoHint == 0 && s.meterPick == 0 {
 			tempo += "（自动识别）"
 		}
@@ -453,7 +506,7 @@ func (a *app) inspireRhythmFix(c *ui.Context) {
 			s.tempoHint = 0
 			redo()
 		}
-		if ui.Segmented(c, &s.meterPick, "自动", "2/4", "3/4", "4/4").Label("拍号").Changed() {
+		if ui.Segmented(c, &s.meterPick, append([]string{"自动"}, meterTitles()...)...).Label("拍号").Changed() {
 			redo()
 		}
 		if ui.Button(c, "小节线左移").Tooltip("把小节线往前挪一拍").Clicked() {
@@ -496,11 +549,17 @@ func (a *app) inspirePhrase(c *ui.Context, tk *fluent.Tokens) {
 		ui.Text(c, "还没有录音。").TextColor(t.TextMuted)
 		return
 	}
-	a.inspireRoll(c, tk)
 	if s.recordingNow() || s.hum == nil {
+		a.inspireRoll(c, tk)
 		return
 	}
-	a.inspireEditBar(c)
+	ui.Segmented(c, &s.view, inspireViews...).Label("乐句视图")
+	if s.view == inspireViewRoll {
+		a.inspireRoll(c, tk)
+		a.inspireEditBar(c)
+	} else {
+		a.inspireSheet(c, tk, s.analysis(), s.view, s.scoreTime(playerPos(s.player)), s.seekScore)
+	}
 	ui.Row(c).Wrap().Gap(12).AlignItems(ui.Center).Children(func() {
 		if ui.Segmented(c, &s.source, "合成旋律", "原始哼唱", "叠加").Label("试听音源").Changed() {
 			s.playerVersion++
@@ -516,7 +575,10 @@ func (a *app) inspirePhrase(c *ui.Context, tk *fluent.Tokens) {
 			fillers[i] = f.Title
 		}
 		if ui.Segmented(c, &s.filler, fillers...).Label("拟声字").Changed() {
-			s.changed()
+			score.FillLyrics(s.hum.Notes, s.filler, s.set().Beat())
+			s.dev.refill(s.filler)
+			s.playerVersion++
+			s.dirty = true
 		}
 		ui.Box(c).Grow(1)
 		a.inspireExports(c)
@@ -526,281 +588,8 @@ func (a *app) inspirePhrase(c *ui.Context, tk *fluent.Tokens) {
 	}
 }
 
-// inspireRoll 绘制卷帘：小节、拍与十六分网格，所选和声的和弦名，量化后的音符（标出拟声字，转音与前一音相连），
-// 录到的音高曲线，以及播放头。录音中横轴为录音时间（节拍器模式扣除预备拍）；整理后为乐谱时间。点击音符选中它，
-// 点击空白处取消选择并跳转。
-func (a *app) inspireRoll(c *ui.Context, tk *fluent.Tokens) {
-	t := c.Theme()
-	s := &a.inspire
-	recording := s.recordingNow()
-	if recording {
-		s.frames = s.sess.Frames()
-	}
-	// 横轴：录音中为录音时间（toX 把帧时间换成横轴时间），整理后为乐谱时间。
-	var (
-		notes  []score.MelodyNote
-		chords []score.Segment
-		length float64
-		beat   float64
-		bpb    int
-		toX    func(float64) float64
-		tuning float64
-	)
-	switch {
-	case recording && s.clickPlayer == nil:
-		elapsed := time.Since(s.recStart).Seconds()
-		length, toX = max(8, math.Ceil(elapsed/4+0.5)*4), func(t float64) float64 { return t }
-	case recording:
-		set := s.recSet
-		length, beat, bpb = set.Length(), set.Beat(), set.BeatsPerBar
-		toX = func(t float64) float64 { return t - set.Start() }
-	default:
-		h := *s.hum
-		set := h.Settings
-		notes, tuning = h.Notes, h.Tuning
-		length, beat, bpb = set.Length(), set.Beat(), set.BeatsPerBar
-		toX = h.ScoreTime
-		if s.pick < len(s.harmonies) {
-			chords = s.harmonies[s.pick].Chords
-		}
-	}
-	// 纵轴：音符（没有时取录到的音高）的音域上下各留 3 个半音，至少一个八度半。
-	lo, hi := math.Inf(1), math.Inf(-1)
-	for _, n := range notes {
-		lo, hi = min(lo, n.Pitch), max(hi, n.Pitch)
-	}
-	for _, f := range s.frames {
-		if f.F0 > 0 && f.Clarity > 0.7 {
-			m := 69 + 12*math.Log2(f.F0/440)
-			lo, hi = min(lo, m), max(hi, m)
-		}
-	}
-	if math.IsInf(lo, 1) {
-		lo, hi = 60, 72
-	}
-	lo, hi = math.Floor(lo)-3, math.Ceil(hi)+3
-	if hi-lo < 18 {
-		lo -= math.Floor((18 - (hi - lo)) / 2)
-		hi = lo + 18
-	}
-	const keysW, chordH = 40, 18
-	box := ui.Box(c.Key("inspire-roll")).Height(280).Radius(fluent.ControlRadius).Background(rollPaper.white).
-		Border(1, tk.CardStroke).Clip().Cursor(ui.CursorPointer).Label("乐句卷帘")
-	b := box.Bounds() // 上一帧的尺寸，用于把点击位置换成时间与音高
-	rowH := (b.H - chordH) / float32(hi-lo+1)
-	if box.Clicked() && b.W > keysW && !recording {
-		x, y, _ := box.PointerPosition()
-		sec := float64((x-keysW)/(b.W-keysW)) * length
-		m := hi - float64((y-chordH)/rowH) + 0.5
-		s.sel = -1
-		for i, n := range notes {
-			if sec >= n.Start && sec < n.End && math.Abs(n.Pitch-m) < 1 {
-				s.sel = i
-			}
-		}
-		if s.sel < 0 {
-			s.seekScore(max(sec, 0))
-		}
-	}
-	accent := t.Accent
-	sel, frames, player, clickPlayer := s.sel, s.frames, s.player, s.clickPlayer
-	recStart := s.recStart
-	tonic := 0
-	if s.hum != nil {
-		tonic = s.hum.TonicPC
-	}
-	scoreTime := s.scoreTime
-	box.Draw(func(p *ui.Painter, r ui.Rect) {
-		xOf := func(sec float64) float32 { return r.X + keysW + float32(sec/length)*(r.W-keysW) }
-		top := r.Y + chordH
-		rowH := (r.H - chordH) / float32(hi-lo+1)
-		yOf := func(m float64) float32 { return top + float32(hi-m)*rowH }
-		// 行：黑键行深色，每个 C 标出音名。
-		for m := int(lo); m <= int(hi); m++ {
-			y := yOf(float64(m)) - rowH/2
-			if slices.Contains([]int{1, 3, 6, 8, 10}, m%12) {
-				p.Fill(ui.Rect{X: r.X + keysW, Y: y, W: r.W - keysW, H: rowH}, rollPaper.black, 0)
-			}
-			if m%12 == 0 {
-				p.Line(r.X, y+rowH, r.X+r.W, y+rowH, 1, rollPaper.cLine)
-				p.Text(r.X+4, y+(rowH-10)/2, midiNoteName(m), 10, rollPaper.keyText)
-			}
-		}
-		// 网格：有节拍时画十六分、拍与小节线；自由录音中只画秒线。
-		if beat > 0 {
-			g := beat / 4
-			for k := 0; float64(k)*g <= length+1e-9; k++ {
-				color := rollPaper.rowLine
-				switch {
-				case k%(4*bpb) == 0:
-					color = rollPaper.bar
-				case k%4 == 0:
-					color = rollPaper.beat
-				}
-				x := xOf(float64(k) * g)
-				p.Line(x, top, x, r.Y+r.H, 1, color)
-			}
-		} else {
-			for sec := 0.0; sec <= length; sec++ {
-				p.Line(xOf(sec), top, xOf(sec), r.Y+r.H, 1, rollPaper.beat)
-			}
-		}
-		// 和弦名（爵士写法）写在顶部一行。
-		p.Fill(ui.Rect{X: r.X + keysW, Y: r.Y, W: r.W - keysW, H: chordH}, rollPaper.ruler, 0)
-		for _, ch := range chords {
-			p.Text(xOf(ch.Start)+3, r.Y+3, score.Symbol(ch, score.SymbolJazz, tonic), 11, rollPaper.rulerText)
-		}
-		// 录到的音高（扣除整体偏移），淡色细点。
-		for _, f := range frames {
-			if f.F0 <= 0 || f.Clarity < 0.7 {
-				continue
-			}
-			sec := toX(f.T)
-			if sec < 0 || sec > length {
-				continue
-			}
-			m := 69 + 12*math.Log2(f.F0/440) - tuning/100
-			p.Fill(ui.Rect{X: xOf(sec) - 1, Y: yOf(m) - 1, W: 2, H: 2}, ui.RGBA(60, 60, 60, 0.45), 1)
-		}
-		// 音符：转音与前一音之间画连线；选中的音加深描边；拟声字写在音符上方。
-		for i, n := range notes {
-			x0, x1 := xOf(n.Start), xOf(n.End)
-			y := yOf(n.Pitch) - rowH/2
-			if n.Slur && i > 0 {
-				pn := notes[i-1]
-				p.Line(xOf(pn.End)-2, yOf(pn.Pitch), x0+2, yOf(n.Pitch), 2, accent)
-			}
-			rc := ui.Rect{X: x0 + 1, Y: y + 1, W: max(x1-x0-2, 2), H: max(rowH-2, 3)}
-			p.Fill(rc, accent, 3)
-			if i == sel {
-				p.Stroke(rc, ui.RGB(20, 20, 20), 3, 2)
-			}
-			if n.Lyric != "" {
-				p.Text(x0+2, y-14, n.Lyric, 12, ui.RGB(30, 30, 30))
-			}
-		}
-		// 播放头：录音时为录音位置，否则为试听位置（换成乐谱时间）。
-		pos, playing := -1.0, false
-		switch {
-		case clickPlayer != nil:
-			pos, playing = toX(clickPlayer.Position().Seconds()), true
-		case recording:
-			pos, playing = time.Since(recStart).Seconds(), true
-		case player != nil:
-			pos, playing = scoreTime(player.Position().Seconds()), player.Playing()
-		}
-		if pos >= 0 && pos <= length {
-			x := xOf(pos)
-			p.Line(x, r.Y, x, r.Y+r.H, 2, rollPaper.playhead)
-		}
-		if playing {
-			p.AnimationFrame()
-		}
-	})
-}
-
-// inspireEditBar 是选中音符的编辑按钮：升降半音、左右移动与伸缩（十六分音符）、与前一音连唱、删除。
-func (a *app) inspireEditBar(c *ui.Context) {
-	t := c.Theme()
-	s := &a.inspire
-	h := s.hum
-	ui.Row(c).Wrap().Gap(8).AlignItems(ui.Center).Children(func() {
-		if s.sel < 0 || s.sel >= len(h.Notes) {
-			ui.Text(c, "点击音符可以修改：升降半音、移动、伸缩、与前一个音连唱（转音）或删除。").FontSize(12).TextColor(t.TextMuted)
-			return
-		}
-		i := s.sel
-		n := &h.Notes[i]
-		g := s.set().Beat() / 4
-		prevEnd, nextStart := 0.0, s.set().Length()
-		if i > 0 {
-			prevEnd = h.Notes[i-1].End
-		}
-		if i+1 < len(h.Notes) {
-			nextStart = h.Notes[i+1].Start
-		}
-		ui.Textf(c, "第 %d 个音 · %s", i+1, midiNoteName(int(n.Pitch))).FontSize(12).Width(110)
-		edit := func(label string, ok bool, fn func()) {
-			if ui.Button(c, label).Disabled(!ok).Clicked() {
-				fn()
-				s.changed()
-			}
-		}
-		edit("升半音", n.Pitch < 96, func() { n.Pitch++ })
-		edit("降半音", n.Pitch > 24, func() { n.Pitch-- })
-		edit("左移", n.Start-g >= prevEnd-1e-9, func() { n.Start -= g; n.End -= g })
-		edit("右移", n.End+g <= nextStart+1e-9, func() { n.Start += g; n.End += g })
-		edit("缩短", n.End-n.Start > g+1e-9, func() { n.End -= g })
-		edit("延长", n.End+g <= nextStart+1e-9, func() { n.End += g })
-		slurLabel := "与前一音连唱"
-		if n.Slur {
-			slurLabel = "拆成新的字"
-		}
-		edit(slurLabel, i > 0, func() { n.Slur = !n.Slur })
-		edit("删除", true, func() {
-			h.Notes = slices.Delete(h.Notes, i, i+1)
-			if i < len(h.Notes) && h.Notes[i].Slur && (i == 0 || h.Notes[i-1].End < h.Notes[i].Start-1e-9) {
-				h.Notes[i].Slur = false // 删掉的是音节的第一个音：后面的连音成为新的字
-			}
-			s.sel = -1
-		})
-	})
-}
-
-// inspireHarmony 是和声卡片：风格、方案（附评分）、和弦序列与选中和弦的理由。
-func (a *app) inspireHarmony(c *ui.Context, tk *fluent.Tokens) {
-	t := c.Theme()
-	s := &a.inspire
-	ui.Row(c).Wrap().Gap(12).AlignItems(ui.Center).Children(func() {
-		if ui.Segmented(c, &s.style, score.HarmonyStyles...).Label("和声风格").Changed() {
-			s.pick = 0
-			s.harmonize()
-		}
-		for i, h := range s.harmonies {
-			b := ui.Button(c.Key(fmt.Sprintf("harm-%d", i)), fmt.Sprintf("方案 %d · %.0f 分", i+1, h.Total)).
-				Tooltip(fmt.Sprintf("旋律匹配 %.0f · 进行流畅 %.0f", h.Melody, h.Prog))
-			if i == s.pick {
-				b = b.Disabled(true)
-			}
-			if b.Clicked() {
-				s.pick, s.chordSel = i, -1
-				s.playerVersion++
-			}
-		}
-	})
-	if len(s.harmonies) == 0 {
-		ui.Text(c, "这段旋律配不出和声（音太少）。").FontSize(12).TextColor(t.TextMuted)
-		return
-	}
-	h := s.harmonies[s.pick]
-	tonic := s.hum.TonicPC
-	ui.Row(c).Wrap().Gap(6).AlignItems(ui.Center).Children(func() {
-		for i, ch := range h.Chords {
-			b := ui.ButtonBase(c.Key(fmt.Sprintf("chord-%d", i))).Padding(4, 10).Radius(fluent.ControlRadius).
-				Border(1, tk.CardStroke).Label(ch.Label)
-			switch {
-			case i == s.chordSel:
-				b.Background(tk.SubtlePressed).Border(1, t.Accent)
-			case b.Hovered():
-				b.Background(tk.SubtleHover)
-			}
-			b.Children(func() {
-				ui.Text(c, score.Symbol(ch, score.SymbolJazz, tonic)).FontSize(14).FontWeight(600)
-			})
-			if b.Clicked() {
-				s.chordSel = i
-				s.seekScore(ch.Start)
-			}
-		}
-	})
-	if s.chordSel >= 0 && s.chordSel < len(h.Reasons) {
-		ui.Text(c, h.Reasons[s.chordSel]).FontSize(13)
-	} else {
-		ui.Text(c, "点击和弦查看理由（同时跳到该和弦）。改动乐句后会重新配和声。").FontSize(12).TextColor(t.TextMuted)
-	}
-}
-
-// inspireExports 是导出按钮：MIDI（旋律与所选和声）、OpenUtau 工程（带拟声字，可直接合成歌声）与原始录音。
+// inspireExports 是导出按钮：MIDI（旋律与所选和声）、OpenUtau 与 Synthesizer V 工程（带拟声字，可直接合成歌声）
+// 与原始录音。
 func (a *app) inspireExports(c *ui.Context) {
 	s := &a.inspire
 	name := fmt.Sprintf("动机_%s", time.Now().Format("0102_1504"))
@@ -822,5 +611,6 @@ func (a *app) inspireExports(c *ui.Context) {
 	}
 	save("导出 MIDI…", "motif.mid", func() ([]byte, error) { return s.analysis().MIDI() })
 	save("导出 OpenUtau 工程…", "motif.ustx", func() ([]byte, error) { return s.hum.Analysis().USTX(name) })
+	save("导出 Synthesizer V 工程…", "motif.svp", func() ([]byte, error) { return s.hum.Analysis().SVP(name) })
 	save("保存录音…", "motif.wav", func() ([]byte, error) { return wav16(s.recording, mic.Rate), nil })
 }

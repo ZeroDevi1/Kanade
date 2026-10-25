@@ -138,6 +138,8 @@ func tempoCandidates(ev []humEvent) []tempoCand {
 		add(pk.p)
 		add(2 * pk.p)
 		add(pk.p / 2)
+		add(3 * pk.p) // 复合拍：从八分音符的峰跳到附点四分音符
+		add(pk.p / 3)
 	}
 	return out
 }
@@ -263,8 +265,8 @@ func beatFit(ev []humEvent, beats []float64) (coverage, onbeat float64) {
 		switch {
 		case math.Abs(frac) <= tempoBeatWin:
 			on += e.w
-		case math.Abs(math.Abs(frac)-0.5) <= tempoBeatWin:
-			on += 0.5 * e.w
+		case math.Abs(math.Abs(frac)-0.5) <= tempoBeatWin, math.Abs(math.Abs(frac)-1.0/3) <= subThirdTol:
+			on += 0.5 * e.w // 半拍（简单拍）或三分之一拍（复合拍）上的起音算一半
 		}
 	}
 	if total > 0 {
@@ -320,9 +322,10 @@ func beatTime(beats []float64, u float64) float64 {
 }
 
 // estimateMeter 返回每小节拍数（3 或 4）与第一个强拍的拍序号相位 p（0 ≤ p < M）。
-func estimateMeter(ev []humEvent, beats []float64) (int, int) {
+func estimateMeter(ev []humEvent, beats []float64, choices []int) (int, int) {
 	k1 := int(math.Round(beatCoord(beats, ev[0].t)))
-	fallback := func() (int, int) { return 4, ((k1 % 4) + 4) % 4 }
+	m0 := choices[0]
+	fallback := func() (int, int) { return m0, ((k1 % m0) + m0) % m0 }
 	if len(ev) < meterMinBeats || len(beats) < 8 {
 		return fallback()
 	}
@@ -386,13 +389,69 @@ func estimateMeter(ev []humEvent, beats []float64) (int, int) {
 		}
 		return bp, score(m, bp)
 	}
-	p4, s4 := best(4)
-	if len(beats) >= meterMinBeats {
-		if p3, s3 := best(3); s3 > s4+meterThree*maxA {
-			return 3, p3
+	// 第一个选择是默认的；其余的须领先 meterThree 的最大重音才选。
+	bm := m0
+	bp, bs := best(m0)
+	for _, m := range choices[1:] {
+		if p, sc := best(m); sc > bs+meterThree*maxA {
+			bm, bp, bs = m, p, sc
 		}
 	}
-	return 4, p4
+	return bm, bp
+}
+
+// 复合拍（6/8）的判定（Fable 5.1 的建议值）：拍长在附点四分音符的常见范围内，拍内的起音足够多，且多数落在三分之一、
+// 三分之二拍处、很少落在半拍处；跟踪锁在八分音符上（拍很短、几乎全在拍上）时改按三拍一组的重音判断。
+const (
+	compoundMinP  = 0.50 // 附点四分音符的拍长范围（秒，48–120 BPM）
+	compoundMaxP  = 1.25
+	subOnTol      = 0.12 // 落在拍上的容差（拍）
+	subThirdTol   = 0.08 // 落在三分点 / 半拍 / 四分点的容差（拍）
+	subHalfTol    = 0.08
+	subQuarterTol = 0.06
+	subMinOff     = 2.0  // 拍内起音的最小总权重
+	subMinOffFrac = 0.25 // 拍内起音占全部起音权重的最小比例
+	subThirdRatio = 0.60 // 三分点起音占拍内起音的最小比例
+	subHalfMax    = 0.25 // 半拍起音占拍内起音的最大比例
+	pulseMinP     = 0.18 // 跟踪锁在八分音符上时的拍长范围（秒）
+	pulseMaxP     = 0.36
+)
+
+// compoundFeel 报告拍内的起音是否呈三分（复合拍）：见上面的常量。p0 为拍长（秒）。
+func compoundFeel(ev []humEvent, beats []float64, p0 float64) bool {
+	if p0 < compoundMinP || p0 > compoundMaxP {
+		return false
+	}
+	var m3, m2, m4, on float64
+	for _, e := range ev {
+		if !e.onset || e.w < tempoStrongW {
+			continue
+		}
+		on += e.w
+		u := beatCoord(beats, e.t)
+		f := u - math.Floor(u)
+		switch {
+		case min(f, 1-f) <= subOnTol:
+		case math.Abs(f-1.0/3) <= subThirdTol || math.Abs(f-2.0/3) <= subThirdTol:
+			m3 += e.w
+		case math.Abs(f-0.5) <= subHalfTol:
+			m2 += e.w
+		case math.Abs(f-0.25) <= subQuarterTol || math.Abs(f-0.75) <= subQuarterTol:
+			m4 += e.w
+		}
+	}
+	off := m3 + m2 + m4
+	return off >= subMinOff && off >= subMinOffFrac*on && m3 >= subThirdRatio*off && m2 <= subHalfMax*off
+}
+
+// groupPulses 把锁在八分音符上的拍点每三个取一个（相位按重音选），返回附点四分音符的拍点。
+func groupPulses(ev []humEvent, beats []float64) []float64 {
+	_, p := estimateMeter(ev, beats, []int{3})
+	var out []float64
+	for k := ((p % 3) + 3) % 3; k < len(beats); k += 3 {
+		out = append(out, beats[k])
+	}
+	return out
 }
 
 // rhythm 估计（或在节拍器模式下校准）逐拍时刻，返回拍点（录音时间）、乐谱原点的拍坐标与更新后的节拍设置。
@@ -458,11 +517,30 @@ func rhythm(ev []humEvent, end float64, s HumSettings) (beats []float64, origin 
 			beats = append(beats, ev[0].t+p0)
 		}
 	}
+	// 复合拍：用户指定了 6/8，或自动判断时拍内起音呈三分；跟踪锁在八分音符上时先三个一组合成附点四分音符的拍。
+	compound := s.Compound && s.BeatsPerBar > 0
+	pulse := p0 >= pulseMinP && p0 <= pulseMaxP && len(beats) >= 6
+	switch {
+	case compound && pulse:
+		beats = groupPulses(ev, beats)
+	case s.BeatsPerBar == 0 && compoundFeel(ev, beats, p0):
+		compound = true
+	case s.BeatsPerBar == 0 && pulse:
+		if m, _ := estimateMeter(ev, beats, []int{2, 3}); m == 3 {
+			beats, compound = groupPulses(ev, beats), true
+		}
+	}
+	if len(beats) < 2 {
+		beats = append(beats, beats[len(beats)-1]+3*p0)
+	}
 	m, p := s.BeatsPerBar, 0
 	k1 := int(math.Round(beatCoord(beats, ev[0].t)))
-	if m == 0 {
-		m, p = estimateMeter(ev, beats)
-	} else {
+	switch {
+	case compound:
+		m, p = estimateMeter(ev, beats, []int{2})
+	case m == 0:
+		m, p = estimateMeter(ev, beats, []int{4, 3})
+	default:
 		p = ((k1 % m) + m) % m
 	}
 	// 原点：不晚于第一个音所在拍的最近小节线（可能为负，表示弱起前补的空拍）。
@@ -472,7 +550,7 @@ func rhythm(ev []humEvent, end float64, s HumSettings) (beats []float64, origin 
 	}
 	avg := (beats[len(beats)-1] - beats[0]) / float64(len(beats)-1)
 	out.BPM = math.Round(60 / avg)
-	out.BeatsPerBar = m
+	out.BeatsPerBar, out.Compound = m, compound
 	out.CountIn = 0
 	// 小节数：最后一个音的终点之后不足半拍的余音不再占一个小节（量化时截到小节末）。
 	out.Bars = max(1, int(math.Ceil((beatCoord(beats, end)-float64(o)-0.5)/float64(m))))

@@ -36,7 +36,7 @@ func TestVocalTrack(t *testing.T) {
 	if !reflect.DeepEqual(notes, want) {
 		t.Errorf("notes\n got %v\nwant %v", notes, want)
 	}
-	if m := tm.meters(); !reflect.DeepEqual(m, []vocalMeter{{0, 1}, {1, 4}}) {
+	if m := tm.meters(); !reflect.DeepEqual(m, []vocalMeter{{0, 1, 4}, {1, 4, 4}}) {
 		t.Errorf("meters %v", m)
 	}
 }
@@ -68,7 +68,7 @@ func TestVocalMetersWholeBarPickup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m := tm.meters(); !reflect.DeepEqual(m, []vocalMeter{{0, 3}}) {
+	if m := tm.meters(); !reflect.DeepEqual(m, []vocalMeter{{0, 3, 4}}) {
 		t.Errorf("meters %v", m)
 	}
 }

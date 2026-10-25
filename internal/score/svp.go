@@ -173,7 +173,7 @@ func (a *Analysis) SVPExport(name string, o SVExport) ([]byte, error) {
 	var p svpProject
 	p.Version = svpVersion
 	for _, m := range tm.meters() {
-		p.Time.Meter = append(p.Time.Meter, svpMeter{m.bar, m.beats, 4})
+		p.Time.Meter = append(p.Time.Meter, svpMeter{m.bar, m.beats, m.denom})
 	}
 	for _, t := range tm.tempos() {
 		p.Time.Tempo = append(p.Time.Tempo, svpTempo{int64(t.tick) * svpBlicksPerTick, t.bpm()})

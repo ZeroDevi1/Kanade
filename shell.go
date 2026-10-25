@@ -60,6 +60,9 @@ func (a *app) view(c *ui.Context) {
 		})
 	})
 	playbackShortcuts(c)
+	if a.current == "inspire" {
+		a.inspireShortcuts(c)
+	}
 }
 
 // titleBar 绘制隐藏系统标题栏后的自绘标题栏，避开系统窗口按钮并可拖动窗口。

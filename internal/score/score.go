@@ -434,6 +434,9 @@ type Analysis struct {
 		Label       *string `json:"label"`
 		BeatsPerBar int     `json:"beats_per_bar"`
 		Confidence  float64 `json:"confidence"`
+		// Denominator 是拍号的分母（拍点 Beats 所代表的音符：4 为四分音符，8 为八分音符）；0 视为 4。
+		// 分析引擎的结果总是以四分音符为拍；灵感页的复合拍（6/8）以八分音符为拍。
+		Denominator int `json:"denominator,omitempty"`
 	} `json:"meter"`
 	Beats     []float64 `json:"beats"`
 	Downbeats []float64 `json:"downbeats"`

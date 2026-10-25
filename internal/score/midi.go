@@ -55,12 +55,17 @@ type midiAnchor struct {
 // midiTimeMap 把秒换算为 tick，并给出需要写入的速度与拍号事件。
 type midiTimeMap struct {
 	anchors []midiAnchor
-	// sigs 是拍号事件：tick 与每小节拍数（以四分音符为拍）。
+	// sigs 是拍号事件：tick 与每小节拍数（以 denom 分音符为拍）。
 	sigs []struct {
 		tick  int
 		beats int
 	}
+	// denom 是拍号的分母（4 或 8）；一拍占 beatTicks() 个 tick。
+	denom int
 }
+
+// beatTicks 返回一拍（denom 分音符）的 tick 数。
+func (m *midiTimeMap) beatTicks() int { return midiPPQ * 4 / m.denom }
 
 func (m *midiTimeMap) tick(sec float64) int {
 	a := m.anchors
@@ -97,7 +102,11 @@ func (a *Analysis) newMidiTimeMap(end float64) *midiTimeMap {
 	if bpb <= 0 {
 		bpb = 4
 	}
-	m := &midiTimeMap{}
+	m := &midiTimeMap{denom: 4}
+	if a.Meter.Denominator == 8 {
+		m.denom = 8
+	}
+	tpb := m.beatTicks()
 	beats := a.Beats
 	if len(beats) < 2 {
 		// 没有拍点：按识别出的 BPM（没有时 120）匀速。
@@ -128,7 +137,7 @@ func (a *Analysis) newMidiTimeMap(end float64) *midiTimeMap {
 	} else {
 		n = max(n, 1)
 	}
-	t0 := float64(n * midiPPQ)
+	t0 := float64(n * tpb)
 	if n > 0 {
 		m.anchors = append(m.anchors, midiAnchor{0, 0})
 	}
@@ -144,7 +153,7 @@ func (a *Analysis) newMidiTimeMap(end float64) *midiTimeMap {
 	stable := a.Tempo.Stable != nil && *a.Tempo.Stable
 	if !stable {
 		for k := k0 + 1; k < len(beats); k++ {
-			m.anchors = append(m.anchors, midiAnchor{beats[k], t0 + float64((k-k0)*midiPPQ)})
+			m.anchors = append(m.anchors, midiAnchor{beats[k], t0 + float64((k-k0)*tpb)})
 		}
 	}
 	// 末端：按平均拍长（匀速）或最后一拍的拍长（变速）外推到 end 之后。
@@ -154,7 +163,7 @@ func (a *Analysis) newMidiTimeMap(end float64) *midiTimeMap {
 		step = intervals[len(intervals)-1]
 	}
 	tail := max(end, last.sec) + step
-	m.anchors = append(m.anchors, midiAnchor{tail, last.tick + (tail-last.sec)/step*midiPPQ})
+	m.anchors = append(m.anchors, midiAnchor{tail, last.tick + (tail-last.sec)/step*float64(tpb)})
 	return m
 }
 
@@ -224,7 +233,7 @@ func (a *Analysis) MIDI() ([]byte, error) {
 	conductor := []midiEvent{{data: append([]byte{0xFF, 0x03, byte(len("Tempo"))}, "Tempo"...)}}
 	for _, s := range tm.sigs {
 		// 拍号：分子、分母（2 的幂，2 = 四分音符）、每拍的 MIDI 时钟数、每四分音符的三十二分音符数。
-		conductor = append(conductor, midiEvent{tick: s.tick, order: 1, data: []byte{0xFF, 0x58, 4, byte(s.beats), 2, 24, 8}})
+		conductor = append(conductor, midiEvent{tick: s.tick, order: 1, data: tm.timeSignature(s.beats)})
 	}
 	conductor = append(conductor, tm.tempoEvents()...)
 
@@ -358,4 +367,17 @@ func median(xs []float64) float64 {
 	s := slices.Clone(xs)
 	slices.Sort(s)
 	return s[len(s)/2]
+}
+
+// timeSignature 返回 beats/denom 拍号的 MIDI 事件：分母写成 2 的幂；节拍器每「击」的 MIDI 时钟数（每四分音符 24 个）
+// 在复合拍（八分音符为拍、拍数为 3 的倍数）时取附点四分音符（36），其余取一拍。
+func (m *midiTimeMap) timeSignature(beats int) []byte {
+	pow, clocks := byte(2), byte(24)
+	if m.denom == 8 {
+		pow, clocks = 3, 12
+		if beats%3 == 0 {
+			clocks = 36
+		}
+	}
+	return []byte{0xFF, 0x58, 4, byte(beats), pow, clocks, 8}
 }

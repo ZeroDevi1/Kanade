@@ -198,7 +198,7 @@ func TestFillLyricsAndAnalysis(t *testing.T) {
 		}
 	}
 	a := h.Analysis()
-	if len(a.Downbeats) != 3 || len(a.Beats) != 9 || a.Key.Label == "" || len(a.Melody.Notes) != 5 {
+	if len(a.Downbeats) != 2 || len(a.Measures()) != 2 || len(a.Beats) != 9 || a.Key.Label == "" || len(a.Melody.Notes) != 5 {
 		t.Fatalf("analysis %+v", a)
 	}
 	if b, err := a.MIDI(); err != nil || len(b) == 0 {

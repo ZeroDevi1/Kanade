@@ -20,9 +20,9 @@ type vocalNote struct {
 	slur           bool
 }
 
-// vocalMeter 是从第 bar 小节（从 0 起）开始的拍号，以四分音符为拍、每小节 beats 拍。
+// vocalMeter 是从第 bar 小节（从 0 起）开始的拍号：每小节 beats 拍，以 denom 分音符为拍。
 type vocalMeter struct {
-	bar, beats int
+	bar, beats, denom int
 }
 
 // vocalTrack 返回旋律线的工程音符（按时间排序、互不重叠）与时间轴。没有旋律线时返回错误。
@@ -73,13 +73,13 @@ func (m *midiTimeMap) meters() []vocalMeter {
 	var out []vocalMeter
 	bar, tick, beats := 0, 0, m.sigs[0].beats
 	for _, s := range m.sigs {
-		bar += (s.tick - tick) / (beats * midiPPQ)
+		bar += (s.tick - tick) / (beats * m.beatTicks())
 		tick, beats = s.tick, s.beats
 		if len(out) > 0 && out[len(out)-1].bar == bar {
 			out[len(out)-1].beats = beats
 			continue
 		}
-		out = append(out, vocalMeter{bar, beats})
+		out = append(out, vocalMeter{bar, beats, m.denom})
 	}
 	return out
 }

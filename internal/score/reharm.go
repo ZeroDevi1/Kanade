@@ -27,6 +27,7 @@ const (
 	kindBorrowed        // 调式交替借用
 	kindDimPass         // 减七经过
 	kindModal           // 调式风格的特征和弦
+	kindLocked          // 用户手动指定、不在候选表里的和弦
 )
 
 // 和声功能。
@@ -112,17 +113,18 @@ var harmonyWeights = [4]styleWeights{
 
 // 其他常量。
 const (
-	harmAnchorTone  = 0.3  // 片内最重的音是和弦音时的奖励（乘以该音权重）
-	harmAnchorRoot  = 0.2  // 并且是根音或三音时的额外奖励
-	harmRunExtra    = 1.0  // 同一和弦持续第 3 个小节起每小节的额外代价
-	harmMustResolve = 3.0  // 副属、替代、经过和弦没有解决的代价
-	harmAltPenalty  = 0.8  // 求备选时对已选（片, 和弦）的初始惩罚
-	harmAltStep     = 0.4  // 差异不够时惩罚的增量
-	harmAltTries    = 4    //
-	harmMinDist     = 0.35 // 备选与已有方案的最小差异
-	harmAltDrop     = 15.0 // 备选的综合分比最优低超过该值时不显示
-	harmSlowBPM     = 72   // 流行风格在慢速时允许小节中换和弦（否则一拍一个音的慢歌会整小节一个和弦）
-	harmLeadingMax  = 0.25 // 旋律中导音的权重超过该比例时 Mixolydian 与旋律冲突，退回调内和弦
+	harmAnchorTone   = 0.3  // 片内最重的音是和弦音时的奖励（乘以该音权重）
+	harmAnchorRoot   = 0.2  // 并且是根音或三音时的额外奖励
+	harmRunExtra     = 1.0  // 同一和弦持续第 3 个小节起每小节的额外代价
+	harmMustResolve  = 3.0  // 副属、替代、经过和弦没有解决的代价
+	harmAltPenalty   = 0.8  // 求备选时对已选（片, 和弦）的初始惩罚
+	harmAltStep      = 0.4  // 差异不够时惩罚的增量
+	harmAltTries     = 4    //
+	harmMinDist      = 0.35 // 备选与已有方案的最小差异
+	harmAltDrop      = 15.0 // 备选的综合分比最优低超过该值时不显示
+	harmSlowBPM      = 72   // 流行风格在慢速时允许小节中换和弦（否则一拍一个音的慢歌会整小节一个和弦）
+	harmLeadingMax   = 0.25 // 旋律中导音的权重超过该比例时 Mixolydian 与旋律冲突，退回调内和弦
+	harmHalfDominant = 0.5  // 半终止片用属和弦的额外奖励（与 penultS 同量级）
 )
 
 // toneCost 是各性质的和弦上各音程（相对根音的半音数）的代价：[0] 用于爵士与重配和声，[1] 用于流行与调式。
@@ -389,13 +391,17 @@ func candPrior(c chordCand, style int, mode string, final bool) float64 {
 	return inf
 }
 
-// harmSlices 把旋律按和声节奏切片并给每个音加权（时值 × 拍位 × 上下文）。
+// harmSlices 把旋律按和声节奏切片并给每个音加权（时值 × 拍位 × 上下文）。4/4 每小节两片，复合拍每拍（附点四分
+// 音符）一片，其余每小节一片。
 func harmSlices(h Hum) []harmSlice {
 	s := h.Settings
 	beat := s.Beat()
 	bpb := s.BeatsPerBar
 	per := 1
-	if bpb == 4 {
+	switch {
+	case s.Compound:
+		per = bpb
+	case bpb == 4:
 		per = 2
 	}
 	sliceBeats := float64(bpb) / float64(per)
@@ -442,7 +448,8 @@ func harmSlices(h Hum) []harmSlice {
 					pos = 0.8
 				case frac < 1e-6:
 					pos = 0.6
-				case math.Abs(frac-0.5) < 1e-6:
+				case !s.Compound && math.Abs(frac-0.5) < 1e-6,
+					s.Compound && math.Abs(frac*3-math.Round(frac*3)) < 1e-6: // 拍内的八分音符
 					pos = 0.35
 				default:
 					pos = 0.25
@@ -565,13 +572,12 @@ func isTonic(c chordCand, mode string, style int) bool {
 	return slices.Contains([]string{"maj", "maj7", "6"}, c.quality)
 }
 
-// cadenceBonus 返回把和弦 c 放在第 s 片的终止相关代价（负值为奖励）。final 为终止片（最后一个起音所在的片），
-// half 为 8 小节时的半终止片；scale 为终止权重（2 小节的动机减半）。
-func cadenceBonus(c chordCand, s, final, half int, mode string, style int, scale float64) float64 {
+// cadenceBonus 返回把和弦 c 放在终止角色为 role 的片上的代价（负值为奖励）；scale 为终止权重（2 小节的动机减半）。
+func cadenceBonus(c chordCand, role int, mode string, style int, scale float64) float64 {
 	w := harmonyWeights[style]
 	cost := 0.0
-	switch {
-	case s == final:
+	switch role {
+	case roleFinal:
 		switch {
 		case isTonic(c, mode, style):
 			cost += w.finalTonic * scale
@@ -580,7 +586,7 @@ func cadenceBonus(c chordCand, s, final, half int, mode string, style int, scale
 		case scale < 1 && c.rel == 7 && c.kind == kindDiatonic:
 			cost += w.finalTonic * scale // 2 小节的开放片段：落在 V 上也可以
 		}
-	case s == final-1:
+	case rolePenult:
 		switch {
 		case c.rel == 7 && (c.quality == "maj" || c.quality == "7" || c.quality == "sus4"):
 			cost += w.penultV * scale
@@ -594,15 +600,76 @@ func cadenceBonus(c chordCand, s, final, half int, mode string, style int, scale
 		case c.rel == 1 && c.quality == "7":
 			cost += w.penultSubV * scale
 		}
-	case s == half && !isTonic(c, mode, style):
-		cost += w.halfCadence
+	case roleHalf:
+		if c.rel != 0 { // 根音是主音的和弦（含 Isus2、Isus4）都不构成半终止
+			cost += w.halfCadence
+		}
+		if c.rel == 7 && (c.quality == "maj" || c.quality == "7" || c.quality == "sus4") {
+			cost -= harmHalfDominant // 半终止落在属和弦上最典型
+		}
 	}
 	return cost
 }
 
+// 和声时间片在终止式中的角色（cadenceBonus）。
+const (
+	roleNone   = iota
+	roleFinal  // 全终止的主和弦片
+	rolePenult // 全终止前一片（属、下属等）
+	roleHalf   // 半终止片
+)
+
+// ChordLock 把乐谱时间 [Start, End)（秒）内起始的和声时间片固定为根音 Root（音级）、性质 Quality 的和弦。
+type ChordLock struct {
+	Start, End float64
+	Root       int
+	Quality    string
+}
+
+// 终止式的种类（CadencePoint.Kind）。
+const (
+	CadHalf = iota + 1 // 半终止：落在属和弦等非主和弦上
+	CadFull            // 全终止：落在主和弦
+)
+
+// CadencePoint 是一个终止点：乐谱时间 At（秒）所在的和声时间片按 Kind 计终止奖励。
+type CadencePoint struct {
+	At   float64
+	Kind int
+}
+
+// 段落的和声区域（RegionBias.Region）。
+const (
+	RegionTonic    = iota // 不加倾向
+	RegionSub             // 下属方向：大调 IV、ii，小调 iv、♭VI
+	RegionRelative        // 关系调：大调 vi、iii，小调 ♭III、♭VII
+)
+
+// RegionBias 让片首落在 [Start, End)（秒）内的时间片倾向某个和声区域：区域内的根音代价减 Weight，主和弦加 Weight。
+type RegionBias struct {
+	Start, End float64
+	Region     int
+	Weight     float64
+}
+
+// HarmonyOptions 是 Harmonize 的附加约束；零值为不加约束。
+type HarmonyOptions struct {
+	// Locks 是用户锁定或替换的和弦：被覆盖的时间片只能用该和弦，其余部分照常求解并与之衔接。
+	Locks []ChordLock
+	// Cadences 非空时取代自动判定的终止位置（最后一个起音所在的片为全终止、8 小节时第 4 小节末为半终止）：
+	// 各全终止片与其前一片计终止奖励，最后一个全终止之后只能保持。用于动机发展后按句式给出的终止。
+	Cadences []CadencePoint
+	// Regions 是段落的和声区域倾向（例如 B 段倾向下属方向）。
+	Regions []RegionBias
+}
+
 // Harmonize 为乐句配 style 风格的和声，返回最多 n 套彼此差异足够大的方案：第一套为模型代价最低的路径，之后为加惩罚
 // 重解得到的备选（综合分比第一套低超过 harmAltDrop 的不返回）。乐句没有音符时为 nil。
-func Harmonize(h Hum, style, n int) []Harmony {
+func Harmonize(h Hum, style, n int) []Harmony { return HarmonizeWith(h, style, n, HarmonyOptions{}) }
+
+// HarmonizeWith 同 Harmonize，并满足 opt 的约束。锁定的和弦不在候选表里时按根音相对主音的位置归入主 / 下属 / 属功能
+// 加入候选（没有解决要求），理由标为手动指定。
+func HarmonizeWith(h Hum, style, n int, opt HarmonyOptions) []Harmony {
 	if len(h.Notes) == 0 || h.Settings.Bars <= 0 {
 		return nil
 	}
@@ -625,6 +692,36 @@ func Harmonize(h Hum, style, n int) []Harmony {
 		}
 	}
 	cands := harmCandidates(h.TonicPC, mode, modal)
+	// 锁定：forced[s] 为第 s 片固定的候选序号（-1 为不固定）。
+	beat := h.Settings.Beat()
+	forced := make([]int, len(sls))
+	for s := range forced {
+		forced[s] = -1
+	}
+	for _, l := range opt.Locks {
+		if _, ok := qualityIntervals[l.Quality]; !ok {
+			continue
+		}
+		root := ((l.Root % 12) + 12) % 12
+		k := slices.IndexFunc(cands, func(c chordCand) bool { return c.root == root && c.quality == l.Quality })
+		if k < 0 {
+			rel := ((root-h.TonicPC)%12 + 12) % 12
+			fn := funcD
+			switch rel {
+			case 0, 3, 4, 8, 9:
+				fn = funcT
+			case 2, 5:
+				fn = funcS
+			}
+			cands = append(cands, chordCand{root: root, rel: rel, quality: l.Quality, kind: kindLocked, fn: fn, target: -1})
+			k = len(cands) - 1
+		}
+		for s, sl := range sls {
+			if t := sl.start * beat; t >= l.Start-1e-9 && t < l.End-1e-9 {
+				forced[s] = k
+			}
+		}
+	}
 	priorStyle := style
 	if style == StyleModal && !modal {
 		priorStyle = StylePop // 退回调内和弦时按流行的先验，进行仍按调式的权重
@@ -633,22 +730,80 @@ func Harmonize(h Hum, style, n int) []Harmony {
 	if style == StylePop && h.Settings.BPM < harmSlowBPM {
 		w.changeMid = harmonyWeights[StyleJazz].changeMid
 	}
-	// 终止片：最后一个起音所在的片；之后的空片只能保持。
-	beat := h.Settings.Beat()
-	lastOnset := h.Notes[len(h.Notes)-1].Start / beat
-	final := 0
-	for i, sl := range sls {
-		if lastOnset >= sl.start-1e-9 {
-			final = i
-		}
-	}
-	half := -1
-	if h.Settings.Bars == 8 {
+	// 终止角色：给出了终止点时按终止点；否则最后一个起音所在的片为全终止，8 小节时第 4 小节末片为半终止。
+	// final 是最后一个全终止片，之后的空片只能保持（锁定的除外）。
+	role := make([]int, len(sls))
+	sliceAt := func(sec float64) int {
+		k := 0
 		for i, sl := range sls {
-			if sl.end <= float64(4*h.Settings.BeatsPerBar)+1e-9 {
-				half = i
+			if sec/beat >= sl.start-1e-9 {
+				k = i
 			}
 		}
+		return k
+	}
+	final := 0
+	if len(opt.Cadences) > 0 {
+		for _, cp := range opt.Cadences {
+			if k := sliceAt(cp.At); cp.Kind == CadHalf {
+				role[k] = roleHalf
+			} else {
+				final = max(final, k)
+			}
+		}
+		for _, cp := range opt.Cadences {
+			if k := sliceAt(cp.At); cp.Kind == CadFull {
+				role[k] = roleFinal
+				if k > 0 && role[k-1] == roleNone {
+					role[k-1] = rolePenult
+				}
+			}
+		}
+	} else {
+		final = sliceAt(h.Notes[len(h.Notes)-1].Start)
+		if h.Settings.Bars == 8 {
+			for i, sl := range sls {
+				if sl.end <= float64(4*h.Settings.BeatsPerBar)+1e-9 {
+					role[i] = roleHalf
+				}
+			}
+			for i := range role {
+				if role[i] == roleHalf && i+1 < len(role) && role[i+1] == roleHalf {
+					role[i] = roleNone // 只有第 4 小节末的那一片
+				}
+			}
+		}
+		role[final] = roleFinal
+		if final > 0 {
+			role[final-1] = rolePenult
+		}
+	}
+	// 段落区域倾向：regionCost[s] 返回候选在第 s 片上的额外代价。
+	regionCost := func(s int, c chordCand) float64 {
+		cost := 0.0
+		for _, rb := range opt.Regions {
+			if t := sls[s].start * beat; t < rb.Start-1e-9 || t >= rb.End-1e-9 {
+				continue
+			}
+			var roots []int
+			switch {
+			case rb.Region == RegionSub && mode == "minor":
+				roots = []int{5, 8}
+			case rb.Region == RegionSub:
+				roots = []int{5, 2}
+			case rb.Region == RegionRelative && mode == "minor":
+				roots = []int{3, 10}
+			case rb.Region == RegionRelative:
+				roots = []int{9, 4}
+			}
+			switch {
+			case slices.Contains(roots, c.rel):
+				cost -= rb.Weight
+			case c.rel == 0:
+				cost += rb.Weight
+			}
+		}
+		return cost
 	}
 	scale := 1.0
 	if h.Settings.Bars <= 2 {
@@ -663,7 +818,16 @@ func Harmonize(h Hum, style, n int) []Harmony {
 		match[s] = make([]float64, len(cands))
 		for k, c := range cands {
 			match[s][k] = sliceCost(sl, c, col)
-			E[s][k] = candPrior(c, priorStyle, mode, s == final) + match[s][k] + cadenceBonus(c, s, final, half, mode, style, scale)
+			switch {
+			case forced[s] >= 0 && k != forced[s]:
+				E[s][k] = math.Inf(1)
+				continue
+			case forced[s] == k:
+				E[s][k] = 0 // 锁定的和弦不计先验（可能是本风格不启用的和弦）
+			default:
+				E[s][k] = candPrior(c, priorStyle, mode, s == final)
+			}
+			E[s][k] += match[s][k] + cadenceBonus(c, role[s], mode, style, scale) + regionCost(s, c)
 			if s == 0 && c.fn != funcT {
 				E[s][k] += w.startNonT
 			}
@@ -684,7 +848,7 @@ func Harmonize(h Hum, style, n int) []Harmony {
 		accepted := false
 		lambda := harmAltPenalty
 		for try := 0; try <= harmAltTries; try++ {
-			path = harmViterbi(sls, E, T, w, final, penalty)
+			path = harmViterbi(sls, E, T, w, final, forced, role, penalty)
 			if path == nil {
 				break
 			}
@@ -710,7 +874,7 @@ func Harmonize(h Hum, style, n int) []Harmony {
 		if !accepted {
 			break
 		}
-		r := harmResult(h, sls, cands, path, T, style)
+		r := harmResult(h, sls, cands, path, T, style, forced)
 		if len(results) > 0 && r.Total < results[0].Total-harmAltDrop {
 			break
 		}
@@ -723,8 +887,10 @@ func Harmonize(h Hum, style, n int) []Harmony {
 	return results
 }
 
-// harmViterbi 在（片, 和弦, 连续小节数）上求最小代价路径；penalty 为求备选时对（片, 和弦）的额外代价。
-func harmViterbi(sl []harmSlice, E, T [][]float64, w styleWeights, final int, penalty map[[2]int]float64) []int {
+// harmViterbi 在（片, 和弦, 连续小节数）上求最小代价路径；forced 为锁定的片（终止之后也允许换到锁定的和弦），
+// role 为各片的终止角色（终止相关的片在小节中换和弦不计 changeMid：终止处和声节奏加快），
+// penalty 为求备选时对（片, 和弦）的额外代价。
+func harmViterbi(sl []harmSlice, E, T [][]float64, w styleWeights, final int, forced, role []int, penalty map[[2]int]float64) []int {
 	K := len(E[0])
 	const runs = 3
 	inf := math.Inf(1)
@@ -766,11 +932,11 @@ func harmViterbi(sl []harmSlice, E, T [][]float64, w styleWeights, final int, pe
 						}
 					case a == b:
 						nr = r
-					case s > final:
+					case s > final && forced[s] < 0:
 						continue // 终止之后只保持
 					default:
 						c = T[a][b]
-						if !bar {
+						if !bar && role[s] == roleNone {
 							c += w.changeMid
 						}
 					}
@@ -840,7 +1006,7 @@ func harmDist(sl []harmSlice, cands []chordCand, p, q []int) float64 {
 }
 
 // harmResult 把路径合并成和弦段，写理由并评分。
-func harmResult(h Hum, sl []harmSlice, cands []chordCand, path []int, T [][]float64, style int) Harmony {
+func harmResult(h Hum, sl []harmSlice, cands []chordCand, path []int, T [][]float64, style int, forced []int) Harmony {
 	beat := h.Settings.Beat()
 	flats := KeySignature(h.TonicPC, h.Mode) < 0
 	r := Harmony{Style: style}
@@ -876,7 +1042,11 @@ func harmResult(h Hum, sl []harmSlice, cands []chordCand, path []int, T [][]floa
 		if i+1 < len(segs) {
 			next = &cands[segs[i+1].k]
 		}
-		r.Reasons = append(r.Reasons, harmReason(c, next, sl[g.s0], h, flats))
+		reason := harmReason(c, next, sl[g.s0], h, flats)
+		if slices.ContainsFunc(forced[g.s0:g.s1+1], func(k int) bool { return k >= 0 }) {
+			reason += "（已锁定）"
+		}
+		r.Reasons = append(r.Reasons, reason)
 	}
 	if mw > 0 {
 		r.Melody = 100 * min(max(1-(ms/mw)/2, 0), 1)
@@ -951,6 +1121,8 @@ func harmReason(c chordCand, next *chordCand, sl harmSlice, h Hum, flats bool) s
 		return fmt.Sprintf("%s：借自同主音%s（调式交替）", name, from) + role
 	case kindDimPass:
 		return fmt.Sprintf("%s：减七经过和弦，半音连接到 %s", name, targetName(c.target)) + role
+	case kindLocked:
+		return fmt.Sprintf("%s：手动指定的和弦", name) + role
 	case kindModal:
 		mode := "Mixolydian"
 		if h.Mode == "minor" {

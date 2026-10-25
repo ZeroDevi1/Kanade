@@ -219,3 +219,28 @@ func contains(list []string, s string) bool {
 	}
 	return false
 }
+
+// 锁定和弦：被锁定的时段只用指定的和弦（不在候选表里的也可以），其余部分重新求解；理由标出已锁定。
+func TestHarmonizeLocks(t *testing.T) {
+	h := melodyHum(t, "E E F G G F E D C C D E E:1.5 D:0.5 D:2", 4)
+	bar := float64(h.Settings.BeatsPerBar) * h.Settings.Beat()
+	for _, l := range []ChordLock{{Start: bar, End: 2 * bar, Root: 9, Quality: "min7"}, {Start: bar, End: 1.5 * bar, Root: 6, Quality: "7"}} {
+		for style := range HarmonyStyles {
+			res := HarmonizeWith(h, style, 3, HarmonyOptions{Locks: []ChordLock{l}})
+			if len(res) == 0 {
+				t.Fatalf("style %d lock %+v: no result", style, l)
+			}
+			for _, r := range res {
+				for i, c := range r.Chords {
+					inLock := c.Start < l.End-1e-9 && c.End > l.Start+1e-9
+					if inLock && (*c.Root != l.Root || c.Quality != l.Quality) {
+						t.Errorf("style %d: %s inside lock %+v (%s)", style, c.Label, l, labels(r))
+					}
+					if inLock && !strings.HasSuffix(r.Reasons[i], "（已锁定）") {
+						t.Errorf("reason %q", r.Reasons[i])
+					}
+				}
+			}
+		}
+	}
+}
