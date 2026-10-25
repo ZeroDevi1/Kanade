@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/egoist/mygo/audio"
@@ -68,8 +69,12 @@ type inspireState struct {
 	frames      []score.KaraokeFrame
 	// 整理结果：hum 为 nil 时还没有录过；sel 是选中的音符（-1 为未选）。undo / redo 是编辑前后的音符快照
 	// （最多 inspireUndoMax 步，重新整理时清空），drag 是卷帘里正在进行的拖动。
-	hum        *score.Hum
-	sel        int
+	hum *score.Hum
+	sel int
+	// raw 是整理出的原始音符（精简之前）；simplify 是精简程度（score.SimplifyLevels 的序号）。hum.Notes 为 raw 按
+	// simplify 精简后再经手动编辑的结果；改精简程度时从 raw 重新精简（作为一步可撤销的编辑）。
+	raw        []score.MelodyNote
+	simplify   int
 	filler     int // score.FillerSets 的序号
 	undo, redo [][]score.MelodyNote
 	drag       rollDrag
@@ -102,7 +107,7 @@ type inspireState struct {
 }
 
 func newInspireState() inspireState {
-	return inspireState{free: true, bpm: 90, meter: 2, bars: 1, sel: -1, chordSel: -1, chords: true, playerVersion: 1,
+	return inspireState{free: true, bpm: 90, meter: 2, bars: 1, sel: -1, chordSel: -1, chords: true, playerVersion: 1, simplify: 1,
 		dev: inspireDevelop{chords: true, selected: -1}}
 }
 
@@ -238,11 +243,28 @@ func (a *app) transcribe() {
 	s := &a.inspire
 	// 录音一并传入：频谱通量补充没有辅音谷的字（「噜噜」）之间的起音证据。
 	h := score.TranscribeHumAudio(s.frames, s.recording, mic.Rate, s.transcribeSettings())
+	s.raw = slices.Clone(h.Notes)
+	h.Notes = score.SimplifyMelody(h, s.simplify) // 哼唱的旋律线不稳：去掉滑音、抖动与碎片
 	s.hum, s.sel, s.err, s.locks, s.undo, s.redo = &h, -1, "", nil, nil, nil
 	if h.Voiced == 0 || len(h.Notes) == 0 {
 		s.err = "没有录到哼唱：请检查录音设备是否选对、麦克风音量是否足够。"
 	}
 	s.changed()
+}
+
+// resimplify 按当前精简程度从整理出的原始音符重新精简（覆盖手动修改，作为一步可撤销的编辑）。
+func (s *inspireState) resimplify() {
+	if s.hum == nil {
+		return
+	}
+	raw := s.raw
+	if raw == nil {
+		raw = s.hum.Notes
+	}
+	s.sel = -1
+	s.edit(func() {
+		s.hum.Notes = score.SimplifyMelody(score.Hum{Settings: s.hum.Settings, Notes: raw}, s.simplify)
+	})
 }
 
 // pauseAllPlayers 暂停各页的试听与 K 歌伴奏（录音时外放会被录进去）。
@@ -553,7 +575,15 @@ func (a *app) inspirePhrase(c *ui.Context, tk *fluent.Tokens) {
 		a.inspireRoll(c, tk)
 		return
 	}
-	ui.Segmented(c, &s.view, inspireViews...).Label("乐句视图")
+	ui.Row(c).Wrap().Gap(12).AlignItems(ui.Center).Children(func() {
+		ui.Segmented(c, &s.view, inspireViews...).Label("乐句视图")
+		ui.Text(c, "精简").FontSize(12).TextColor(t.TextMuted)
+		if ui.Segmented(c, &s.simplify, score.SimplifyLevels...).Label("精简程度").
+			Tooltip("合并滑入、滑出、抖动与碎音，补上被切开的短空隙；「精简」基本每字一音。从整理结果重新精简，会覆盖手动修改（可撤销）").
+			Changed() {
+			s.resimplify()
+		}
+	})
 	if s.view == inspireViewRoll {
 		a.inspireRoll(c, tk)
 		a.inspireEditBar(c)

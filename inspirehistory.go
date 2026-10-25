@@ -32,12 +32,15 @@ type inspireRecord struct {
 	BarShift  int                  `json:"bar_shift,omitempty"`
 	Frames    []score.KaraokeFrame `json:"frames"`
 	Hum       score.Hum            `json:"hum"`
-	Filler    int                  `json:"filler"`
-	Style     int                  `json:"style"`
-	Pick      int                  `json:"pick"`
-	Locks     []score.ChordLock    `json:"locks,omitempty"`
-	DevBars   int                  `json:"dev_bars"`
-	DevForm   string               `json:"dev_form,omitempty"`
+	// Raw 是整理出的原始音符（精简之前），Simplify 为精简程度；旧记录没有这两项（未精简）。
+	Raw      []score.MelodyNote `json:"raw,omitempty"`
+	Simplify int                `json:"simplify,omitempty"`
+	Filler   int                `json:"filler"`
+	Style    int                `json:"style"`
+	Pick     int                `json:"pick"`
+	Locks    []score.ChordLock  `json:"locks,omitempty"`
+	DevBars  int                `json:"dev_bars"`
+	DevForm  string             `json:"dev_form,omitempty"`
 }
 
 // inspireHistory 是记录列表的状态（属于 inspireState）。dir 是当前记录的目录（空为还没保存：新录音整理后的
@@ -125,7 +128,7 @@ func (a *app) saveInspireRecord() {
 		created = old.Created
 	}
 	r := inspireRecord{Created: created, RecSet: s.recSet, TempoHint: s.tempoHint, MeterPick: s.meterPick, BarShift: s.barShift,
-		Frames: s.frames, Hum: *s.hum, Filler: s.filler, Style: s.style, Pick: s.pick, Locks: s.locks,
+		Frames: s.frames, Hum: *s.hum, Raw: s.raw, Simplify: s.simplify, Filler: s.filler, Style: s.style, Pick: s.pick, Locks: s.locks,
 		DevBars: s.dev.bars, DevForm: s.dev.form}
 	b, err := json.Marshal(r)
 	if err == nil {
@@ -161,6 +164,10 @@ func (a *app) openInspireRecord(dir string) {
 	h := r.Hum
 	s.recSet, s.tempoHint, s.meterPick, s.barShift = r.RecSet, r.TempoHint, r.MeterPick, r.BarShift
 	s.frames, s.recording, s.hum = r.Frames, rec, &h
+	s.raw, s.simplify = r.Raw, r.Simplify
+	if s.raw == nil {
+		s.raw = slices.Clone(h.Notes) // 旧记录：保存的音符就是原始结果
+	}
 	s.filler, s.style, s.locks = r.Filler, r.Style, r.Locks
 	s.sel, s.undo, s.redo, s.history.dir = -1, nil, nil, dir
 	s.dev.bars, s.dev.form = r.DevBars, r.DevForm
@@ -188,7 +195,7 @@ func (a *app) deleteInspireRecord() {
 		s.player.Stop()
 	}
 	s.dev.reset()
-	*s = inspireState{free: s.free, bpm: s.bpm, meter: s.meter, bars: s.bars, sel: -1, chordSel: -1, chords: s.chords,
+	*s = inspireState{free: s.free, bpm: s.bpm, meter: s.meter, bars: s.bars, sel: -1, chordSel: -1, chords: s.chords, simplify: s.simplify,
 		playerVersion: 1, dev: s.dev, history: inspireHistory{items: hs.items, loaded: true}}
 }
 

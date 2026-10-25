@@ -456,3 +456,41 @@ func TestInspireSheetAndSlotEdit(t *testing.T) {
 		t.Fatalf("edited slot %+v", q.Slots[1])
 	}
 }
+
+// 精简：切换精简程度时从整理出的原始音符重新精简（一步可撤销的编辑）；记录保存原始音符与精简程度。
+func TestInspireSimplify(t *testing.T) {
+	l := paths.New(t.TempDir())
+	a := newApp()
+	a.be, a.current = backend{layout: l}, "inspire"
+	s := &a.inspire
+	h := testInspireHum()
+	// 原始音符：字首有一个十六分音符的滑入（64 → 62），适中级别会合并。
+	h.Notes = []score.MelodyNote{{Start: 0, End: 0.125, Pitch: 64}, {Start: 0.125, End: 1, Pitch: 62, Slur: true},
+		{Start: 1, End: 2, Pitch: 67}, {Start: 2, End: 4, Pitch: 60}}
+	s.raw = slices.Clone(h.Notes)
+	s.hum = h
+	s.simplify = 0
+	s.changed()
+	tt := ui.NewTester(a.view, 1200, 2400)
+	tt.Frame() // 第一帧保存记录后出现记录行，布局下移；点击前让布局稳定
+	if err := tt.Click("适中"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame() // 分段控件在下一帧报告改变
+	if s.simplify != 1 {
+		t.Fatalf("level %d", s.simplify)
+	}
+	if len(s.hum.Notes) != 3 || s.hum.Notes[0].Pitch != 62 || s.hum.Notes[0].Start != 0 || len(s.undo) != 1 {
+		t.Fatalf("simplified %+v undo %d", s.hum.Notes, len(s.undo))
+	}
+	s.undoEdit()
+	if len(s.hum.Notes) != 4 {
+		t.Fatalf("undo: %+v", s.hum.Notes)
+	}
+	s.redoEdit()
+	tt.Frame()
+	r, err := readInspireRecord(s.history.dir)
+	if err != nil || len(r.Raw) != 4 || r.Simplify != 1 || len(r.Hum.Notes) != 3 {
+		t.Fatalf("record: %v raw %d simplify %d notes %d", err, len(r.Raw), r.Simplify, len(r.Hum.Notes))
+	}
+}

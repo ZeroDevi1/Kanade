@@ -943,6 +943,15 @@ func expandPeriod(h Hum, p Period, k keyModel, filler int) Hum {
 			notes[i].Slur = false
 		}
 	}
+	// 同一个字里相邻的同音合并（模进、倒影后换回 MIDI 时，两个音可能落到同一个音高上）。
+	for i := 1; i < len(notes); {
+		if notes[i].Slur && notes[i].Pitch == notes[i-1].Pitch && math.Abs(notes[i].Start-notes[i-1].End) < 1e-9 {
+			notes[i-1].End = notes[i].End
+			notes = slices.Delete(notes, i, i+1)
+			continue
+		}
+		i++
+	}
 	out := Hum{Settings: set, Notes: notes, TonicPC: h.TonicPC, Mode: h.Mode, KeyClear: h.KeyClear, Voiced: h.Voiced}
 	FillLyrics(out.Notes, filler, beat)
 	return out
