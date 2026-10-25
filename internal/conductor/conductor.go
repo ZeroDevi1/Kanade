@@ -106,6 +106,8 @@ type Conductor struct {
 	wEngine string // worker 所属引擎
 	// wEnv 是 worker 启动时的 extraEnv：设置变化后（例如填写 Hugging Face 令牌）下一个任务换用新进程。
 	wEnv []string
+	// wUsed 是 worker 是否已运行过任务；Spec.FreshTasks 中的任务只交给没有运行过任务的 worker。
+	wUsed bool
 	// extraEnv 是追加给 uv 与 worker 的环境变量（下载镜像），对之后启动的进程生效。
 	extraEnv []string
 	closed   bool
@@ -399,7 +401,7 @@ func (c *Conductor) execute(j *Job) {
 		c.fail(j, err)
 		return
 	}
-	w, err := c.workerFor(j.Engine)
+	w, err := c.workerFor(j.Engine, j.Task)
 	if err != nil {
 		c.fail(j, err)
 		return
@@ -529,16 +531,21 @@ func (c *Conductor) waitInstalled(ctx context.Context, name string) error {
 	}
 }
 
-// workerFor 返回引擎的 worker：复用同引擎、且启动时环境与当前一致的 worker，否则关闭旧 worker 再启动新的。
-func (c *Conductor) workerFor(name string) (*Worker, error) {
+// workerFor 返回运行 task 的 worker：复用同引擎、且启动时环境与当前一致的 worker，否则关闭旧 worker 再启动新的。
+// task 在 Spec.FreshTasks 中且 worker 已运行过任务时也换新进程，释放旧进程占用的显存。
+func (c *Conductor) workerFor(name, task string) (*Worker, error) {
 	env := c.env()
 	c.mu.Lock()
-	w, owner, wEnv := c.worker, c.wEngine, c.wEnv
+	w, owner, wEnv, used := c.worker, c.wEngine, c.wEnv, c.wUsed
+	fresh := slices.Contains(c.engines[name].spec.FreshTasks, task)
 	c.mu.Unlock()
-	if w != nil && owner == name && slices.Equal(wEnv, env) && w.Err() == nil {
+	if w != nil && owner == name && slices.Equal(wEnv, env) && w.Err() == nil && !(fresh && used) {
 		select {
 		case <-w.Exited:
 		default:
+			c.mu.Lock()
+			c.wUsed = true
+			c.mu.Unlock()
 			return w, nil
 		}
 	}
@@ -560,7 +567,7 @@ func (c *Conductor) workerFor(name string) (*Worker, error) {
 		return nil, err
 	}
 	c.mu.Lock()
-	c.worker, c.wEngine, c.wEnv = w, name, env
+	c.worker, c.wEngine, c.wEnv, c.wUsed = w, name, env, true
 	c.mu.Unlock()
 	c.setEngineState(name, EngineRunning)
 	return w, nil

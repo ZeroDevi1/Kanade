@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -87,7 +88,8 @@ type timbreState struct {
 	trainOverlap     float64
 	trainNorm        string
 	trainIndex       string
-	trainCacheGPU    bool
+	trainCacheGPU    string // trainCacheTitles 之一
+	trainPrecision   string // timbre.Precisions 之一
 	trainCheckpoint  bool
 	trainSkipPre     bool
 	trainSkipExtract bool
@@ -107,7 +109,7 @@ func newTimbreState() timbreState {
 		harmonyMode: timbre.HarmonyModes[0], stemChoice: coverStemChoices[0], mix: timbre.DefaultMix(),
 		trainRate: "48000", trainEpochs: 200, trainBatch: 4, trainSaveEvery: 10, trainF0: "rmvpe",
 		trainCut: timbre.CutModes[0], trainChunk: 3, trainOverlap: 0.3, trainNorm: timbre.Normalizations[0],
-		trainIndex: timbre.IndexAlgorithms[0]}
+		trainIndex: timbre.IndexAlgorithms[0], trainCacheGPU: trainCacheTitles[0], trainPrecision: timbre.Precisions[0]}
 	s.applyPreset(timbre.Presets[2])
 	return s
 }
@@ -607,6 +609,9 @@ func (a *app) timbreTrain(c *ui.Context, tk *fluent.Tokens) {
 	})
 }
 
+// trainCacheTitles 是「数据缓存到显存」的选项，与 timbre.CacheGPUModes 一一对应。
+var trainCacheTitles = []string{"自动（按数据量）", "开", "关"}
+
 // timbreTrainPro 是训练的专业参数。
 func (a *app) timbreTrainPro(c *ui.Context) {
 	t := c.Theme()
@@ -634,8 +639,13 @@ func (a *app) timbreTrainPro(c *ui.Context) {
 		ui.Field(c, "切片重叠（秒）", func() { ui.NumberInput(c, &s.trainOverlap, 0, 1, 0.1).Width(110) })
 		ui.Field(c, "响度归一化", func() { ui.Select(c, &s.trainNorm, timbre.Normalizations).Width(110) })
 	})
+	ui.Row(c).Gap(12).AlignItems(ui.End).Children(func() {
+		ui.Field(c, "数据缓存到显存", func() { ui.Select(c, &s.trainCacheGPU, trainCacheTitles).Width(200) })
+		ui.Field(c, "训练精度", func() { ui.Select(c, &s.trainPrecision, timbre.Precisions).Width(110) })
+	})
+	ui.Text(c, "缓存到显存后每步不再经 PCIe 传输数据，Oculink 等外接显卡上提速明显；自动时数据量不超过显存的 10% 才缓存。"+
+		"bf16 需要 RTX 30 及以后的显卡，fp32 最慢。").FontSize(12).TextColor(t.TextMuted)
 	ui.Row(c).Gap(16).Children(func() {
-		ui.Checkbox(c, &s.trainCacheGPU, "数据缓存到显存")
 		ui.Checkbox(c, &s.trainCheckpoint, "梯度检查点（省显存）")
 		ui.Checkbox(c, &s.trainSkipPre, "跳过预处理（续训）")
 		ui.Checkbox(c, &s.trainSkipExtract, "跳过特征提取（续训）")
@@ -652,7 +662,8 @@ func (s *timbreState) trainRequest() timbre.TrainRequest {
 	r.Epochs, r.BatchSize, r.SaveEvery = int(s.trainEpochs), int(s.trainBatch), int(s.trainSaveEvery)
 	r.F0, r.CPUCores, r.IndexAlgorithm = s.trainF0, int(s.trainCores), s.trainIndex
 	r.CutMode, r.ChunkLen, r.OverlapLen, r.Normalization = s.trainCut, s.trainChunk, s.trainOverlap, s.trainNorm
-	r.CacheGPU, r.Checkpointing = s.trainCacheGPU, s.trainCheckpoint
+	r.CacheGPU = timbre.CacheGPUModes[max(0, slices.Index(trainCacheTitles, s.trainCacheGPU))]
+	r.Precision, r.Checkpointing = s.trainPrecision, s.trainCheckpoint
 	r.SkipPreprocess, r.SkipExtract = s.trainSkipPre, s.trainSkipExtract
 	return r
 }

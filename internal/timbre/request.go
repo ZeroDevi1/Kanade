@@ -141,7 +141,8 @@ type TrainRequest struct {
 	ChunkLen       float64 // 切片长度（秒）
 	OverlapLen     float64 // 切片重叠（秒）
 	Normalization  string  // 响度归一化，Normalizations 之一
-	CacheGPU       bool    // 把训练数据缓存到显存（小数据集更快，显存占用更高）
+	CacheGPU       string  // 把训练数据缓存到显存：CacheGPUModes 之一，空为自动（按数据量与显存决定）
+	Precision      string  // 训练精度：Precisions 之一，空为 fp16
 	Checkpointing  bool    // 梯度检查点：以约 20% 速度换更低显存
 	IndexAlgorithm string  // 索引算法，IndexAlgorithms 之一
 }
@@ -154,6 +155,11 @@ var (
 	CutModes        = []string{"Automatic", "Simple", "Skip"}
 	Normalizations  = []string{"none", "pre", "post"}
 	IndexAlgorithms = []string{"Auto", "Faiss", "KMeans"}
+	// CacheGPUModes：auto 按数据量决定（不超过显存的 10% 时缓存），on / off 强制开关。缓存后每步不再经 PCIe
+	// 拷贝批数据，Oculink 等外接显卡上提速明显；数据量大时会挤占训练显存。
+	CacheGPUModes = []string{"auto", "on", "off"}
+	// Precisions 与 Applio 的 precision 设置一致；bf16 需要 RTX 30 及以后的显卡。
+	Precisions = []string{"fp16", "bf16", "fp32"}
 )
 
 // Params 校验输入并返回 timbre.train 的任务参数。
@@ -181,7 +187,8 @@ func (r TrainRequest) Params() (map[string]any, error) {
 	for _, c := range []struct {
 		v    string
 		list []string
-	}{{r.CutMode, CutModes}, {r.Normalization, Normalizations}, {r.IndexAlgorithm, IndexAlgorithms}} {
+	}{{r.CutMode, CutModes}, {r.Normalization, Normalizations}, {r.IndexAlgorithm, IndexAlgorithms},
+		{r.CacheGPU, CacheGPUModes}, {r.Precision, Precisions}} {
 		if c.v != "" && !contains(c.list, c.v) {
 			return nil, fmt.Errorf("无效的取值 %q", c.v)
 		}
@@ -193,7 +200,11 @@ func (r TrainRequest) Params() (map[string]any, error) {
 		"name": strings.TrimSpace(r.Name), "dataset_dir": r.Dataset, "list": r.List, "sample_rate": r.SampleRate,
 		"f0_method": r.F0, "epochs": r.Epochs, "batch_size": r.BatchSize, "save_every": r.SaveEvery,
 		"skip_preprocess": r.SkipPreprocess, "skip_extract": r.SkipExtract,
-		"cache_gpu": r.CacheGPU, "checkpointing": r.Checkpointing,
+		"cache_gpu":     map[string]any{"": "auto", "auto": "auto", "on": true, "off": false}[r.CacheGPU],
+		"checkpointing": r.Checkpointing,
+	}
+	if r.Precision != "" {
+		p["precision"] = r.Precision
 	}
 	if r.CPUCores > 0 {
 		p["cpu_cores"] = r.CPUCores

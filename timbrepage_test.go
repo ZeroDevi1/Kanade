@@ -90,10 +90,18 @@ func TestTimbreTrainModes(t *testing.T) {
 	if err := tt.Click("专业"); err != nil {
 		t.Fatal(err)
 	}
-	for _, label := range []string{"总轮数", "batch", "每 N 轮保存", "采样率", "切片方式"} {
+	for _, label := range []string{"总轮数", "batch", "每 N 轮保存", "采样率", "切片方式", "数据缓存到显存", "训练精度"} {
 		if !tt.HasText(label) {
 			t.Errorf("pro training missing visible label %q", label)
 		}
+	}
+	// 专业模式默认与智能模式相同：缓存自动、fp16；选「开」后提交 true。
+	if r := a.timbre.trainRequest(); r.CacheGPU != "auto" || r.Precision != "fp16" {
+		t.Errorf("pro defaults %+v", r)
+	}
+	a.timbre.trainCacheGPU = trainCacheTitles[1]
+	if p, _ := a.timbre.trainRequest().Params(); p["cache_gpu"] != true {
+		t.Errorf("cache on: %v", p["cache_gpu"])
 	}
 }
 

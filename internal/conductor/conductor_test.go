@@ -108,8 +108,17 @@ func TestDevMockEndToEnd(t *testing.T) {
 		t.Error("worker restarted without an env change")
 	}
 	c.SetEnv([]string{"KANADE_HF_TOKEN=hf_test"})
-	if w3 := quick(); w3 == w1 {
+	w3 := quick()
+	if w3 == w1 {
 		t.Error("worker kept after env change")
+	}
+	// FreshTasks 中的任务每次都交给没有运行过任务的 worker（释放上一个任务留在进程里的显存）。
+	c.mu.Lock()
+	c.engines["dev-mock"].spec.FreshTasks = []string{"mock.tts"}
+	c.mu.Unlock()
+	w4 := quick()
+	if w4 == w3 || quick() == w4 {
+		t.Error("fresh task reused a worker that had already run a task")
 	}
 }
 

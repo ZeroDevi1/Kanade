@@ -10,5 +10,8 @@
     "timbre.train",
     "timbre.mix",
     "timbre.doctor"
+  ],
+  "fresh_tasks": [
+    "timbre.train"
   ]
 }

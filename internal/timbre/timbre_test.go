@@ -201,8 +201,17 @@ func TestCoverDryVocal(t *testing.T) {
 func TestTrainParamsAuto(t *testing.T) {
 	ds := t.TempDir()
 	p, err := TrainRequest{Name: "m", Dataset: ds, F0: "rmvpe"}.Params()
-	if err != nil || p["epochs"] != 0 || p["sample_rate"] != 0 || p["cut_mode"] != nil {
+	// 缓存到显存默认自动（由引擎按数据量决定），精度不写（引擎默认 fp16）。
+	if err != nil || p["epochs"] != 0 || p["sample_rate"] != 0 || p["cut_mode"] != nil || p["cache_gpu"] != "auto" ||
+		p["precision"] != nil {
 		t.Fatalf("%v %v", p, err)
+	}
+	p, err = TrainRequest{Name: "m", Dataset: ds, F0: "rmvpe", CacheGPU: "off", Precision: "bf16"}.Params()
+	if err != nil || p["cache_gpu"] != false || p["precision"] != "bf16" {
+		t.Fatalf("explicit %v %v", p, err)
+	}
+	if _, err := (TrainRequest{Name: "m", Dataset: ds, F0: "rmvpe", Precision: "int8"}).Params(); err == nil {
+		t.Error("bad precision accepted")
 	}
 	if _, err := (TrainRequest{Name: "m", Dataset: ds, F0: "rmvpe", SampleRate: 44100}).Params(); err == nil {
 		t.Error("44100 accepted")

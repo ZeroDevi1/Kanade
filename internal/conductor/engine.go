@@ -30,6 +30,10 @@ type Spec struct {
 	// Module 是 worker 入口，以 python -m <Module> 启动。
 	Module string   `json:"module"`
 	Tasks  []string `json:"tasks"`
+	// FreshTasks 是需要一个尚未运行过其他任务的 worker 的任务：worker 进程在任务间缓存的模型与 CUDA 上下文
+	// 会一直占着显存，例如 RVC 训练在子进程中运行，worker 之前推理时加载的模型会与训练争用 8 GB 显存，
+	// 超出后驱动回退到共享内存（经 Oculink 等外接显卡尤其慢）。
+	FreshTasks []string `json:"fresh_tasks,omitempty"`
 }
 
 // sharedDirs 是所有引擎共用、随每个引擎一起释放的目录。

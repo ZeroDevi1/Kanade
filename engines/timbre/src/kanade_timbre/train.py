@@ -11,6 +11,16 @@
 
 进度分配：预处理 0–8%，提取 8–20%，训练 20–97%，索引 97–100%。训练进度从脚本每轮输出的
 「<名称> | epoch=N | step=…」行解析。
+
+训练速度（8 GB 显卡、经 Oculink 等 PCIe 4.0 ×4 外接时尤其明显）：
+- worker 由 Conductor 为每次训练新启动（engine.json 的 fresh_tasks），且本进程不调用 torch.cuda（显存经 nvidia-smi
+  查询，见 gpu.py），训练子进程独占显存；否则推理时缓存的模型与 CUDA 上下文会与训练争用显存，超出后驱动回退到
+  共享内存，速度降到几分之一。
+- 数据缓存到显存（cache_gpu）默认按数据量自动决定：缓存后每步不再经 PCIe 拷贝批数据、也不经 DataLoader 的工作进程
+  （Windows 上以 spawn 启动，进程间传递张量开销大）。
+- 精度写入本次训练专用的 Applio 设置文件（APPLIO_CONFIG_FILE），不读用户另装的 Applio 的设置
+  （那里若设成 fp32，训练会慢一倍以上）。默认 fp16，与此前实测一致。
+- 训练中每 15 秒查询一次显卡：进度中显示 PCIe 链路、显存与每轮耗时，显存将满或链路降级时提示。
 """
 
 from __future__ import annotations
@@ -26,14 +36,23 @@ from pathlib import Path
 
 from kanade_engine import Cancelled, Job, annotations
 
-from . import runtime
+from . import gpu, runtime
 
 SAMPLE_RATES = (32000, 40000, 48000)
 CUT_MODES = ("Automatic", "Simple", "Skip")
 NORMALIZATION = ("none", "pre", "post")
 INDEX_ALGORITHMS = ("Auto", "Faiss", "KMeans")
 TRAIN_META = "kanade-train.json"
+PRECISIONS = ("fp16", "bf16", "fp32")
+# APPLIO_SETTINGS 是实验目录中本次训练专用的 Applio 设置文件（只写 precision，其余沿用 config_template.json）。
+APPLIO_SETTINGS = "kanade-applio.json"
 _EPOCH = re.compile(r"\| epoch=(\d+) \| step=(\d+)")
+_SPEED = re.compile(r"training_speed=(\d+):(\d+):(\d+)")
+# 显存余量低于此值（MB）时视为将满：驱动开始把显存分配回退到共享内存（Windows 默认的 Sysmem Fallback Policy）。
+VRAM_FULL_MARGIN_MB = 300
+# 自动缓存的数据量上限：显存的 10%（8 GB 约 0.8 GB，48 kHz 下约 12 分钟切片）。batch 4 的训练本身已用去 8 GB 卡的
+# 大部分显存，缓存过多反而触发共享内存回退；余量由训练中的显存监视核对。
+CACHE_GPU_FRACTION = 0.10
 _NAME = re.compile(r"^[\w\-一-鿿]+$")
 
 
@@ -71,14 +90,18 @@ def stage_dataset(job: Job, dataset: Path, list_path: Path | None, exp_dir: Path
     return staged
 
 
-def run_script(job: Job, args: list[str], lo: float, hi: float, label: str, on_line=None) -> None:
+def run_script(job: Job, args: list[str], lo: float, hi: float, label: str, on_line=None, env: dict | None = None,
+               status=None) -> None:
     """以子进程运行 vendor 中的脚本，逐行转发输出到日志，并在取消时结束整个进程树。
 
-    on_line(line) 可返回 [0, 1] 的阶段内进度；返回 None 表示该行不含进度。
+    on_line(line) 可返回 [0, 1] 的阶段内进度；返回 None 表示该行不含进度。env 是追加的环境变量。
+    status() 返回附在进度说明后的状态文字（例如显卡监视的结果），每次更新进度时调用。
     """
     cmd = [sys.executable, *args]
     job.progress(lo, label)
-    proc = subprocess.Popen(cmd, cwd=runtime.ROOT, env=runtime.subprocess_env(), stdout=subprocess.PIPE,
+    proc_env = runtime.subprocess_env()
+    proc_env.update(env or {})
+    proc = subprocess.Popen(cmd, cwd=runtime.ROOT, env=proc_env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     canceled = threading.Event()
@@ -102,7 +125,8 @@ def run_script(job: Job, args: list[str], lo: float, hi: float, label: str, on_l
         if on_line:
             frac = on_line(line)
             if frac is not None and not canceled.is_set():
-                job.progress(lo + (hi - lo) * frac, label + "：" + _status_text(line))
+                extra = status() if status else ""
+                job.progress(lo + (hi - lo) * frac, label + (f"（{extra}）" if extra else "") + "：" + _status_text(line))
     code = proc.wait()
     if canceled.is_set():
         raise Cancelled()
@@ -161,6 +185,12 @@ def run_train(job: Job) -> None:
     index_algo = p.get("index_algorithm") or "Auto"
     if cut not in CUT_MODES or norm not in NORMALIZATION or index_algo not in INDEX_ALGORITHMS:
         raise ValueError("切片方式、响度归一化或索引算法取值无效")
+    precision = p.get("precision") or "fp16"
+    if precision not in PRECISIONS:
+        raise ValueError(f"训练精度须为 {PRECISIONS} 之一")
+    cache_mode = p.get("cache_gpu", "auto")
+    if cache_mode not in ("auto", True, False):
+        raise ValueError("数据缓存到显存须为 auto、true 或 false")
     chunk = float(p.get("chunk_len") or 3.0)
     overlap = float(p.get("overlap_len") if p.get("overlap_len") is not None else 0.3)
     vendor = runtime.VENDOR / "rvc" / "train"
@@ -206,8 +236,23 @@ def run_train(job: Job) -> None:
     check_extracted(exp_dir)
 
     pg, pd = runtime.pretrained_paths(sr)
+    status0 = gpu.query()
+    cache_gpu = cache_mode is True or (cache_mode == "auto" and auto_cache_gpu(exp_dir, sr, status0))
+    settings = exp_dir / APPLIO_SETTINGS
+    settings.write_text(json.dumps({"precision": precision}), encoding="utf-8")
+    meta.update({"precision": precision, "cache_gpu": cache_gpu})
+    if status0:
+        meta["gpu"] = status0.name
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    job.progress(0.20, f"精度 {precision} · 数据{'已' if cache_gpu else '不'}缓存到显存")
+
+    monitor = TrainMonitor()
+    epoch_secs: list[int] = []
 
     def epoch_progress(line: str) -> float | None:
+        if sp := _SPEED.search(line):
+            epoch_secs.append(int(sp.group(1)) * 3600 + int(sp.group(2)) * 60 + int(sp.group(3)))
+            monitor.epoch_seconds = epoch_secs[-1]
         m = _EPOCH.search(line)
         return min(int(m.group(1)) / epochs, 1.0) if m else None
 
@@ -215,8 +260,15 @@ def run_train(job: Job) -> None:
     # 名称、每 N 轮保存、总轮数、G 底模、D 底模、GPU、batch、采样率、只保留最新、每次保存导出权重、
     # 数据缓存到 GPU、清除旧训练、声码器、梯度检查点。
     run_script(job, [str(vendor / "train.py"), name, str(save_every), str(epochs), pg, pd, "0", str(batch), str(sr),
-                     "True", "True", _flag(p, "cache_gpu", False), "False", "HiFi-GAN", _flag(p, "checkpointing", False)],
-               0.20, 0.97, "训练", epoch_progress)
+                     "True", "True", str(cache_gpu), "False", "HiFi-GAN", _flag(p, "checkpointing", False)],
+               0.20, 0.97, "训练", epoch_progress, env={"APPLIO_CONFIG_FILE": str(settings)}, status=monitor.start())
+    monitor.stop()
+    # 记录本次的速度与链路，便于比较设置（例如换线缆、开关缓存）前后的变化。
+    if epoch_secs:
+        meta["epoch_seconds"] = sorted(epoch_secs)[len(epoch_secs) // 2]
+    if monitor.peak:
+        meta["pcie"], meta["vram_peak_mb"] = monitor.peak.link(), monitor.peak_used
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     # 经 faiss_compat 启动：模型名含中文时 faiss 原生的 write_index 无法写入（见 faiss_compat 说明）。
     run_script(job, ["-m", "kanade_timbre.faiss_compat", str(vendor / "process" / "extract_index.py"), str(exp_dir), index_algo],
                0.97, 0.995, "生成索引")
@@ -272,9 +324,15 @@ def auto_epochs(minutes: float, trained: int) -> int:
 
 
 def auto_batch() -> int:
-    """按显存选 batch：8 GB 显卡用 4（2026-10-20 RTX 5060 实测），6 GB 以下用 2；MPS 用 4，CPU 用 2。"""
+    """按显存选 batch：8 GB 显卡用 4（2026-10-20 RTX 5060 实测），6 GB 以下用 2；MPS 用 4，CPU 用 2。
+
+    显存经 nvidia-smi 查询（见 gpu.py：不在 worker 中创建 CUDA 上下文）。
+    """
     import torch
 
+    if (st := gpu.query()) is not None:
+        gb = st.total_mb / 1024
+        return 2 if gb < 7 else 4 if gb < 11 else 8 if gb < 20 else 12
     if torch.cuda.is_available():
         gb = torch.cuda.get_device_properties(0).total_memory / 2**30
         return 2 if gb < 7 else 4 if gb < 11 else 8 if gb < 20 else 12
@@ -311,3 +369,66 @@ def latest_weights(exp_dir: Path, name: str) -> Path | None:
         if m and (int(m.group(1)), int(m.group(2))) > key:
             best, key = f, (int(m.group(1)), int(m.group(2)))
     return best
+
+
+# ---------- 显存缓存与显卡监视 ----------
+
+def cache_bytes(exp_dir: Path, sr: int) -> int:
+    """估计把训练数据缓存到显存所需的字节数：每秒切片约为波形（float32）、线性频谱（n_fft/2+1 个频点 × 100 帧）
+    与 768 维内容特征（100 帧）之和，再加两成按批补齐的余量。三种采样率的帧率都是 100 帧/秒
+    （hop 分别为 480 / 400 / 320）。"""
+    bins = 513 if sr == 32000 else 1025
+    per_sec = 4 * (sr + bins * 100 + 768 * 100 + 2 * 100)
+    seconds = sum(d for d, _ in _durations(exp_dir / "sliced_audios"))
+    return int(seconds * per_sec * 1.2)
+
+
+def auto_cache_gpu(exp_dir: Path, sr: int, st: "gpu.Status | None") -> bool:
+    """数据量不超过显存的 CACHE_GPU_FRACTION 时缓存到显存；没有 NVIDIA 显卡（MPS / CPU）时不缓存。"""
+    if st is None:
+        return False
+    return cache_bytes(exp_dir, sr) <= st.total_mb * 2**20 * CACHE_GPU_FRACTION
+
+
+class TrainMonitor:
+    """训练期间每 15 秒查询一次显卡，给出附在进度后的状态：PCIe 链路、显存、每轮耗时，以及显存将满或链路降级的提示。
+    start() 返回供 run_script 调用的 status 函数；stop() 结束查询线程。peak 是显存占用最高时的状态。"""
+
+    INTERVAL = 15.0
+
+    def __init__(self) -> None:
+        self.latest: gpu.Status | None = None
+        self.peak: gpu.Status | None = None
+        self.peak_used = 0
+        self.epoch_seconds = 0
+        self._stop = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+        return self.status
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            st = gpu.query()
+            if st is not None:
+                self.latest = st
+                if st.used_mb >= self.peak_used:
+                    self.peak, self.peak_used = st, st.used_mb
+            self._stop.wait(self.INTERVAL)
+
+    def status(self) -> str:
+        parts = []
+        if (st := self.latest) is not None:
+            parts += [st.link(), st.memory()]
+        if self.epoch_seconds:
+            parts.append(f"每轮 {self.epoch_seconds} 秒")
+        if st is not None:
+            if st.total_mb - st.used_mb < VRAM_FULL_MARGIN_MB:
+                parts.append("显存将满，可能已回退到共享内存（外接显卡上会明显变慢）：可降低 batch、关闭数据缓存或开启梯度检查点")
+            # 链路只在负载下有意义（空闲时降速）；Oculink 正常为 4.0 ×4，低于 3.0 或 ×4 多半是线缆或 BIOS 设置问题。
+            if st.util >= 50 and (st.gen < 3 or st.width < 4):
+                parts.append(f"PCIe 链路只有 {st.link()}：检查 Oculink 线缆与 BIOS 中该接口的 PCIe 代数设置")
+        return " · ".join(parts)
