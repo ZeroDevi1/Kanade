@@ -109,7 +109,7 @@ func TestTrackMix(t *testing.T) {
 func TestRenderTrack(t *testing.T) {
 	const rate = 16000
 	for _, tr := range []Track{
-		{Program: 0}, {Program: 25}, {Program: 30}, {Program: 33}, {Program: 19}, {Program: 40}, {Program: 56},
+		{Program: 0}, {Program: 4}, {Program: 6}, {Program: 25}, {Program: 30}, {Program: 32}, {Program: 33}, {Program: 46}, {Program: 19}, {Program: 40}, {Program: 48}, {Program: 56},
 		{Program: 65}, {Program: 73}, {Program: 81}, {Program: 89}, {Program: 11}, {Program: 117},
 		{Drum: true, Notes: []PianoNote{{MIDI: 36, Start: 0.1, End: 0.15, Velocity: 0.7}, {MIDI: 38, Start: 0.5, End: 0.55, Velocity: 0.7},
 			{MIDI: 42, Start: 0.7, End: 0.75, Velocity: 0.7}, {MIDI: 49, Start: 0.9, End: 0.95, Velocity: 0.7}, {MIDI: 45, Start: 1.2, End: 1.25, Velocity: 0.7}}},

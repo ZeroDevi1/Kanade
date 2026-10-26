@@ -22,7 +22,8 @@ import (
 //   - 匀速的歌（Tempo.Stable）只写一个速度，便于在编辑器中按网格编辑；
 //     有变速的歌每拍写一个速度，逐拍对齐原曲。
 //
-// 有多乐器转录时，和弦轨之后每种乐器一轨（按转录的音符数从多到少），音色为该乐器组的代表 GM 音色，鼓在通道 10。
+// 有多乐器转录时，和弦轨之后每种乐器一轨（顺序同 Transcription.Instruments），音色为该乐器组的代表 GM 音色，鼓在通道 10；
+// 音符按卷帘里的演奏设置写入（力度、时值、移八度），延音踏板写成 CC64。
 // 轨道名与 Melody / Chords 一样用英文：轨道名元事件没有编码约定，mido 与不少 DAW 按 Latin-1 读取，中文会显示为乱码。
 //
 // 有歌词时旋律轨在每个音的按下处写歌词事件（FF 05，UTF-8）：字写在字的第一个音上，连音写 "-"
@@ -38,9 +39,6 @@ const (
 	// midiDrumChannel 是 GM 规定的打击乐通道（第 10 通道）。
 	midiDrumChannel = 9
 )
-
-// midiInstrumentVelocity 是转录音符的力度：MuScriptor 不输出力度，取 mf 附近的固定值（约 90）。
-const midiInstrumentVelocity = 0.7
 
 // instrumentChannel 返回第 i 种有音高乐器的通道：依次用通道 3–16（跳过鼓通道 10），超过 13 种时循环复用
 // （共用通道的乐器在播放时会互相改掉音色，但各轨音符仍分开，导入 DAW 后可逐轨重设）。
@@ -295,11 +293,11 @@ func MIDI(a *score.Analysis) ([]byte, error) {
 			ch, prog = instrumentChannel(pitched), min(max(in.Program, 0), 127)
 			pitched++
 		}
-		notes := make([]PianoNote, len(in.Notes))
-		for i, n := range in.Notes {
-			notes[i] = PianoNote{MIDI: n.Pitch, Start: n.Start, End: n.End, Velocity: midiInstrumentVelocity}
+		track := noteTrack(in.TrackName(), ch, prog, InstrumentNotes(in), tm)
+		if !in.Drum {
+			track = append(track, pedalEvents(ch, PedalSpans(a, in.Play.Pedal), tm)...)
 		}
-		tracks = append(tracks, noteTrack(in.TrackName(), ch, prog, notes, tm))
+		tracks = append(tracks, track)
 	}
 
 	var buf bytes.Buffer
@@ -340,6 +338,22 @@ func noteTrack(name string, ch, program int, notes []PianoNote, tm *TimeMap) []m
 				midiEvent{tick: on, order: 3, data: []byte{byte(0x90 | ch), byte(pitch), vel}},
 				midiEvent{tick: off, order: 2, data: []byte{byte(0x80 | ch), byte(pitch), 0}})
 		}
+	}
+	return ev
+}
+
+// pedalEvents 是延音踏板（CC64）的踩下与抬起事件。抬起排在同一 tick 的松开音之前、踩下排在按下之后，
+// 与换踏板的先后一致。
+func pedalEvents(ch int, spans []Span, tm *TimeMap) []midiEvent {
+	var ev []midiEvent
+	for _, s := range spans {
+		on, off := tm.Tick(s.Start), tm.Tick(s.End)
+		if off <= on {
+			continue
+		}
+		ev = append(ev,
+			midiEvent{tick: on, order: 4, data: []byte{byte(0xB0 | ch), 64, 127}},
+			midiEvent{tick: off, order: 1, data: []byte{byte(0xB0 | ch), 64, 0}})
 	}
 	return ev
 }

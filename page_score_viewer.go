@@ -12,7 +12,8 @@ import (
 	"kanade/internal/ui/fluent"
 )
 
-// 卷帘的放大查看（只读，类似 Cubase 的 Key Editor）：在接近整个窗口大小的对话框里查看一条音轨。
+// 卷帘的放大查看（类似 Cubase 的 Key Editor）：在接近整个窗口大小的对话框里查看一条音轨；乐器音轨另有演奏调节
+// （page_score_perform.go：顶部的演奏设置栏与画布底部的力度条），音符本身不可编辑。
 // 左侧是钢琴键盘（鼓为鼓件名称），上方是小节标尺；音符块按音高排在半音行上，宽度够时标出音名，
 // 正在发声的音高亮；播放头与试听同步。滑块调节横向（可见秒数）与纵向（行高）缩放；
 // 拖动画布平移（横向移动时间、纵向移动音高，并关闭跟随），单击跳转到该处。
@@ -42,6 +43,8 @@ type zoomState struct {
 	// dragged 记录本次按下期间是否拖动过：拖动过的按下松开时不当作单击跳转。
 	dragged bool
 	handle  ui.Handle // 画布，读取上一帧尺寸
+
+	perform performState // 乐器音轨的演奏调节（page_score_perform.go）
 }
 
 // openZoom 打开第 i 条音轨的放大查看：时间窗口保持当前位置，纵向居中到音轨的音域。
@@ -100,12 +103,19 @@ func (a *app) scoreZoomDialog(c *ui.Context, tk *fluent.Tokens, res *score.Analy
 					z.open = false
 				}
 			})
+			if tr := s.tracks[z.track]; tr.Instrument >= 0 && res.Transcription != nil && tr.Instrument < len(res.Transcription.Instruments) {
+				a.zoomPerformRow(c, tk, res, tr)
+			}
 			a.zoomCanvas(c, tk, res)
 			// 对话框遮住了页面底部的控制条，在画布下方另放一个，控制同一个播放器（scoreClock）。
 			if p := a.scoreClock(); p != nil {
 				transport(c, tk, "zoom", p)
 			}
-			ui.Text(c, "拖动画布平移，单击跳转；Esc 或点击对话框外关闭。").FontSize(12).TextColor(t.TextMuted)
+			hint := "拖动画布平移，单击跳转；Esc 或点击对话框外关闭。"
+			if s.tracks[z.track].Instrument >= 0 {
+				hint = "拖动画布平移，单击跳转；在底部力度条上按住拖过音符设置力度，条上沿的灰条是踏板踩下的区间；Esc 或点击对话框外关闭。"
+			}
+			ui.Text(c, hint).FontSize(12).TextColor(t.TextMuted)
 		})
 	})
 }
@@ -135,8 +145,13 @@ func (a *app) zoomCanvas(c *ui.Context, tk *fluent.Tokens, res *score.Analysis) 
 	box := ui.Box(c.Key("zoom-canvas")).Grow(1).MinHeight(0).Bind(&z.handle).Radius(fluent.ControlRadius).
 		Background(rollPaper.white).Border(1, tk.CardStroke).Clip().Cursor(ui.CursorPointer).Label(tr.Title + "放大卷帘")
 	bounds := z.handle.Bounds(c)
+	// 乐器音轨在网格下方留出力度条。
+	velH := float32(0)
+	if tr.Instrument >= 0 {
+		velH = zoomVelH
+	}
 	gridW := float64(bounds.W - zoomKeysWidth)
-	gridH := float64(bounds.H - zoomRulerH)
+	gridH := float64(bounds.H - zoomRulerH - velH)
 	pos, seek := a.scorePosition()
 	measures := res.Measures()
 
@@ -163,8 +178,20 @@ func (a *app) zoomCanvas(c *ui.Context, tk *fluent.Tokens, res *score.Analysis) 
 		return z.wheel(ev, gridW, pos, res.Duration, pitched)
 	})
 
+	// 力度条上的按住拖动编辑力度，此时不平移、不跳转。
+	px, py, _ := box.PointerPosition()
+	lane := ui.Rect{X: zoomKeysWidth, Y: bounds.H - velH, W: float32(gridW), H: velH}
+	timeAt := func(x float32) float64 {
+		v0, v1 := z.zoomView(pos, res.Duration)
+		return v0 + float64(x-zoomKeysWidth)/max(gridW, 1)*(v1-v0)
+	}
+	editing := a.velocityDrag(res, tr, box.Pressed(), px, py, lane, timeAt, 3/max(gridW, 1)*z.span)
+	if editing {
+		z.dragged = true
+	}
+
 	// 拖动平移：横向按像素换算秒数，纵向按行高换算半音；拖动即关闭跟随。单击（没有拖动）跳转。
-	if dx, dy, ok := box.Dragged(); ok && (dx != 0 || dy != 0) {
+	if dx, dy, ok := box.Dragged(); ok && !editing && (dx != 0 || dy != 0) {
 		v0, v1 := z.zoomView(pos, res.Duration)
 		if gridW > 0 {
 			z.start = v0 - float64(dx)/gridW*(v1-v0)
@@ -189,7 +216,7 @@ func (a *app) zoomCanvas(c *ui.Context, tk *fluent.Tokens, res *score.Analysis) 
 			pos, playing = pl.Position().Seconds(), pl.Playing()
 		}
 		v0, v1 := z.zoomView(pos, res.Duration)
-		grid := ui.Rect{X: r.X + zoomKeysWidth, Y: r.Y + zoomRulerH, W: r.W - zoomKeysWidth, H: r.H - zoomRulerH}
+		grid := ui.Rect{X: r.X + zoomKeysWidth, Y: r.Y + zoomRulerH, W: r.W - zoomKeysWidth, H: r.H - zoomRulerH - velH}
 		xOf := func(sec float64) float32 { return grid.X + float32((sec-v0)/(v1-v0))*grid.W }
 		rowH := float32(z.rowH)
 
@@ -254,6 +281,19 @@ func (a *app) zoomCanvas(c *ui.Context, tk *fluent.Tokens, res *score.Analysis) 
 				p.Fill(ui.Rect{X: xOf(pos) - 1, Y: grid.Y, W: 2, H: grid.H}, rollPaper.playhead, 1)
 			}
 		})
+		if velH > 0 {
+			lane := ui.Rect{X: grid.X, Y: grid.Y + grid.H, W: grid.W, H: velH}
+			p.Clip(lane, 0, func() {
+				a.drawVelocityLane(p, lane, res, tr, v0, v1, color, xOf)
+				if pos >= v0 && pos < v1 {
+					p.Fill(ui.Rect{X: xOf(pos) - 1, Y: lane.Y, W: 2, H: lane.H}, rollPaper.playhead, 1)
+				}
+			})
+			keys := ui.Rect{X: r.X, Y: lane.Y, W: zoomKeysWidth - 1, H: velH}
+			p.Fill(keys, rollPaper.keyWhite, 0)
+			p.Line(keys.X, keys.Y, keys.X+keys.W, keys.Y, 1, rollPaper.keyEdge)
+			p.Text(keys.X+8, keys.Y+(velH-12)/2, "力度", 12, rollPaper.keyText)
+		}
 
 		// 标尺：深色底、浅色小节号（与乐谱的编号一致），写在小节起点处；起点在窗口左侧之外的小节也写，编号随之移出。
 		p.Fill(ui.Rect{X: r.X, Y: r.Y, W: r.W, H: zoomRulerH}, rollPaper.ruler, 0)

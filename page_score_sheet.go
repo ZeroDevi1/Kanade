@@ -71,14 +71,21 @@ func (s *sheetState) styleKey() string {
 	return score.SymbolJazz
 }
 
-// useTracks 让音轨缓存对应 res：换了分析结果时重建音轨与混音设置（乐器数可能不同），丢弃已合成的采样。
+// useTracks 让音轨缓存对应 res：换了分析结果时重建音轨与混音设置（乐器数可能不同）。同一位置上声音不变的音轨
+// （synth.SameSound，例如只改了另一条音轨的演奏设置或乐器）保留已合成的采样，其余丢弃。
 // 返回是否重建了（此时需要按新结果重新混音）。
 func (s *sheetState) useTracks(res *score.Analysis) bool {
 	if s.tracksFor == res {
 		return false
 	}
+	old, oldPCM := s.tracks, s.synthPCM
 	s.tracksFor, s.tracks = res, synth.Tracks(res)
 	s.synthPCM = make([][]float32, len(s.tracks))
+	for i := range min(len(old), len(oldPCM), len(s.tracks)) {
+		if synth.SameSound(old[i], s.tracks[i]) {
+			s.synthPCM[i] = oldPCM[i]
+		}
+	}
 	s.mix.Resize(len(s.tracks))
 	return true
 }

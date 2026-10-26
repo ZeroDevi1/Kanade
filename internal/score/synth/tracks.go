@@ -2,6 +2,7 @@ package synth
 
 import (
 	"cmp"
+	"fmt"
 	"slices"
 
 	"kanade/internal/score"
@@ -21,33 +22,61 @@ const (
 // Track 是一条音轨：标题与要合成的音符（秒、MIDI 音高）。原曲轨没有音符。
 type Track struct {
 	Title string
-	// Notes 按开始时间排序。鼓轨的音高是 GM 打击乐键位。
+	// Notes 按开始时间排序。鼓轨的音高是 GM 打击乐键位。乐器音轨是按演奏设置演奏后的音（InstrumentNotes）。
 	Notes []PianoNote
 	// Program 是合成用的 GM 音色（0–127）；Drum 为 true 时是鼓组，Program 无意义。钢琴两轨为 0（大钢琴）。
 	Program int
 	Drum    bool
+	// Pedal 是延音踏板踩下的区间（按时间排序，合成时延长音符，见 perform.go）；nil 为不踩。
+	Pedal []Span
+	// Instrument 是乐器音轨在 Transcription.Instruments 中的序号，固定音轨为 −1。
+	// Source[j] 是 Notes[j] 在该乐器 Notes 中的序号（Notes 重新按时间排过序）；固定音轨为 nil。
+	Instrument int
+	Source     []int
 }
 
-// Tracks 返回全部音轨：原曲、钢琴和弦、钢琴旋律（没有旋律线时音符为空），然后是每种转录出音符的乐器。
+// Tracks 返回全部音轨：原曲、钢琴和弦、钢琴旋律（没有旋律线时音符为空），然后是每种转录出的乐器。
+// 改乐器后可能有同名的乐器，第二条起的标题加上序号（如「原声钢琴 2」）。
 func Tracks(a *score.Analysis) []Track {
 	out := []Track{
-		{Title: "原曲"},
-		{Title: "钢琴 · 和弦", Notes: ChordPad(a)},
-		{Title: "钢琴 · 旋律", Notes: MelodyPiano(a)},
-	}
-	if a.Transcription != nil {
-		for _, in := range a.Transcription.Instruments {
-			notes := make([]PianoNote, len(in.Notes))
-			for i, n := range in.Notes {
-				notes[i] = PianoNote{MIDI: n.Pitch, Start: n.Start, End: n.End, Velocity: midiInstrumentVelocity}
-			}
-			out = append(out, Track{Title: in.Title(), Notes: notes, Program: in.Program, Drum: in.Drum})
-		}
+		{Title: "原曲", Instrument: -1},
+		{Title: "钢琴 · 和弦", Notes: ChordPad(a), Instrument: -1},
+		{Title: "钢琴 · 旋律", Notes: MelodyPiano(a), Instrument: -1},
 	}
 	for i := range out {
 		slices.SortStableFunc(out[i].Notes, func(x, y PianoNote) int { return cmp.Compare(x.Start, y.Start) })
 	}
+	if a.Transcription == nil {
+		return out
+	}
+	seen := map[string]int{}
+	for k, in := range a.Transcription.Instruments {
+		played := InstrumentNotes(in)
+		src := make([]int, len(played))
+		for j := range src {
+			src[j] = j
+		}
+		slices.SortStableFunc(src, func(x, y int) int { return cmp.Compare(played[x].Start, played[y].Start) })
+		notes := make([]PianoNote, len(played))
+		for j, s := range src {
+			notes[j] = played[s]
+		}
+		title := in.Title()
+		if seen[in.Name]++; seen[in.Name] > 1 {
+			title = fmt.Sprintf("%s %d", title, seen[in.Name])
+		}
+		tr := Track{Title: title, Notes: notes, Program: in.Program, Drum: in.Drum, Instrument: k, Source: src}
+		if !in.Drum {
+			tr.Pedal = PedalSpans(a, in.Play.Pedal)
+		}
+		out = append(out, tr)
+	}
 	return out
+}
+
+// SameSound 报告两条音轨合成出的声音是否相同（音色、音符与踏板都相同），用于在结果更新后保留已合成的采样。
+func SameSound(x, y Track) bool {
+	return x.Program == y.Program && x.Drum == y.Drum && slices.Equal(x.Notes, y.Notes) && slices.Equal(x.Pedal, y.Pedal)
 }
 
 // TrackMix 是各音轨的混音设置，三个切片等长（音轨数）。Gain 为线性增益（0–2，1 为原电平）。

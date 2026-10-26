@@ -553,8 +553,113 @@ func TestScoreInstrumentHint(t *testing.T) {
 	}
 }
 
-// 改乐器：把识别成原声吉他的音轨改为钢琴后与已有的钢琴轨合并，analysis.json 随之更新；鼓轨没有这个菜单，
-// 鼓与有音高的乐器不能互改。
+// 演奏调节：放大查看乐器音轨时切换延音踏板、在力度条上拖动设置力度，改动写回分析结果；
+// 只重新合成改动的音轨，其他音轨已合成的采样保留。
+func TestScoreRollPerform(t *testing.T) {
+	dir := t.TempDir()
+	wav, js := filepath.Join(dir, "audio.wav"), filepath.Join(dir, "analysis.json")
+	writeTestWav(t, wav, 8000, 16000)
+	os.WriteFile(js, []byte(`{"duration": 2, "beats": [0,0.5,1,1.5], "downbeats": [0, 1],
+		"key": {"label": "C 大调", "tonic_pc": 0, "mode": "major"},
+		"chords": [{"start":0,"end":2,"label":"C","root":0,"quality":"maj"}],
+		"transcription": {"model": "muscriptor-medium", "onset_delay": 0, "instruments": [
+			{"name": "electric_bass", "program": 33, "drum": false, "notes": [{"start":0,"end":0.5,"pitch":36},{"start":1,"end":1.5,"pitch":43}]},
+			{"name": "drums", "program": -1, "drum": true, "notes": [{"start":0,"end":0.05,"pitch":36},{"start":0.5,"end":0.55,"pitch":38}]}]}}`), 0o644)
+	l := paths.New(t.TempDir())
+	cond, _ := conductor.New(l, engines.FS, nil)
+	a := newApp()
+	a.be, a.current = backend{layout: l, cond: cond}, "score"
+	updates := make(chan func(), 64)
+	a.post = func(fn func()) { updates <- fn }
+	run, _ := score.Start(artifactJobs{[]string{wav, js}}, score.Request{Input: "/x/歌.flac", Options: score.DefaultOptions()}, nil)
+	for run.Snapshot().Running() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	a.score.runs = []*score.Run{run}
+	tt := ui.NewTester(a.view, 1200, 900)
+	pv := &a.score.preview
+	s := &a.score.sheet
+	drain := func(until func() bool) {
+		t.Helper()
+		deadline := time.After(10 * time.Second)
+		for !until() {
+			select {
+			case fn := <-updates:
+				fn()
+				tt.Frame()
+			case <-deadline:
+				t.Fatal("timed out")
+			}
+		}
+	}
+	drain(func() bool { return pv.player != nil })
+	bass, drums := synth.TrackInstruments, synth.TrackInstruments+1
+	s.mix.Mute[bass], s.mix.Mute[drums] = false, false
+	a.applyMix(run.Snapshot().Result)
+	drain(func() bool { return s.synthPCM[bass] != nil && s.synthPCM[drums] != nil && !s.mixPending })
+	drumPCM := s.synthPCM[drums]
+
+	a.openZoom(bass)
+	tt.Frame()
+	if err := tt.Click("每小节换"); err != nil {
+		t.Fatalf("%v; texts %q", err, tt.Texts())
+	}
+	tt.Frame()
+	if in := run.Snapshot().Result.Transcription.Instruments[0]; in.Play.Pedal != score.PedalBar {
+		t.Fatalf("pedal %+v", in.Play)
+	}
+	if len(s.tracks[bass].Pedal) != 2 || s.synthPCM[bass] != nil && &s.synthPCM[drums][0] != &drumPCM[0] {
+		t.Errorf("pedal %+v; drums resynthesized", s.tracks[bass].Pedal)
+	}
+	drain(func() bool { return s.synthPCM[bass] != nil && !s.synthBusy })
+	if &s.synthPCM[drums][0] != &drumPCM[0] {
+		t.Error("unchanged drum track was resynthesized")
+	}
+
+	// 在力度条底部按住第一个音的起点：这个音的力度变小，第二个音不变（存成默认力度）。
+	r, ok := tt.Find("电贝斯放大卷帘")
+	if !ok {
+		t.Fatal("no zoom canvas")
+	}
+	x, y := r.X+zoomKeysWidth+1, r.Y+r.H-10
+	tt.Press(x, y)
+	tt.Frame()
+	tt.Move(x+1, y)
+	tt.Frame()
+	tt.Release(x+1, y)
+	tt.Frame()
+	tt.Frame()
+	notes := run.Snapshot().Result.Transcription.Instruments[0].Notes
+	if notes[0].Velocity <= 0 || notes[0].Velocity > 0.3 || notes[1].Velocity != score.DefaultNoteVelocity {
+		t.Errorf("velocities %+v", notes)
+	}
+	saved, err := score.ReadAnalysis(js)
+	if err != nil || saved.Transcription.Instruments[0].Play.Pedal != score.PedalBar || saved.Transcription.Instruments[0].Notes[0].Velocity != notes[0].Velocity {
+		t.Errorf("saved %+v %v", saved.Transcription.Instruments[0], err)
+	}
+
+	// 按原曲估计力度（后台），完成后每个音都有力度；清除后恢复未设置。
+	if err := tt.Click("按原曲估计力度"); err != nil {
+		t.Fatal(err)
+	}
+	drain(func() bool { return !s.roll.zoom.perform.estimating })
+	tt.Frame()
+	for _, n := range run.Snapshot().Result.Transcription.Instruments[0].Notes {
+		if n.Velocity < 0.2 || n.Velocity > 1 {
+			t.Errorf("estimated %+v (err %q)", n, a.score.err)
+		}
+	}
+	if err := tt.Click("清除逐音力度"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if n := run.Snapshot().Result.Transcription.Instruments[0].Notes[0]; n.Velocity != 0 {
+		t.Errorf("cleared %+v", n)
+	}
+}
+
+// 改乐器：把识别成原声吉他的音轨改为钢琴后，它与已有的钢琴轨仍是两条音轨（第二条标题带序号），顺序与其他音轨的
+// 混音设置不变，analysis.json 随之更新；鼓轨没有这个菜单，鼓与有音高的乐器不能互改。
 func TestScoreRelabelInstrument(t *testing.T) {
 	dir := t.TempDir()
 	wav, js := filepath.Join(dir, "audio.wav"), filepath.Join(dir, "analysis.json")
@@ -583,6 +688,7 @@ func TestScoreRelabelInstrument(t *testing.T) {
 	if _, ok := tt.Find("把鼓改为其他乐器"); ok {
 		t.Error("drum track should not offer relabeling")
 	}
+	a.score.sheet.mix.Mute[synth.TrackInstruments+1] = false // 钢琴轨的混音设置在改乐器后保留
 	if err := tt.Click("把原声吉他改为其他乐器"); err != nil {
 		t.Fatal(err)
 	}
@@ -591,25 +697,32 @@ func TestScoreRelabelInstrument(t *testing.T) {
 	}
 	tt.Frame()
 	tr := run.Snapshot().Result.Transcription
-	if len(tr.Instruments) != 2 || tr.Instruments[0].Name != "acoustic_piano" || len(tr.Instruments[0].Notes) != 3 ||
-		tr.Instruments[0].Notes[1].Pitch != 62 {
+	if len(tr.Instruments) != 3 || tr.Instruments[0].Name != "acoustic_piano" || tr.Instruments[0].Program != 0 ||
+		len(tr.Instruments[0].Notes) != 2 || tr.Instruments[1].Name != "acoustic_piano" || len(tr.Instruments[1].Notes) != 1 {
 		t.Fatalf("instruments %+v", tr.Instruments)
 	}
-	if tt.HasText("原声吉他") || len(a.score.sheet.tracks) != synth.TrackInstruments+2 {
+	if tt.HasText("原声吉他") || !tt.HasText("原声钢琴 2") || len(a.score.sheet.tracks) != synth.TrackInstruments+3 {
 		t.Errorf("tracks not rebuilt: %q", tt.Texts())
 	}
+	if a.score.sheet.mix.Mute[synth.TrackInstruments+1] {
+		t.Error("mix settings reset by relabeling")
+	}
 	saved, err := score.ReadAnalysis(js)
-	if err != nil || len(saved.Transcription.Instruments) != 2 || saved.Key.Label != "C 大调" {
+	if err != nil || len(saved.Transcription.Instruments) != 3 || saved.Transcription.Instruments[0].Name != "acoustic_piano" ||
+		saved.Key.Label != "C 大调" {
 		t.Errorf("saved %+v %v", saved, err)
 	}
-	// 改成没有的乐器：改名并换成该组的代表音色。
-	if err := run.RelabelInstrument("acoustic_piano", "electric_piano"); err != nil {
+	// 两条同名的轨可以分别再改。
+	if err := run.RelabelInstrument(1, "electric_piano"); err != nil {
 		t.Fatal(err)
 	}
-	if in := run.Snapshot().Result.Transcription.Instruments[0]; in.Name != "electric_piano" || in.Program != 2 {
+	if in := run.Snapshot().Result.Transcription.Instruments[1]; in.Name != "electric_piano" || in.Program != 2 {
 		t.Errorf("renamed %+v", in)
 	}
-	if err := run.RelabelInstrument("drums", "acoustic_piano"); err == nil {
+	if err := run.RelabelInstrument(2, "acoustic_piano"); err == nil {
 		t.Error("drums relabeled to a pitched instrument")
+	}
+	if err := run.RelabelInstrument(5, "acoustic_piano"); err == nil {
+		t.Error("out-of-range instrument relabeled")
 	}
 }

@@ -136,6 +136,14 @@ func rollNote(p *ui.Painter, r ui.Rect, color ui.Color, muted, active bool, radi
 	p.Stroke(r, edge, radius, width)
 }
 
+// noteColor 返回音符块的填充色：乐器音轨按力度深浅（弱的音更淡），固定音轨保持原色。
+func noteColor(color ui.Color, tr synth.Track, n synth.PianoNote) ui.Color {
+	if tr.Instrument < 0 {
+		return color
+	}
+	return color.Alpha(float32(0.35 + 0.65*n.Velocity))
+}
+
 // rollView 返回 pos 时卷帘显示的时间范围 [v0, v1)（秒）。
 func (r *rollState) rollView(pos, duration float64) (v0, v1 float64) {
 	w := r.visibleSpan()
@@ -194,11 +202,7 @@ func (a *app) scoreRollCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysi
 		ui.Column(c).Gap(2).AlignItems(ui.Stretch).Children(func() {
 			for i, tr := range s.tracks {
 				ui.Row(c.Key(fmt.Sprintf("roll-%d", i))).Gap(8).Height(r.laneHeight()).AlignItems(ui.Stretch).Children(func() {
-					var inst *score.Instrument
-					if k := i - synth.TrackInstruments; k >= 0 && res.Transcription != nil && k < len(res.Transcription.Instruments) {
-						inst = &res.Transcription.Instruments[k]
-					}
-					if a.rollHeader(c, tk, i, tr, inst, available[i], audible[i]) {
+					if a.rollHeader(c, tk, i, tr, available[i], audible[i]) {
 						changed = true
 					}
 					a.rollLane(c, tk, res, i, tr, audible[i], v0, v1, seek)
@@ -211,7 +215,8 @@ func (a *app) scoreRollCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysi
 		case len(s.tracks) == synth.TrackInstruments:
 			ui.Text(c, "多乐器转录没有转录出音符。").FontSize(12).TextColor(t.TextMuted)
 		default:
-			ui.Text(c, "乐器音轨用简化的合成音色播放转录出的音符，用于听出各乐器的旋律与节奏；导出 MIDI 后可在 DAW 中换成真实音色。"+
+			ui.Text(c, "乐器音轨用简化的合成音色播放转录出的音符，用于听出各乐器的旋律与节奏；放大查看一条乐器音轨可调节力度、时值、"+
+				"八度与延音踏板，导出 MIDI 时一并写入，之后可在 DAW 中换成真实音色。"+
 				"转录由 MuScriptor 完成，其权重为 CC BY-NC 4.0 许可，仅限非商业用途。").FontSize(12).TextColor(t.TextMuted)
 		}
 	})
@@ -222,9 +227,9 @@ func (a *app) scoreRollCard(c *ui.Context, tk *fluent.Tokens, res *score.Analysi
 	return el
 }
 
-// rollHeader 是一条音轨左侧的栏：色块、名称与音符概况、静音 / 独奏与音量；inst 非 nil 时（转录出的乐器音轨）另有
+// rollHeader 是一条音轨左侧的栏：色块、名称与音符概况、静音 / 独奏与音量；转录出的有音高乐器音轨另有
 // 「改为其他乐器」的菜单。返回混音设置是否被改动。
-func (a *app) rollHeader(c *ui.Context, tk *fluent.Tokens, i int, tr synth.Track, inst *score.Instrument, available, audible bool) (changed bool) {
+func (a *app) rollHeader(c *ui.Context, tk *fluent.Tokens, i int, tr synth.Track, available, audible bool) (changed bool) {
 	t := c.Theme()
 	s := &a.score.sheet
 	ui.Row(c).Width(rollHeaderWidth).Shrink(0).Gap(8).AlignItems(ui.Center).Padding(0, 8, 0, 0).Children(func() {
@@ -243,11 +248,15 @@ func (a *app) rollHeader(c *ui.Context, tk *fluent.Tokens, i int, tr synth.Track
 					name.TextColor(t.TextMuted)
 				}
 				ui.Text(c, rollSummary(tr)).FontSize(11).Font("monospace").TextColor(t.TextMuted).SingleLine().Grow(1)
-				if inst != nil {
-					a.relabelButton(c, tk, *inst)
+				if tr.Instrument >= 0 && !tr.Drum {
+					a.relabelButton(c, tk, tr)
+				}
+				tip := "放大查看（也可双击卷帘）"
+				if tr.Instrument >= 0 {
+					tip = "放大查看，并调节力度、时值与踏板（也可双击卷帘）"
 				}
 				zoom := ui.ButtonBase(c.Key("zoom-"+tr.Title)).Size(22, 20).Radius(fluent.ControlRadius).Center().
-					Label("放大查看" + tr.Title).Tooltip("放大查看（也可双击卷帘）")
+					Label("放大查看" + tr.Title).Tooltip(tip)
 				if zoom.Hovered() {
 					zoom.Background(tk.SubtleHover)
 				}
@@ -358,7 +367,7 @@ func (a *app) rollLane(c *ui.Context, tk *fluent.Tokens, res *score.Analysis, i 
 				}
 				y := rect.Y + 3 + float32(rows-1-rowOf(n.MIDI))*rowH + (rowH-noteH)/2
 				x0, x1 := xOf(max(n.Start, v0)), xOf(min(n.End, v1))
-				rollNote(p, ui.Rect{X: x0, Y: y, W: max(x1-x0, 2), H: noteH}, color, !audible,
+				rollNote(p, ui.Rect{X: x0, Y: y, W: max(x1-x0, 2), H: noteH}, noteColor(color, tr, n), !audible,
 					audible && pos >= n.Start && pos < n.End, 1.5)
 			}
 		}
@@ -428,14 +437,16 @@ func rollWaveform(p *ui.Painter, rect ui.Rect, pv *audioPreview, v0, v1 float64,
 	}
 }
 
-// relabelButton 是乐器音轨的「改为…」菜单：常用乐器组直接列出，其余在「其他乐器」子菜单中；改成已有的乐器时合并。
-// 鼓只能与鼓互改，所以鼓轨没有这个菜单。
-func (a *app) relabelButton(c *ui.Context, tk *fluent.Tokens, inst score.Instrument) {
-	if inst.Drum {
+// relabelButton 是有音高乐器音轨 tr 的「改为…」菜单：常用乐器组直接列出，其余在「其他乐器」子菜单中。改成已有的
+// 乐器时两条音轨仍各自独立。鼓只能与鼓互改，所以鼓轨没有这个菜单。
+func (a *app) relabelButton(c *ui.Context, tk *fluent.Tokens, tr synth.Track) {
+	res := a.score.sheet.tracksFor
+	if res == nil || res.Transcription == nil || tr.Instrument >= len(res.Transcription.Instruments) {
 		return
 	}
-	b := ui.ButtonBase(c.Key("relabel-"+inst.Name)).Size(22, 20).Radius(fluent.ControlRadius).Center().
-		Label("把" + inst.Title() + "改为其他乐器").Tooltip("识别错了乐器？改为其他乐器（改成已有的乐器时合并）")
+	inst := res.Transcription.Instruments[tr.Instrument]
+	b := ui.ButtonBase(c.Key(fmt.Sprintf("relabel-%d", tr.Instrument))).Size(22, 20).Radius(fluent.ControlRadius).Center().
+		Label("把" + tr.Title + "改为其他乐器").Tooltip("识别错了乐器？改为其他乐器（音符与演奏设置不变）")
 	if b.Hovered() {
 		b.Background(tk.SubtleHover)
 	}
@@ -445,7 +456,7 @@ func (a *app) relabelButton(c *ui.Context, tk *fluent.Tokens, inst score.Instrum
 			return
 		}
 		if m.Item(g.Title).Checked(g.Key == inst.Name).Disabled(g.Key == inst.Name).Chosen() {
-			a.relabelInstrument(inst.Name, g.Key)
+			a.relabelInstrument(tr.Instrument, g.Key)
 		}
 	}
 	b.Menu(func(m *ui.Menu) {
@@ -466,17 +477,21 @@ func (a *app) relabelButton(c *ui.Context, tk *fluent.Tokens, inst score.Instrum
 	})
 }
 
-// relabelInstrument 把当前记录转录中的乐器 from 改为 to，并按新的音轨重新开始混音（各音轨的静音、独奏与音量恢复默认）。
-func (a *app) relabelInstrument(from, to string) {
+// relabelInstrument 把当前记录转录中的第 k 种乐器改为乐器组 to。音轨的顺序不变，各音轨的混音设置保留；
+// 下一帧 useTracks 按新结果重建音轨，只重新合成这一条。
+func (a *app) relabelInstrument(k int, to string) {
+	a.editTranscription(func(r *score.Run) error { return r.RelabelInstrument(k, to) })
+}
+
+// editTranscription 对当前记录执行一次转录编辑（score.Run 的 RelabelInstrument、SetPerformance 等），失败时在页面上报错。
+func (a *app) editTranscription(edit func(*score.Run) error) {
 	s := &a.score
 	if len(s.runs) == 0 {
 		return
 	}
-	if err := s.runs[s.shown].RelabelInstrument(from, to); err != nil {
+	if err := edit(s.runs[s.shown]); err != nil {
 		s.err = err.Error()
 		return
 	}
-	// 菜单的选择在本帧构建中途回调，本帧其余部分仍按旧音轨构建：混音设置保持旧音轨数，下一帧 useTracks 按新音轨调整。
 	s.err = ""
-	s.sheet.mix = synth.NewTrackMix(len(s.sheet.tracks))
 }

@@ -2,6 +2,7 @@
 package score
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -492,6 +493,8 @@ type Instrument struct {
 	Program int              `json:"program"` // 代表 GM 音色 0–127；鼓为 -1
 	Drum    bool             `json:"drum"`
 	Notes   []InstrumentNote `json:"notes"`
+	// Play 是在多轨卷帘里调的演奏设置（引擎不输出，零值为原样演奏）。
+	Play Performance `json:"play,omitzero"`
 }
 
 // InstrumentNote 是转录出的一个音（秒）。鼓的时长是引擎给的固定短音。
@@ -499,7 +502,44 @@ type InstrumentNote struct {
 	Start float64 `json:"start"`
 	End   float64 `json:"end"`
 	Pitch int     `json:"pitch"` // MIDI 音高；鼓为 GM 打击乐键位
+	// Velocity 是逐音力度（0–1）：MuScriptor 不输出力度，0 表示未设置、按 DefaultNoteVelocity 演奏；
+	// 在卷帘中手动调整或按原曲估计后写入。
+	Velocity float64 `json:"velocity,omitempty"`
 }
+
+// DefaultNoteVelocity 是没有逐音力度的转录音符的力度：mf 附近（MIDI 约 90）。
+const DefaultNoteVelocity = 0.7
+
+// 延音踏板的方式（Performance.Pedal）：每小节或每次换和弦时换踏板（抬起再踩下）。
+const (
+	PedalOff   = ""
+	PedalBar   = "bar"
+	PedalChord = "chord"
+)
+
+// Performance 是一条乐器音轨的演奏设置（多轨卷帘的简易调节），作用于试听合成与 MIDI 导出，不改转录出的音符本身。
+// 零值为原样演奏。鼓只用 Velocity。
+type Performance struct {
+	// Velocity 是力度倍率（0.25–2），0 视为 1：乘在每个音的力度上，结果限制在 0–1。
+	Velocity float64 `json:"velocity,omitempty"`
+	// Length 是时值倍率（0.25–2），0 视为 1：从按下处伸缩每个音的长度。
+	Length float64 `json:"length,omitempty"`
+	// Octave 是整轨移八度（−2–2）。
+	Octave int `json:"octave,omitempty"`
+	// Pedal 是延音踏板：PedalOff、PedalBar 或 PedalChord。
+	Pedal string `json:"pedal,omitempty"`
+}
+
+// Valid 报告设置是否在允许的范围内。
+func (p Performance) Valid() bool {
+	in := func(v float64) bool { return v == 0 || v >= 0.25 && v <= 2 }
+	return in(p.Velocity) && in(p.Length) && p.Octave >= -2 && p.Octave <= 2 &&
+		(p.Pedal == PedalOff || p.Pedal == PedalBar || p.Pedal == PedalChord)
+}
+
+// VelocityScale 与 LengthScale 返回倍率，零值为 1。
+func (p Performance) VelocityScale() float64 { return cmp.Or(p.Velocity, 1) }
+func (p Performance) LengthScale() float64   { return cmp.Or(p.Length, 1) }
 
 // instrumentTitles 是乐器组的中文名。
 var instrumentTitles = map[string]string{
