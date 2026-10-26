@@ -20,6 +20,8 @@ type synthOpts struct {
 	vibAmp, vibHz  float64 // 颤音幅度（音分）与频率
 	glide          float64 // 同音节相邻音之间的滑音时长（秒）
 	octaveBurstsAt []float64
+	drift          float64 // 音高随时间的线性漂移（音分 / 秒，负值为越唱越低）
+	jitter         float64 // 每个边界的随机时间偏差的标准差（秒）；紧接的音共用边界
 }
 
 // synthFrames 按 Fable 建议的模型合成 10 ms 一帧的哼唱特征：持续段清晰度约 0.9、响度 −20 dBFS；从静音起音时
@@ -27,9 +29,26 @@ type synthOpts struct {
 func synthFrames(s HumSettings, notes []synthNote, o synthOpts) []KaraokeFrame {
 	rng := rand.New(rand.NewPCG(1, 2))
 	beat := s.Beat()
-	at := func(n synthNote) (float64, float64) {
+	// 各音起止（秒）：节奏抖动按边界施加，前一音终点与后一音起点重合时共用同一偏差，保持紧接。
+	bounds := make([][2]float64, len(notes))
+	jrng := rand.New(rand.NewPCG(5, 6))
+	jit := func() float64 { return max(-2.5*o.jitter, min(2.5*o.jitter, jrng.NormFloat64()*o.jitter)) }
+	for k, n := range notes {
 		a := s.Start() + n.start*beat + o.shift
-		return a, a + n.dur*beat
+		if k > 0 && math.Abs(notes[k-1].start+notes[k-1].dur-n.start) < 1e-9 {
+			a = bounds[k-1][1]
+		} else if k > 0 {
+			a += jit()
+		}
+		bounds[k] = [2]float64{a, s.Start() + (n.start+n.dur)*beat + o.shift + jit()}
+	}
+	idx := map[synthNote]int{}
+	for k, n := range notes {
+		idx[n] = k
+	}
+	at := func(n synthNote) (float64, float64) {
+		b := bounds[idx[n]]
+		return b[0], b[1]
 	}
 	total := s.Start() + s.Length() + beat
 	var out []KaraokeFrame
@@ -40,11 +59,12 @@ func synthFrames(s HumSettings, notes []synthNote, o synthOpts) []KaraokeFrame {
 			if t < a || t >= b {
 				continue
 			}
-			c := 100*float64(n.midi) + o.tune + o.vibAmp*math.Sin(2*math.Pi*o.vibHz*(t-a)) + rng.NormFloat64()*8
+			c := 100*float64(n.midi) + o.tune + o.vibAmp*math.Sin(2*math.Pi*o.vibHz*(t-a)) + rng.NormFloat64()*8 +
+				o.drift*(t-s.Start())
 			f.DB, f.Clarity = -20, 0.9+rng.NormFloat64()*0.03
 			prevAdj := k > 0 && math.Abs(func() float64 { _, pb := at(notes[k-1]); return pb }()-a) < 1e-9
 			if prevAdj && notes[k-1].syl == n.syl && t-a < o.glide {
-				p := 100*float64(notes[k-1].midi) + o.tune
+				p := 100*float64(notes[k-1].midi) + o.tune + o.drift*(t-s.Start())
 				c = p + (c-p)*(t-a)/o.glide
 			}
 			if !prevAdj && t-a < 0.03 {
@@ -121,13 +141,29 @@ func TestTranscribeHum(t *testing.T) {
 			[]wantNote{{0, 1.0 / 3, 60, false}, {1.0 / 3, 2.0 / 3, 62, false}, {2.0 / 3, 1, 64, false}, {1, 2, 65, false}}},
 		{"休止分开的乐句", []synthNote{{0, 1, 60, 0}, {2, 1, 64, 1}}, synthOpts{},
 			[]wantNote{{0, 1, 60, false}, {2, 3, 64, false}}},
+		{"真实的八度大跳与十六分音符的大七度跳不被当成倍频错误折回",
+			[]synthNote{{0, 1, 57, 0}, {1, 1, 69, 1}, {2, 1, 57, 2}, {3, 0.25, 57, 3}, {3.25, 0.25, 68, 4}, {3.5, 0.5, 60, 5}},
+			synthOpts{vibAmp: 30, vibHz: 5.5},
+			[]wantNote{{0, 1, 57, false}, {1, 2, 69, false}, {2, 3, 57, false}, {3, 3.25, 57, false}, {3.25, 3.5, 68, false}, {3.5, 4, 60, false}}},
+		{"越唱越高（偏高 30 音分起，每秒再高 15 音分）带颤音的长音",
+			[]synthNote{{0, 2, 60, 0}, {2, 2, 64, 1}, {4, 2, 62, 2}, {6, 2, 67, 3}}, synthOpts{tune: 30, drift: 15, vibAmp: 30, vibHz: 5.5},
+			[]wantNote{{0, 2, 60, false}, {2, 4, 64, false}, {4, 6, 62, false}, {6, 8, 67, false}}},
+		{"边界前后偏 30 ms 的八分音符节奏不被量化成三连音或附点十六分",
+			[]synthNote{{0, 1.5, 60, 0}, {1.5, 0.5, 62, 1}, {2, 0.5, 64, 2}, {2.5, 1.5, 65, 3}, {4.5, 1, 67, 4}, {5.5, 0.5, 65, 5}, {6, 2, 64, 6}},
+			synthOpts{jitter: 0.03, vibAmp: 30, vibHz: 5.5},
+			[]wantNote{{0, 1.5, 60, false}, {1.5, 2, 62, false}, {2, 2.5, 64, false}, {2.5, 4, 65, false}, {4.5, 5.5, 67, false}, {5.5, 6, 65, false}, {6, 8, 64, false}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := TranscribeHum(synthFrames(testHum, tc.notes, tc.opts), testHum)
 			checkNotes(t, h, tc.want)
-			if tc.opts.tune != 0 && math.Abs(h.Tuning-tc.opts.tune) > 8 {
-				t.Errorf("tuning %.1f, want %.0f", h.Tuning, tc.opts.tune)
+			// 有漂移时 Tuning 是漂移曲线在有声帧上的平均（线性漂移约为中点的偏移）。
+			if want := tc.opts.tune + tc.opts.drift*testHum.Length()/2; want != 0 && math.Abs(h.Tuning-want) > 8 {
+				t.Errorf("tuning %.1f, want %.0f", h.Tuning, want)
+			}
+			// 4 秒内每秒高 15 音分：开头到结尾的漂移约 60 音分（曲线经 1 秒的高斯窗平滑，两端略收窄）。
+			if want := tc.opts.drift * testHum.Length(); want != 0 && math.Abs(h.DriftSpan()-want) > 20 {
+				t.Errorf("drift span %.1f, want about %.0f", h.DriftSpan(), want)
 			}
 			// 整体抢拍 / 拖拍由节拍跟踪吸收：乐谱第一拍对应的录音时刻随之移动。
 			if want := testHum.Start() + tc.opts.shift; math.Abs(h.RecTime(0)-want) > 0.025 { // 点击的伪起音会把拍点稍微拉回节拍器
@@ -240,5 +276,62 @@ func TestTranscribeHumRobust(t *testing.T) {
 				t.Fatalf("trial %d settings %+v", trial, h.Settings)
 			}
 		}
+	}
+}
+
+// 随机乐句在音准漂移与节奏抖动下的准确率（相对第一个音比较音高，整句移调不算错）。阈值比当前结果略低，
+// 防止调参时某一类扰动的准确率明显退化：漂移在切分前扣除、拍位先验与孤立三分点代价都由这里把关。
+func TestTranscribeHumAccuracy(t *testing.T) {
+	cases := []struct {
+		name               string
+		durs               []float64 // 时值候选（拍）
+		opts               synthOpts
+		minPitch, minOnset float64 // 音数正确的乐句里音高、起点正确的比例下限
+	}{
+		{"八分音符节奏，越唱越低", []float64{0.5, 1, 1.5, 2}, synthOpts{drift: -12}, 1, 1},
+		{"八分音符节奏，偏高并越唱越高", []float64{0.5, 1, 1.5, 2}, synthOpts{tune: 30, drift: 15}, 1, 1},
+		{"八分音符节奏，边界抖动 30 ms", []float64{0.5, 1, 1.5, 2}, synthOpts{jitter: 0.03}, 1, 0.98},
+		{"含十六分音符，越唱越高", []float64{0.25, 0.5, 0.75, 1, 1.5}, synthOpts{drift: 15}, 0.99, 1},
+		{"含十六分音符，边界抖动 30 ms", []float64{0.25, 0.5, 0.75, 1, 1.5}, synthOpts{jitter: 0.03}, 0.97, 0.92},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rng := rand.New(rand.NewPCG(11, 12))
+			o := tc.opts
+			o.vibAmp, o.vibHz = 30, 5.5
+			pitch, onset, total, phrases := 0, 0, 0, 0
+			for range 40 {
+				var notes []synthNote
+				for b, syl := 0.0, 0; b < 7.5; syl++ {
+					d := tc.durs[rng.IntN(len(tc.durs))]
+					notes = append(notes, synthNote{b, min(d, 8-b), 57 + rng.IntN(14), syl})
+					b += d
+					if rng.IntN(4) == 0 {
+						b += 0.5
+					}
+				}
+				h := TranscribeHum(synthFrames(testHum, notes, o), testHum)
+				if len(h.Notes) != len(notes) {
+					continue
+				}
+				phrases++
+				beat, off := h.Settings.Beat(), int(h.Notes[0].Pitch)-notes[0].midi
+				for i, n := range notes {
+					total++
+					if int(h.Notes[i].Pitch)-off == n.midi {
+						pitch++
+					}
+					if math.Abs(h.Notes[i].Start/beat-n.start) < 1e-6 {
+						onset++
+					}
+				}
+			}
+			if phrases < 36 {
+				t.Errorf("only %d/40 phrases with the right note count", phrases)
+			}
+			if p, o := float64(pitch)/float64(total), float64(onset)/float64(total); p < tc.minPitch || o < tc.minOnset {
+				t.Errorf("pitch %.3f (min %.2f) onset %.3f (min %.2f) over %d notes", p, tc.minPitch, o, tc.minOnset, total)
+			}
+		})
 	}
 }

@@ -167,7 +167,7 @@ func (a *app) inspireRoll(c *ui.Context, tk *fluent.Tokens) {
 		bpb    int
 		sub    int
 		toX    func(float64) float64
-		tuning float64
+		tuning func(int) float64
 	)
 	switch {
 	case recording && s.clickPlayer == nil:
@@ -180,7 +180,7 @@ func (a *app) inspireRoll(c *ui.Context, tk *fluent.Tokens) {
 	default:
 		h := *s.hum
 		set := h.Settings
-		notes, tuning = h.Notes, h.Tuning
+		notes, tuning = h.Notes, h.TuningAt
 		length, beat, bpb, sub = set.Length(), set.Beat(), set.BeatsPerBar, set.Sub()
 		toX = h.ScoreTime
 		if s.pick < len(s.harmonies) {
@@ -239,7 +239,7 @@ func (a *app) inspireRoll(c *ui.Context, tk *fluent.Tokens) {
 }
 
 // rollView 是卷帘要画的内容：纵轴音高范围 [lo, hi]，横轴 [0, length]（秒）；beat 为 0 时不画节拍网格（只画秒线）。
-// frames 经 toX 换到横轴时间、扣除 tuning（音分）后画成淡色的点；sel 为选中的音（-1 为没有）；pos 在绘制时
+// frames 经 toX 换到横轴时间、扣除 tuning(帧下标)（音分；nil 为不扣除）后画成淡色的点；sel 为选中的音（-1 为没有）；pos 在绘制时
 // 返回播放头的位置（-1 为不画）与是否在播放（播放中逐帧重画）。
 type rollView struct {
 	lo, hi, length, beat float64
@@ -250,7 +250,7 @@ type rollView struct {
 	tonic                int
 	frames               []score.KaraokeFrame
 	toX                  func(float64) float64
-	tuning               float64
+	tuning               func(int) float64
 	sel                  int
 	accent               ui.Color
 	pos                  func() (float64, bool)
@@ -299,8 +299,8 @@ func paintRoll(p *ui.Painter, r ui.Rect, v rollView) {
 	for _, ch := range v.chords {
 		p.Text(xOf(ch.Start)+3, r.Y+3, score.Symbol(ch, score.SymbolJazz, v.tonic), 11, rollPaper.rulerText)
 	}
-	// 录到的音高（扣除整体偏移），淡色细点。
-	for _, f := range v.frames {
+	// 录到的音高（逐帧扣除整理时校正的音准偏移，与音符对齐），淡色细点。
+	for i, f := range v.frames {
 		if f.F0 <= 0 || f.Clarity < 0.7 {
 			continue
 		}
@@ -308,7 +308,10 @@ func paintRoll(p *ui.Painter, r ui.Rect, v rollView) {
 		if sec < 0 || sec > length {
 			continue
 		}
-		m := 69 + 12*math.Log2(f.F0/440) - v.tuning/100
+		m := 69 + 12*math.Log2(f.F0/440)
+		if v.tuning != nil {
+			m -= v.tuning(i) / 100
+		}
 		p.Fill(ui.Rect{X: xOf(sec) - 1, Y: yOf(m) - 1, W: 2, H: 2}, ui.RGBA(60, 60, 60, 0.45), 1)
 	}
 	// 音符：转音与前一音之间画连线；选中的音加深描边；拟声字写在音符上方。

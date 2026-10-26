@@ -490,7 +490,7 @@ func (a *app) inspireInfoCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
 			{"调", key},
 			{"节奏", tempo},
 			{"音符", fmt.Sprintf("%d 个音、%d 个字（%d 个转音）", len(h.Notes), syl, len(h.Notes)-syl)},
-			{"音高", tuningText(h.Tuning)},
+			{"音高", tuningText(h.Tuning, h.DriftSpan())},
 		}
 		if !set.Free {
 			rows = append(rows, [2]string{"拍点", shiftText(h.RecTime(0) - set.Start())})
@@ -543,14 +543,29 @@ func (a *app) inspireRhythmFix(c *ui.Context) {
 	ui.Text(c, "调整后会用同一段录音重新整理，乐句里的手动修改会被覆盖。").FontSize(12).TextColor(t.TextMuted)
 }
 
-func tuningText(cents float64) string {
+func tuningText(cents, drift float64) string {
+	var out string
 	switch {
 	case cents > 5:
-		return fmt.Sprintf("整体偏高 %.0f 音分（已校正）", cents)
+		out = fmt.Sprintf("整体偏高 %.0f 音分", cents)
 	case cents < -5:
-		return fmt.Sprintf("整体偏低 %.0f 音分（已校正）", -cents)
+		out = fmt.Sprintf("整体偏低 %.0f 音分", -cents)
 	}
-	return "音高准"
+	// 漂移不到约六分之一个半音时听不出来，不提。
+	if math.Abs(drift) >= 15 {
+		dir := "越唱越高"
+		if drift < 0 {
+			dir = "越唱越低"
+		}
+		if out != "" {
+			out += "，"
+		}
+		out += fmt.Sprintf("%s约 %.0f 音分", dir, math.Abs(drift))
+	}
+	if out == "" {
+		return "音高准"
+	}
+	return out + "（已校正）"
 }
 
 func shiftText(sec float64) string {

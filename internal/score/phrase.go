@@ -11,13 +11,15 @@ import (
 // 并按音节分组（同一音节的多个音 = 转音 / 连音，只配一个拟声字）。离线处理，录完后整段计算。
 //
 // 流水线（算法设计经 Claude Fable 5.1 咨询，阈值为按 10 ms 帧与典型人声颤音推导的经验值，可用真实录音再调）：
-//  1. 有声判定（滞回 + 短缺口桥接）、八度错误修正、5 帧中值平滑 → 每帧音分（MIDI×100）；
+//  1. 有声判定（滞回 + 短缺口桥接）、八度错误修正（持续且清晰的八度 / 五度跳进保留）、5 帧中值平滑 → 每帧音分（MIDI×100）；
 //  2. 音节起音检测：响度回升、响度谷深、清晰度回升三项证据叠加（辅音造成的谷）；
 //  3. 每个有声段独立做只有半音状态的 Viterbi：起音帧换音免费，其余帧换音有代价，颤音因停留代价小于两次换音而不被切开；
 //     再合并过短的音（滑音归入目标音）、同音相连与阶梯状滑音；
-//  4. 代表音高（去头尾后按清晰度加权的中位数）→ 全局调音偏移（圆均值）→ 取整 → Krumhansl–Kessler 估调 →
+//  4. 切分前先扣除帧级音准漂移曲线（局部圆均值，相位展开）；代表音高（去头尾后按清晰度加权的中位数）→
+//     剩余的整体调音残差（圆均值）→ 取整 → Krumhansl–Kessler 估调 →
 //     调性明确时把唱得含糊的调外音吸附到调内；
-//  5. 全局节奏偏移（起点相对网格的圆均值）→ 按拍选 1/16 或八分三连音网格 → 边界动态规划量化，保证不重叠、不归零。
+//  5. 全局节奏偏移（起点相对网格的圆均值）→ 按拍选 1/16 或八分三连音网格 → 边界动态规划量化（距离 + 拍位先验），
+//     保证不重叠、不归零。
 // 参考：Mauch & Dixon 2014（pYIN）；Mauch et al. 2015（Tony 的音符 HMM）；Krumhansl & Kessler 1982（调性轮廓）。
 
 // 有声判定。
@@ -36,6 +38,11 @@ const (
 	humFifthTol  = 60  // 相差约纯五度且清晰度低于 humFifthClarity 时视为五度错误（YIN 偶见 ×3/2）
 	humFifthClar = 0.8
 	humMedianWin = 5 // 中值滤波窗（帧）：短于颤音半周期（70–100 ms），不削峰
+	// 真实跳进的判据：停在远侧至少 80 ms 且平均清晰度够高。♩=120 的十六分音符 125 ms，扣掉换音过渡与下一字的
+	// 辅音后只剩约 90 ms，平均清晰度也被辅音帧（约 0.3）拉到 0.75 左右；YIN 的倍频突跳通常只有 1–5 帧，
+	// 更长的倍频错误多出现在气声里，清晰度低于该值。
+	humLeapFrames  = 8
+	humLeapClarity = 0.7
 )
 
 // 音节起音。三项证据各自归一化到约 1，单项（例如颤音带来的 ±2 dB 起伏）不足以触发。
@@ -68,17 +75,28 @@ const (
 	humTrimHeadFrac = 0.2 // 短于 15 帧的音去掉开头的比例
 	humTrimTail     = 1
 	humTuneMinR     = 0.4 // 调音偏移的圆均值集中度低于此值时不校正
-	humKeyMinCorr   = 0.6 // 调性明确：最佳调的相关系数
-	humKeyMargin    = 0.1 // 且领先第二名
-	humSnapDev      = 35  // 取整残差至少该音分、且指向的相邻半音在调内时才吸附
+	// 音准漂移曲线的时间窗（秒）：约覆盖前后各 2–4 个音，单个唱偏的音只把偏移拉动一小部分；
+	// 太窄会把唱偏的音当成漂移吸收掉，太宽跟不上越唱越低。
+	humDriftSigma  = 1.0
+	humDriftAvg    = 19  // 残差的滑动平均窗（帧，190 ms ≈ 5–6 Hz 颤音的一个周期）
+	humDriftStable = 3   // 稳定帧：平滑后每帧变化不到该音分（漂移通常 < 0.3 音分 / 帧；一个半音的换音在平均窗内约 5 音分 / 帧）
+	humKeyMinCorr  = 0.6 // 调性明确：最佳调的相关系数
+	humKeyMargin   = 0.1 // 且领先第二名
+	humSnapDev     = 35  // 取整残差至少该音分、且指向的相邻半音在调内时才吸附
 )
 
 // 量化。
 const (
 	humTripletBias = 0.15 // 选三连音网格的额外代价（以 1/16 网格为单位），偏向直拍
+	humTripletLone = 0.15 // 拍内只有一个边界时三连音的额外代价：唱准的四分三连音（离三分点不到约 10 ms）仍保留
 	humShiftMinDur = 0.1  // 参与估计节奏偏移的音符最短时长（秒）
 	humShiftMinR   = 0.3  // 节奏偏移的圆均值集中度低于此值时不校正
 	humLegatoGap   = 0.5  // 与下一音的间隙小于半个网格时连奏
+	// 拍位先验（以 1/16 网格为单位的额外代价）：八分音符位置比十六分音符位置多 0.2 格的容差，离八分音符位置不到
+	// 0.6 格（离十六分音符位置超过 0.4 格）的边界取八分音符位置；唱准的十六分音符（距离约 0）不受影响。合成哼唱（边界抖动 σ = 30–45 ms，♩=120）上调出的值，见 phrase_test.go。
+	humMetricHalf    = 0.1
+	humMetricTriplet = 0.3
+	humMetricQuarter = 0.3
 )
 
 // humFrame 是录音的帧移（秒），与 KaraokeSession 一致。
@@ -93,13 +111,33 @@ type Hum struct {
 	TonicPC  int
 	Mode     string
 	KeyClear bool
-	// Tuning 是整体音高偏移（音分，正值为偏高）；Shift 是整体节奏偏移（秒，负值为抢拍）。都已在结果中扣除。
+	// Tuning 是整体音高偏移（音分，正值为偏高；有漂移时是逐帧偏移在有声帧上的平均）；Shift 是整体节奏偏移（秒，
+	// 负值为抢拍）。都已在结果中扣除。
 	Tuning, Shift float64
-	Voiced        int // 有声帧数；为 0 时没有录到哼唱
+	// Drift 是逐帧的音高偏移（音分，与整理时的 frames 一一对应，已含 Tuning 的残差校正），跟随越唱越高 / 越低；
+	// 旧记录没有时为 nil，按 Tuning 处理（见 TuningAt）。
+	Drift  []float64 `json:",omitempty"`
+	Voiced int       // 有声帧数；为 0 时没有录到哼唱
 	// Beats 是跟踪出的逐拍时刻（录音时间，秒），Origin 是乐谱第一拍在其中的拍坐标（可为负：弱起前补的空拍）。
 	// 乐谱按 Settings.BPM 等速；RecTime / ScoreTime 在乐谱时间与录音时间之间换算。Beats 为 nil 时为等距网格。
 	Beats  []float64
 	Origin float64
+}
+
+// TuningAt 返回第 i 帧（整理时的 frames 下标）已扣除的音高偏移（音分）。
+func (h Hum) TuningAt(i int) float64 {
+	if i >= 0 && i < len(h.Drift) {
+		return h.Drift[i]
+	}
+	return h.Tuning
+}
+
+// DriftSpan 返回从开头到结尾音准漂移了多少（音分，正值为越唱越高）；没有逐帧偏移时为 0。
+func (h Hum) DriftSpan() float64 {
+	if len(h.Drift) == 0 {
+		return 0
+	}
+	return h.Drift[len(h.Drift)-1] - h.Drift[0]
 }
 
 // RecTime 把乐谱时间（秒，相对第一拍）换算成录音时间。
@@ -153,6 +191,16 @@ func TranscribeHumAudio(frames []KaraokeFrame, pcm []float32, rate int, s HumSet
 	if h.Voiced == 0 {
 		return h
 	}
+	// 先扣除音准漂移再切分：Viterbi 的状态是绝对半音，偏了近半个半音的长音会随颤音在两个状态间来回切。
+	drift := humDrift(cents, voiced, frames)
+	var dsum float64
+	for i, v := range voiced {
+		if v {
+			cents[i] -= drift[i]
+			dsum += drift[i]
+		}
+	}
+	h.Tuning = dsum / float64(h.Voiced)
 	onset := humOnsets(frames, voiced, spectralFlux(pcm, rate, frames))
 	notes := humSegment(cents, voiced, onset)
 	if len(notes) == 0 {
@@ -162,6 +210,12 @@ func TranscribeHumAudio(frames []KaraokeFrame, pcm []float32, rate int, s HumSet
 		notes[i].cents = humNoteCents(cents, frames, notes[i])
 	}
 	midi := h.tune(notes)
+	// 逐帧偏移 = 漂移曲线 + tune 校正的残差（h.Tuning 里减去漂移平均的部分）；保留一位小数，记录里不占太多空间。
+	resid := h.Tuning - dsum/float64(h.Voiced)
+	h.Drift = drift
+	for i := range h.Drift {
+		h.Drift[i] = math.Round((h.Drift[i]+resid)*10) / 10
+	}
 	starts, ends := make([]float64, len(notes)), make([]float64, len(notes))
 	for i, n := range notes {
 		starts[i], ends[i] = frames[n.a].T, frames[n.b-1].T+humFrame
@@ -249,6 +303,64 @@ func humPitch(frames []KaraokeFrame) ([]float64, []bool) {
 	return cents, voiced
 }
 
+// humDrift 返回每帧的音准偏移曲线（音分）：以该帧为中心、高斯窗（σ = humDriftSigma 秒）内稳定有声帧的音分残差
+// （mod 100）按清晰度加权的圆均值，跟随越唱越低 / 越高的漂移；窗内集中度不足 humTuneMinR 时沿用前一帧的值（开头
+// 为 0）。相邻帧的值按差展开到 ±50 音分以内（漂移是连续的），所以漂移超过半个半音后仍保持音程，整句与开头的
+// 音准对齐——这比与绝对音高对齐更符合哼唱者心里的旋律。
+// 残差取自约一个颤音周期（humDriftAvg 帧）的滑动平均：±30 音分的颤音直接放到 100 音分的圆上，集中度只剩约 0.3。
+// 稳定帧指平滑后每帧变化不到 humDriftStable 音分、且平均窗内全部有声的帧，排除滑音、换音与段的边缘。
+// 无声帧的值是前后的延续，只供连续性使用。
+func humDrift(cents []float64, voiced []bool, frames []KaraokeFrame) []float64 {
+	n := len(cents)
+	r := humDriftAvg / 2
+	avg := make([]float64, n) // 平均窗内全部有声时的滑动平均，否则为 0
+	for i := r; i+r < n; i++ {
+		sum := 0.0
+		for j := i - r; j <= i+r; j++ {
+			if !voiced[j] {
+				sum = 0
+				break
+			}
+			sum += cents[j]
+		}
+		avg[i] = sum / float64(2*r+1)
+	}
+	type cs struct{ x, y float64 }
+	unit := make([]cs, n) // 每帧残差的单位向量 × 权重；不参与的帧为零
+	for i := 1; i+1 < n; i++ {
+		if avg[i-1] == 0 || avg[i] == 0 || avg[i+1] == 0 ||
+			math.Abs(avg[i]-avg[i-1]) > humDriftStable || math.Abs(avg[i+1]-avg[i]) > humDriftStable {
+			continue
+		}
+		th := 2 * math.Pi * math.Mod(avg[i], 100) / 100
+		w := max(frames[i].Clarity, 0.05)
+		unit[i] = cs{w * math.Cos(th), w * math.Sin(th)}
+	}
+	sigma := humDriftSigma / humFrame
+	half := int(3 * sigma)
+	kern := make([]float64, half+1)
+	for d := range kern {
+		kern[d] = math.Exp(-float64(d*d) / (2 * sigma * sigma))
+	}
+	out := make([]float64, n)
+	prev := 0.0
+	for i := range n {
+		var sx, sy, sw float64
+		for j := max(0, i-half); j <= min(n-1, i+half); j++ {
+			if u := unit[j]; u != (cs{}) {
+				k := kern[abs(j-i)]
+				sx, sy, sw = sx+k*u.x, sy+k*u.y, sw+k*math.Hypot(u.x, u.y)
+			}
+		}
+		if sw > 0 && math.Hypot(sx, sy)/sw >= humTuneMinR {
+			v := 100 / (2 * math.Pi) * math.Atan2(sy, sx)
+			prev = v + 100*math.Round((prev-v)/100)
+		}
+		out[i] = prev
+	}
+	return out
+}
+
 // humSegments 返回连续有声帧的区间 [a, b)。
 func humSegments(voiced []bool) [][2]int {
 	var out [][2]int
@@ -293,28 +405,50 @@ func humInterpolate(c []float64) {
 }
 
 // humFixOctaves 修正段内 YIN 的八度错误（×2、×1/2）与低清晰度时的五度错误（×3/2、×2/3）：参考音高为之前
-// 5 个已接受帧的中位数，段首没有足够的帧时用整段中位数。
+// 5 个已接受帧的中位数，段首没有足够的帧时用整段中位数。偏离参考约一个八度（或五度）的一串帧若持续至少
+// humLeapFrames 帧且平均清晰度不低于 humLeapClarity，是真实的八度 / 五度跳进，原样保留（参考随之移过去）；
+// YIN 的倍频错误多是几十毫秒的突跳，或出现在清晰度低的气声、换声处。
 func humFixOctaves(c []float64, frames []KaraokeFrame) {
 	if len(c) == 0 {
 		return
 	}
 	segMed := median(c)
 	var acc []float64
+	// keepUntil 之前的帧属于已判定为真实跳进的一串，原样接受。
+	keepUntil := 0
 	for i := range c {
 		ref := segMed
 		if len(acc) >= 5 {
 			ref = median(acc[len(acc)-5:])
 		}
-		d := c[i] - ref
-		switch {
-		case math.Abs(d-1200) < humOctaveTol:
-			c[i] -= 1200
-		case math.Abs(d+1200) < humOctaveTol:
-			c[i] += 1200
-		case frames[i].Clarity < humFifthClar && math.Abs(d-702) < humFifthTol:
-			c[i] -= 702
-		case frames[i].Clarity < humFifthClar && math.Abs(d+702) < humFifthTol:
-			c[i] += 702
+		// fold 返回偏离参考所对应的修正量（0 表示不偏离）。
+		fold := func(k int) float64 {
+			d := c[k] - ref
+			switch {
+			case math.Abs(d-1200) < humOctaveTol:
+				return -1200
+			case math.Abs(d+1200) < humOctaveTol:
+				return 1200
+			case frames[k].Clarity < humFifthClar && math.Abs(d-702) < humFifthTol:
+				return -702
+			case frames[k].Clarity < humFifthClar && math.Abs(d+702) < humFifthTol:
+				return 702
+			}
+			return 0
+		}
+		if fix := fold(i); fix != 0 && i >= keepUntil {
+			// 往后数停在远侧（同方向偏离超过修正量的一半）的帧：跳进后的音带颤音、或跳的是大七度 / 小九度时，
+			// 不会每帧都贴近整八度；五度也不再要求低清晰度（跳进后的音清晰度回升也属于这一串）。
+			j, cl := i, 0.0
+			for j < len(c) && (ref-c[j])*math.Copysign(1, fix) > math.Abs(fix)/2 {
+				cl += frames[j].Clarity
+				j++
+			}
+			if j-i >= humLeapFrames && cl/float64(j-i) >= humLeapClarity {
+				keepUntil = j
+			} else {
+				c[i] += fix
+			}
 		}
 		acc = append(acc, c[i])
 	}
@@ -572,7 +706,8 @@ func humNoteCents(cents []float64, frames []KaraokeFrame, n rawNote) float64 {
 	return xs[len(xs)-1].v
 }
 
-// tune 估计整体音高偏移与调，返回每个音的整数 MIDI 音高（调性明确时吸附唱得含糊的调外音）。
+// tune 估计整体音高偏移与调，返回每个音的整数 MIDI 音高（调性明确时吸附唱得含糊的调外音）。notes 的音高已扣除
+// 帧级漂移曲线（humDrift），这里只校正剩下的整体残差并累加到 h.Tuning。
 func (h *Hum) tune(notes []rawNote) []int {
 	// 整体偏移：各音残差（mod 100）按时长加权的圆均值。
 	var sx, sy, sw float64
@@ -581,14 +716,15 @@ func (h *Hum) tune(notes []rawNote) []int {
 		w := float64(n.b - n.a)
 		sx, sy, sw = sx+w*math.Cos(th), sy+w*math.Sin(th), sw+w
 	}
+	var resid float64
 	if math.Hypot(sx, sy)/sw >= humTuneMinR {
-		h.Tuning = 100 / (2 * math.Pi) * math.Atan2(sy, sx)
+		resid = 100 / (2 * math.Pi) * math.Atan2(sy, sx)
 	}
 	midi := make([]int, len(notes))
 	dev := make([]float64, len(notes))
 	var hist [12]float64
 	for i, n := range notes {
-		c := n.cents - h.Tuning
+		c := n.cents - resid
 		midi[i] = int(math.Round(c / 100))
 		dev[i] = c - 100*float64(midi[i])
 		hist[((midi[i]%12)+12)%12] += float64(n.b - n.a)
@@ -615,6 +751,7 @@ func (h *Hum) tune(notes []rawNote) []int {
 			}
 		}
 	}
+	h.Tuning += resid
 	h.KeyClear = r1 >= humKeyMinCorr && r1-r2 >= humKeyMargin
 	if !h.KeyClear {
 		return midi
@@ -685,20 +822,52 @@ func (h *Hum) quantize(starts, ends []float64, midi []int, notes []rawNote, esti
 	for _, i := range keep {
 		x = append(x, min(max(starts[i]-h.Shift, 0), length), min(max(ends[i]-h.Shift, 0), length))
 	}
-	// 每拍选网格：该拍内各边界到网格的距离之和（以 g 为单位），三连音多付 humTripletBias。
+	// 拍位先验：落在越弱的拍位上代价越高（拍点 0；半拍与复合拍的八分音符位置 humMetricHalf；三连音位置
+	// humMetricTriplet；其余十六分音符位置 humMetricQuarter）。人哼唱时起止前后偏几十毫秒，只按距离取最近格会把
+	// 八分音符节奏切碎成附点十六分音符或孤立的三连音；先验让离两格差不多远的边界落到更强的拍位。思路同
+	// Cemgil et al. 2000（节奏量化的贝叶斯先验）、Desain & Honing 1989 的「简单节奏优先」。
+	metric := func(q float64) float64 {
+		f := math.Mod(q/beat+1e-9, 1)
+		on := func(v float64) bool { return math.Abs(f-v) < 1e-6 }
+		switch {
+		case on(0):
+			return 0
+		case s.Compound && (on(1.0/3) || on(2.0/3)), !s.Compound && on(0.5):
+			return humMetricHalf
+		case on(1.0/3) || on(2.0/3):
+			return humMetricTriplet
+		}
+		return humMetricQuarter
+	}
+	// snapCost 是边界 v 落到间距 st 的网格上两侧格点的最小代价（距离以 g 为单位，加拍位先验）。
+	snapCost := func(v, st float64) float64 {
+		lo := math.Floor(v/st+1e-9) * st
+		return min(math.Abs(v-lo)/g+metric(lo), math.Abs(lo+st-v)/g+metric(lo+st))
+	}
+	// 每拍选网格：该拍内各边界落到网格的代价之和（snapCost），三连音多付 humTripletBias。
 	beats := int(math.Ceil(length/beat - 1e-9))
 	step := make([]float64, beats+1)
 	for b := range step {
 		step[b] = g
 	}
 	for b := range beats {
-		c4, c3, any := 0.0, humTripletBias, false
+		// 连奏处前一音的终点与后一音的起点是同一个边界，只计一次；拍内（离拍点超过半格）的边界只有一个时，
+		// 三连音再多付 humTripletLone——一拍里孤立的三分点多半是唱得偏后的半拍。
+		c4, c3, any, inner, last := 0.0, humTripletBias, false, 0, math.Inf(-1)
+		b0 := float64(b) * beat
 		for _, v := range x {
-			if v >= float64(b)*beat && v < float64(b+1)*beat {
-				any = true
-				c4 += gridDist(v, g) / g
-				c3 += gridDist(v, beat/3) / g
+			if v < b0 || v >= b0+beat || v-last < g/2 {
+				continue
 			}
+			any, last = true, v
+			c4 += snapCost(v, g)
+			c3 += snapCost(v, beat/3)
+			if v-b0 > g/2 && b0+beat-v > g/2 {
+				inner++
+			}
+		}
+		if inner == 1 {
+			c3 += humTripletLone
 		}
 		if any && c3 < c4 && !s.Compound {
 			step[b] = beat / 3
@@ -726,7 +895,7 @@ func (h *Hum) quantize(starts, ends []float64, midi []int, notes []rawNote, esti
 		from[k] = make([]int, len(C[k]))
 		for c, q := range C[k] {
 			dp[k][c] = math.Inf(1)
-			d := math.Abs(x[k]-q) / g
+			d := math.Abs(x[k]-q)/g + metric(q)
 			if k == 0 {
 				dp[k][c] = d
 				continue
