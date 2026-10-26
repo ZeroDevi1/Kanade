@@ -148,7 +148,7 @@ macOS 已跑通完整流程（《我不想念》，分离伴奏约 40 分钟在 
 ## 9. 2026-10-21 晚：标题栏、分析记录与完整和弦
 
 - [x] 系统设置开启「在标题栏和窗口边框上显示强调色」时，窗口顶部不再出现强调色条（最大化时整条标题栏也不再是强调色）；
-  其余三边仍是系统的强调色细边框，与其他应用一致。实现：DWMWA_CAPTION_COLOR 设为 DWMWA_COLOR_NONE（`window_windows.go`）。
+  其余三边仍是系统的强调色细边框，与其他应用一致。实现：DWMWA_CAPTION_COLOR 设为 DWMWA_COLOR_NONE（`app_window_windows.go`）。
 - [x] 分析记录：完成的分析保存在 `outputs/score-history/<时间>-<歌名>/`（record.json、analysis.json、chords.lab、audio.wav
   与新分离的分轨），重启应用后在「分析记录」中可选；删除需要二次确认。首条记录约 137 MB（含两条分轨），复用分轨的记录约 45 MB。
 - [x] 同一首歌（路径、大小、修改时间与分轨模型都相同）再次分析时复用记录里的分轨：进度显示「分离伴奏（复用已保存的分轨）」，

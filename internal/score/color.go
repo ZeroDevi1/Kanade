@@ -19,8 +19,8 @@ import (
 //   - 朝向：整体旋转到主和弦朝正上方；顺时针（右侧）为升号方向，听感更明亮，逆时针（左侧）为降号方向，更暗淡。
 //   - 色差 = 相邻两和弦位置的距离（0–2）；张力差 = 两者模长之差的绝对值（0–1）；新鲜感 = 色差 + 张力差。
 
-// qualityIntervals 是和弦性质的音程（相对根音的半音数），与引擎 harmony.QUALITIES 一致。
-var qualityIntervals = map[string][]int{
+// QualityIntervals 是和弦性质的音程（相对根音的半音数），与引擎 harmony.QUALITIES 一致。
+var QualityIntervals = map[string][]int{
 	"maj": {0, 4, 7}, "min": {0, 3, 7}, "7": {0, 4, 7, 10}, "maj7": {0, 4, 7, 11},
 	"min7": {0, 3, 7, 10}, "dim": {0, 3, 6}, "sus4": {0, 5, 7},
 	"aug": {0, 4, 8}, "6": {0, 4, 7, 9}, "min6": {0, 3, 7, 9}, "minmaj7": {0, 3, 7, 11},
@@ -29,7 +29,7 @@ var qualityIntervals = map[string][]int{
 
 // PitchClasses 返回和弦的音级集合（0 = C）；未知的性质返回 nil。
 func PitchClasses(root int, quality string) []int {
-	iv, ok := qualityIntervals[quality]
+	iv, ok := QualityIntervals[quality]
 	if !ok {
 		return nil
 	}

@@ -12,7 +12,7 @@ import (
 )
 
 // 主唱的表情特征（引擎 score.expression，字段见 engines/score/src/kanade_score/expression.py）：
-// 导出 Synthesizer V 工程时换算成参数曲线（svexpr.go）。特征按记录缓存为记录目录下的 expression.json，
+// 导出 Synthesizer V 工程时换算成参数曲线（vocal/svexpr.go）。特征按记录缓存为记录目录下的 expression.json，
 // 第一次导出时从记录复用的主唱分轨提取（约 10 秒，只用 CPU），之后直接读取。
 
 // expressionFile 是记录目录中缓存表情特征的文件名。

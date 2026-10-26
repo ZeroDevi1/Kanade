@@ -1,6 +1,6 @@
 # 灵感页调研：哼唱动机 → 乐句 → 和声配置 → 动机发展
 
-状态：M1（哼唱转乐句：自由哼唱的自适应速度、6/8 复合拍识别、频谱通量起音，`internal/score/phrase.go`、`tempo.go`、`flux.go`）、M2（规则和声配置与和弦锁定，`internal/score/reharm.go`）、M3（动机发展与逐格编辑变换链，`internal/score/develop.go`）已实现；界面见 `inspire*.go`（卷帘编辑与撤销、五线谱 / 爵士谱预览、灵感记录的保存与历史、MIDI / OpenUtau / Synthesizer V 导出，6/8 写成真正的 6/8 拍号）。哼唱转乐句已能处理真实八度大跳、音准漂移与节奏松散（见 2.1）。已知限制：五线谱 / 爵士谱预览里 6/8 的八分音符拍仍按四分音符画（相当于 6/4 的写法；乐谱排版 `melody.go` 尚不支持拍号分母）；阈值都只在合成数据上验证过，需用灵感记录里保存的真实录音帧再调。日期：2026-10-26。
+状态：M1（哼唱转乐句：自由哼唱的自适应速度、6/8 复合拍识别、频谱通量起音，`internal/score/hum/`）、M2（规则和声配置与和弦锁定，`internal/score/compose/reharm.go`）、M3（动机发展与逐格编辑变换链，`internal/score/compose/develop.go`）已实现；界面见 `page_page_inspire*.go`（卷帘编辑与撤销、五线谱 / 爵士谱预览、灵感记录的保存与历史、MIDI / OpenUtau / Synthesizer V 导出，6/8 写成真正的 6/8 拍号）。哼唱转乐句已能处理真实八度大跳、音准漂移与节奏松散（见 2.1）。已知限制：五线谱 / 爵士谱预览里 6/8 的八分音符拍仍按四分音符画（相当于 6/4 的写法；乐谱排版 `internal/score/melody.go` 尚不支持拍号分母）；阈值都只在合成数据上验证过，需用灵感记录里保存的真实录音帧再调。日期：2026-10-26。
 
 **应用不调用 LLM**：灵感页的全部功能都是本地的确定性算法，离线可用。开发时遇到算法设计问题，由开发者向 Claude Fable 5.1（effort high）咨询，咨询结论整理进本文档或代码注释。
 
@@ -20,14 +20,14 @@
 
 | 环节 | 做法 | 依据或可复用的部分 |
 |---|---|---|
-| 音高曲线 | 录音时直接用 `score.KaraokeSession` 实时取得 F0、清晰度和响度帧，与 K 歌同一套 | `internal/score/karaoke.go` |
+| 音高曲线 | 录音时直接用 `karaoke.KaraokeSession` 实时取得 F0、清晰度和响度帧，与 K 歌同一套 | `internal/score/karaoke/karaoke.go` |
 | 音符切分 | 对 F0 帧做「音高状态 + 起音 / 持续 / 静音」的 HMM，Viterbi 求音符序列；清晰度低的帧算静音 | pYIN 与 Tony 的音符 HMM（Mauch & Dixon 2014；Mauch et al. 2015, *Computer-aided melody note transcription using the Tony software*） |
 | 速度与量化 | 默认按节拍器速度量化；不用节拍器时，从起音间隔的直方图估计速度，再按 1/8 或 1/16 网格量化，允许三连音 | 用户确认的速度优先，估计值只作建议 |
 | 转音与连音 | 响度包络在新音节处会先下凹再起音（辅音、换气）。音高变化处没有这种起音时，判为同一音节内的转音，归为一组连音 | 与乐谱页歌词分组「一个字唱多个音」相同的表示，乐谱和 MIDI 现成可用 |
 | 拟声词歌词 | 每个音节一个拟声字。长音用「啊」，短促的音用「哒」，句尾用「嗯」。也可以在界面上切换一组（例如「啦 / 噜」偏明亮，「呜 / 哦」偏抒情） | 歌声合成工程需要每个音都有歌词，拟声字保证 SV / OpenUtau 导出能唱 |
 | 调性 | 对量化后的音符做 Krumhansl 调性剖面匹配，再结合首尾音和长音 | 分析引擎已有调性剖面（`KeyProfiles`），可移到 Go 端对少量音符直接计算 |
 
-### 2.1 跑调、漂移与节奏松散（`phrase.go`）
+### 2.1 跑调、漂移与节奏松散（`internal/score/hum/phrase.go`）
 
 合成哼唱上的鲁棒性处理（每种扰动都有回归测试 `TestTranscribeHum`、`TestTranscribeHumAccuracy`）：
 
