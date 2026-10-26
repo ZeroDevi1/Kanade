@@ -1,0 +1,15 @@
+{
+  "name": "voxcpm",
+  "title": "VoxCPM 语音生成",
+  "description": "VoxCPM2：48 kHz 音色克隆、风格控制与用文字描述设计音色，30 种语言；VoxCPM 1.5 为轻量中英文版本。",
+  "python": "3.12",
+  "module": "kanade_voxcpm",
+  "tasks": [
+    "voxcpm.download",
+    "voxcpm.zero_shot",
+    "voxcpm.cross_lingual",
+    "voxcpm.instruct",
+    "voxcpm.voice_design",
+    "voxcpm.doctor"
+  ]
+}

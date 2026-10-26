@@ -13,4 +13,7 @@ import "embed"
 //go:embed timbre/engine.json timbre/pyproject.toml timbre/uv.lock all:timbre/src all:timbre/vendor
 //go:embed score/engine.json score/pyproject.toml score/uv.lock all:score/src
 //go:embed cosyvoice/engine.json cosyvoice/pyproject.toml cosyvoice/uv.lock all:cosyvoice/src all:cosyvoice/vendor
+//go:embed qwentts/engine.json qwentts/pyproject.toml qwentts/uv.lock all:qwentts/src
+//go:embed voxcpm/engine.json voxcpm/pyproject.toml voxcpm/uv.lock all:voxcpm/src
+//go:embed indextts/engine.json indextts/pyproject.toml indextts/uv.lock all:indextts/src
 var FS embed.FS

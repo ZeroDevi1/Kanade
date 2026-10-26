@@ -1,21 +1,24 @@
-"""长文本合成：分段、逐段合成与检查、按标点停顿拼接，并保存每段音频以便单独重新生成。
+"""长文本合成：分段、逐段合成与检查、按标点停顿拼接，并保存每段音频以便单独重新生成。各语音合成引擎共用。
 
-上游的做法（frontend.text_normalize + inference_*）对长文本有几个问题：
+上游 TTS 一次处理整篇长文本时普遍有几个问题（以 CosyVoice 为例）：
 - 中文先删掉所有换行，段落结构与段间停顿都丢了；
 - 只按句末标点切分并合并到约 80 字，只有逗号的长句整句交给 LLM，越长越容易拖长、重复或提前结束；
 - 文本含 <|…|> 时整段跳过归一化与切分——CosyVoice 3 跨语种要在正文前加系统提示（含 <|endofprompt|>），
   因此此前 CosyVoice 3 的长文本是一整段合成的；
 - 各句直接首尾相接，停顿长短取决于每句模型自带的静音。
+自回归模型的训练数据多为 30 秒以内的单句，超出这个长度后同样容易失控，因此所有引擎都先在这里分段。
 
 这里的流程：
-1. plan：按换行分段落；每段用上游 text_normalize 归一化并切句（关闭归一化或含标记时按标点自行切句），
-   超过 MAX_ZH_CHARS / MAX_EN_WORDS 的句子再按逗号切开。每段记下其后的停顿类型（逗号 / 句末 / 换行 / 空行）。
-2. 逐段合成：每段以 text_frontend=False 交给上游（已归一化，不再二次处理、不再切分），模式所需的前缀
-   （CosyVoice 3 的系统提示）由调用方按段加上。时长偏离按字数估计的范围（拖长或过短）时换随机种子重试，
-   最多 MAX_RETRIES 次，都不合格时取最接近估计的一次。
+1. plan：按换行分段落；每段用调用方提供的 split（如 CosyVoice 的 text_normalize，含归一化）切句，
+   没有 split 时按标点自行切句；超过 MAX_ZH_CHARS / MAX_EN_WORDS 的句子再按逗号切开。
+   每段记下其后的停顿类型（逗号 / 句末 / 换行 / 空行）。
+2. 逐段合成：每段交给调用方的 generate（模式所需的前缀由调用方按段加上），返回该段的单声道波形。
+   时长偏离按字数估计的范围（拖长或过短）时换随机种子重试，最多 MAX_RETRIES 次，都不合格时取最接近估计的一次。
 3. 拼接：每段去掉首尾静音（保留 EDGE_KEEP_S），按停顿类型插入静音（乘以 pause_scale）。
 4. 输出：最终 WAV（artifact kind audio）与 segments.json（kind segments，每段的文本、文件、时长、停顿与重试次数）；
    取消时把已合成的段落拼成部分结果登记后再结束，重新生成单段见 regenerate。
+
+依赖 numpy 与 soundfile（使用本模块的引擎自行声明；SDK 本身不依赖它们，因此不在 kanade_engine 包导入时加载）。
 """
 
 from __future__ import annotations
@@ -26,11 +29,11 @@ import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
 import numpy as np
 
-from kanade_engine import Cancelled, Job
+from .runtime import Cancelled, Job
 
 # 句子上限：中文按字数、其他语言按词数；超过时按逗号切开。中文 70 字约 15 秒语音，CosyVoice 在这个长度内较少失控
 # （上游合并上限为 80 字，只有逗号的长句不切）；英文 45 词同理。
@@ -60,10 +63,15 @@ _SENT_END = "。！？!?；;…"
 _COMMAS = "，,、：:"
 _TAG = re.compile(r"<\|[^|]*\|>|\[[a-z_]+\]|</?[a-z]+>")
 
+# split(line) 把一行文本切成句子（可同时做归一化），返回的句子原样交给模型。
+Split = Callable[[str], list[str]]
+# generate(text) 合成一段文本，返回单声道 float 波形（采样率为调用方给出的 sample_rate）；没有输出时返回 None 或空数组。
+Generate = Callable[[str], "np.ndarray | None"]
+
 
 @dataclass
 class Segment:
-    text: str  # 已归一化、交给模型的文本（不含模式前缀）
+    text: str  # 交给模型的文本（已按 split 归一化，不含模式前缀）
     pause: str  # 之后的停顿类型，PAUSES 的键
     file: str = ""  # 合成后的音频文件名（相对 segments.json 所在目录）
     duration: float = 0.0  # 去首尾静音后的时长（秒）
@@ -71,9 +79,46 @@ class Segment:
     suspicious: bool = False  # 重试后仍超出时长范围
 
 
+# ---------- 入口 ----------
+
+def run(job: Job, text: str, sample_rate: int, generate: Generate, split: Split | None = None) -> None:
+    """按任务参数执行长文本合成；带 regenerate 参数时只重新生成此前结果中的一段。
+
+    读取的任务参数：speed（语速，只用于时长估计，实际语速由调用方交给模型）、seed（非负时固定随机种子）、
+    pause_scale（段间停顿倍数，0.2–3，默认 1）、regenerate {manifest, index}。
+    """
+    p = job.params
+    speed = float(p.get("speed") or 1.0)
+    seed = p.get("seed")
+    fixed = int(seed) if seed is not None and int(seed) >= 0 else None
+    regen = p.get("regenerate")
+    if regen:
+        regenerate(job, sample_rate, Path(regen["manifest"]), int(regen["index"]), generate, speed, fixed)
+        return
+    if not text.strip():
+        raise ValueError("文本为空")
+    pause = float(p.get("pause_scale") or 1.0)
+    if not 0.2 <= pause <= 3:
+        raise ValueError("停顿倍数须在 0.2–3 之间")
+    if fixed is not None:
+        seed_all(fixed)
+    synthesize(job, sample_rate, plan(text, split), generate, speed, pause, fixed)
+
+
+def seed_all(seed: int) -> None:
+    """固定 random / numpy / torch（若已安装）的随机种子。"""
+    random.seed(seed)
+    np.random.seed(seed % 2**32)
+    try:
+        import torch
+    except ImportError:
+        return
+    torch.manual_seed(seed)
+
+
 # ---------- 分段 ----------
 
-def plan(model, text: str, text_frontend: bool) -> list[Segment]:
+def plan(text: str, split: Split | None = None) -> list[Segment]:
     """把文本切成待合成的段落（见文件头第 1 步）。没有可读的内容时返回空列表。"""
     lines = [ln.strip() for ln in text.replace("\r\n", "\n").split("\n")]
     out: list[Segment] = []
@@ -85,7 +130,8 @@ def plan(model, text: str, text_frontend: bool) -> list[Segment]:
         if out:
             out[-1].pause = "paragraph" if blank else "line"
         blank = False
-        for sent in _sentences(model, ln, text_frontend):
+        sents = [s for s in (x.strip() for x in split(ln)) if _readable(s)] if split else split_punct(ln)
+        for sent in sents:
             for piece in _split_long(sent):
                 out.append(Segment(piece, "comma" if piece[-1:] in _COMMAS else "sentence"))
             if out:
@@ -95,11 +141,8 @@ def plan(model, text: str, text_frontend: bool) -> list[Segment]:
     return out
 
 
-def _sentences(model, line: str, text_frontend: bool) -> list[str]:
-    """一行文本的句子：可归一化时用上游 text_normalize（含数字、符号读法）；否则按句末标点切开，保留标记。"""
-    if text_frontend and not ("<|" in line and "|>" in line):
-        segs = model.frontend.text_normalize(line, split=True, text_frontend=True)
-        return [s for s in (x.strip() for x in segs) if _readable(s)]
+def split_punct(line: str) -> list[str]:
+    """按句末标点切开一行文本，保留标记。"""
     parts, cur = [], ""
     for k, ch in enumerate(line):
         cur += ch
@@ -154,12 +197,9 @@ def expected_seconds(text: str, speed: float) -> float:
 
 # ---------- 合成 ----------
 
-Generate = Callable[[str], Iterable[dict]]
-
-
-def synthesize(job: Job, model, segs: list[Segment], generate: Generate, speed: float, pause_scale: float,
+def synthesize(job: Job, sample_rate: int, segs: list[Segment], generate: Generate, speed: float, pause_scale: float,
                fixed_seed: int | None) -> None:
-    """逐段合成并输出（见文件头第 2–4 步）。generate(text) 对一段文本产出上游的推理结果（非流式时恰好一项）。
+    """逐段合成并输出（见文件头第 2–4 步）。
 
     fixed_seed 为 None 时每段的首次合成沿用调用方设置的随机状态；重试总是换新的随机种子。
     取消时登记已合成部分的拼接结果，然后抛出 Cancelled。
@@ -174,9 +214,9 @@ def synthesize(job: Job, model, segs: list[Segment], generate: Generate, speed: 
     audio: list[np.ndarray] = []
     try:
         for i, seg in enumerate(segs):
-            clip = _synthesize_one(job, model, seg, generate, speed, fixed_seed, i)
-            _save(work / f"seg_{i:03d}.wav", clip, model.sample_rate)
-            seg.file, seg.duration = f"seg_{i:03d}.wav", round(len(clip) / model.sample_rate, 3)
+            clip = _synthesize_one(job, sample_rate, seg, generate, speed, fixed_seed, i)
+            _save(work / f"seg_{i:03d}.wav", clip, sample_rate)
+            seg.file, seg.duration = f"seg_{i:03d}.wav", round(len(clip) / sample_rate, 3)
             audio.append(clip)
             done_chars += max(len(seg.text), 1)
             elapsed = time.monotonic() - t0
@@ -189,37 +229,33 @@ def synthesize(job: Job, model, segs: list[Segment], generate: Generate, speed: 
             job.progress(0.1 + 0.88 * done_chars / total_chars, note)
     except Cancelled:
         if audio:
-            _finish(job, work, model.sample_rate, segs[:len(audio)], audio, pause_scale, partial=True)
+            _finish(job, work, sample_rate, segs[:len(audio)], audio, pause_scale, partial=True)
         raise
     except Exception as exc:
-        # 取消时 LLM 被提前截断，残缺的 token 序列可能让后续的 flow / 声码器报错；此时按取消处理而不是失败。
+        # 取消时模型可能被提前截断（如 CosyVoice 的 LLM 收到结束 token），残缺的 token 序列可能让后续的
+        # flow / 声码器报错；此时按取消处理而不是失败。
         if job.cancelled:
             if audio:
-                _finish(job, work, model.sample_rate, segs[:len(audio)], audio, pause_scale, partial=True)
+                _finish(job, work, sample_rate, segs[:len(audio)], audio, pause_scale, partial=True)
             raise Cancelled() from exc
         raise
-    _finish(job, work, model.sample_rate, segs, audio, pause_scale)
+    _finish(job, work, sample_rate, segs, audio, pause_scale)
 
 
-def _synthesize_one(job: Job, model, seg: Segment, generate: Generate, speed: float, fixed_seed: int | None,
+def _synthesize_one(job: Job, sample_rate: int, seg: Segment, generate: Generate, speed: float, fixed_seed: int | None,
                     index: int) -> np.ndarray:
     """合成一段并检查时长，不合格时换种子重试；返回去首尾静音后的单声道 float32。"""
-    import torch
-
     want = expected_seconds(seg.text, speed)
     best, best_err = None, float("inf")
     for attempt in range(MAX_RETRIES + 1):
         if attempt:
-            seed = random.randrange(2**31) if fixed_seed is None else fixed_seed + 7919 * attempt + index
-            random.seed(seed)
-            np.random.seed(seed % 2**32)
-            torch.manual_seed(seed)
-        chunks = [out["tts_speech"] for out in generate(seg.text)]
+            seed_all(random.randrange(2**31) if fixed_seed is None else fixed_seed + 7919 * attempt + index)
+        wav = generate(seg.text)
         job.check_cancelled()
-        if not chunks:
+        if wav is None or len(wav) == 0:
             continue
-        clip = trim(torch.cat(chunks, dim=1).squeeze(0).cpu().float().numpy(), model.sample_rate)
-        dur = len(clip) / model.sample_rate
+        clip = trim(np.asarray(wav, dtype=np.float32).reshape(-1), sample_rate)
+        dur = len(clip) / sample_rate
         ok, err = judge(dur, want)
         if err < best_err:
             best, best_err = clip, err
@@ -293,7 +329,7 @@ def _finish(job: Job, work: Path, sr: int, segs: list[Segment], clips: list[np.n
     job.artifact(work / "segments.json", "segments")
 
 
-def regenerate(job: Job, model, manifest_path: Path, index: int, generate: Generate, speed: float,
+def regenerate(job: Job, sample_rate: int, manifest_path: Path, index: int, generate: Generate, speed: float,
                fixed_seed: int | None) -> None:
     """重新合成 segments.json 中的第 index 段（文本不变、换随机种子），替换该段音频并重新拼接，输出新的最终音频
     （文件名带序号，避免界面播放器沿用旧文件）。segments.json 原地更新。"""
@@ -305,18 +341,13 @@ def regenerate(job: Job, model, manifest_path: Path, index: int, generate: Gener
         raise ValueError(f"没有第 {index + 1} 段")
     work = manifest_path.parent
     sr = int(manifest["sample_rate"])
-    if sr != model.sample_rate:
+    if sr != sample_rate:
         raise ValueError("重新生成须使用合成时的同一个模型")
     seg = segs[index]
     job.progress(0.1, f"重新生成第 {index + 1} 段")
     # 重新生成的目的就是换一次结果：总是换随机种子（固定种子时在其上偏移）。
-    seed = random.randrange(2**31) if fixed_seed is None else fixed_seed + 104729 * (seg.retries + 1)
-    random.seed(seed)
-    np.random.seed(seed % 2**32)
-    import torch
-
-    torch.manual_seed(seed)
-    clip = _synthesize_one(job, model, seg, generate, speed, None, index)
+    seed_all(random.randrange(2**31) if fixed_seed is None else fixed_seed + 104729 * (seg.retries + 1))
+    clip = _synthesize_one(job, sr, seg, generate, speed, None, index)
     version = int(manifest.get("revision", 0)) + 1
     seg.file = f"seg_{index:03d}_r{version}.wav"
     _save(work / seg.file, clip, sr)

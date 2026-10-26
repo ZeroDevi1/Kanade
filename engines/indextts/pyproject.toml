@@ -1,0 +1,42 @@
+[project]
+name = "kanade-indextts"
+version = "0.1.0"
+description = "Kanade 的 IndexTTS 推理引擎（Cantus）：音色克隆与情绪控制"
+requires-python = "==3.11.*"
+dependencies = [
+    "kanade-engine-sdk",
+    # 上游不发布到 PyPI，按提交锁定（2026-09-30，含 IndexTTS-2.5 的 infer_v2_5）；其依赖版本由上游 pyproject 锁定，
+    # torch 2.8、transformers 4.52.1。webui / deepspeed / accel 等可选依赖不安装。
+    "indextts",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "numpy",
+    "soundfile",
+]
+
+[tool.uv]
+# 只为实际发布的两个平台解析：Windows x64（CUDA 推理）与 macOS arm64（界面开发与 CPU / MPS 冒烟测试）。
+environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[tool.uv.sources]
+# editable：SDK 版本号不变时 uv sync 不会重装非 editable 的 path 依赖，改为直接引用释放出的源码。
+kanade-engine-sdk = { path = "../sdk", editable = true }
+indextts = { git = "https://github.com/index-tts/index-tts", rev = "d9e41aac89fd00b3d71497fddb287b7f24613712" }
+# Windows 用 PyTorch 官方 CUDA 12.8 构建（与上游一致，要求驱动 570 及以上）；macOS 用 PyPI 的 CPU/MPS 构建。
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32'" }]
+torchaudio = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kanade_indextts"]

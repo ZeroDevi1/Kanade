@@ -386,6 +386,9 @@ def assemble(base: Path, name: str, wd: Path) -> Path:
             shutil.copy2(avg, out / f"{part}.pt")
     emb = torch.load(wd / "data" / "spk2embedding.pt")[name]
     torch.save({name: {"embedding": torch.tensor(emb, dtype=torch.float32).reshape(1, -1)}}, out / "spk2info.pt")
-    (out / "kanade-sft.json").write_text(json.dumps({"spk_id": name, "base": base.name}, ensure_ascii=False), encoding="utf-8")
+    # instruct 供推理时作为默认提示，与训练条件一致（见 tasks._sft_v3_prompt）。
+    instruct = json.loads((wd / "prepare.json").read_text(encoding="utf-8")).get("instruct") or INSTRUCT_DEFAULT
+    (out / "kanade-sft.json").write_text(json.dumps({"spk_id": name, "base": base.name, "instruct": instruct},
+                                                    ensure_ascii=False), encoding="utf-8")
     (out / dl.COMPLETE_MARKER).write_text("{}", encoding="utf-8")
     return out

@@ -1,4 +1,4 @@
-"""CosyVoice 模型下载：只下载推理所需文件，支持断点续传与按字节上报进度。
+"""CosyVoice 模型下载：只下载推理所需文件，支持断点续传与按字节上报进度（通用部分见 kanade_engine.hub）。
 
 不使用 modelscope.snapshot_download：它的进度只输出到 tqdm，无法转给 Conductor，且会下载 TensorRT /
 JIT 等推理用不到的文件（Fun-CosyVoice3 全量 9.75 GB，筛选后约 5.4 GB）。
@@ -6,16 +6,13 @@ JIT 等推理用不到的文件（Fun-CosyVoice3 全量 9.75 GB，筛选后约 5
 
 from __future__ import annotations
 
-import json
 import re
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from kanade_engine import Job
-from kanade_engine.download import fetch, mirror, urlopen
+from kanade_engine import hub
+from kanade_engine.hub import COMPLETE_MARKER, ensure_files, is_complete  # noqa: F401（sft.py / tasks.py 经本模块使用）
 
 # 推理用不到的文件：JIT/TensorRT 导出、批量版 tokenizer、RL 版 LLM 权重、flow 缓存、文档图片。
 _SKIP = re.compile(r"(\.zip$|estimator.*\.onnx$|\.batch\.onnx$|llm\.rl\.pt$|flow\.cache\.pt$|^asset/|\.md$|\.png$|\.jpg$|^\.gitattributes$)")
@@ -23,44 +20,6 @@ _SKIP = re.compile(r"(\.zip$|estimator.*\.onnx$|\.batch\.onnx$|llm\.rl\.pt$|flow
 # wetext 文本归一化资源（只在 ModelScope 上发布）。CosyVoice 只用中英文 TN 的 tagger / verbalizer。
 WETEXT_REPO = "pengzhendong/wetext"
 _WETEXT_KEEP = re.compile(r"^(zh|en)/tn/(tagger|verbalizer)\.fst$")
-
-COMPLETE_MARKER = ".kanade-complete"
-_TIMEOUT = 60
-
-
-@dataclass
-class RemoteFile:
-    path: str
-    size: int
-    url: str
-
-
-def _get_json(url: str):
-    req = urllib.request.Request(mirror(url), headers={"User-Agent": "Kanade"})
-    with urlopen(req, timeout=_TIMEOUT) as resp:
-        return json.load(resp)
-
-
-def list_files(source: str, repo: str, keep: Callable[[str], bool] | None = None) -> list[RemoteFile]:
-    """列出仓库中需要下载的文件。source 为 "modelscope" 或 "huggingface"；keep 为空时按 _SKIP 排除推理用不到的文件。"""
-    quoted = urllib.parse.quote(repo, safe="/")
-    if source == "modelscope":
-        data = _get_json(f"https://www.modelscope.cn/api/v1/models/{quoted}/repo/files?Recursive=true")
-        entries = [(f["Path"], int(f.get("Size") or 0)) for f in data["Data"]["Files"] if f["Type"] == "blob"]
-        base = f"https://www.modelscope.cn/models/{quoted}/resolve/master/"
-    elif source == "huggingface":
-        data = _get_json(f"https://huggingface.co/api/models/{quoted}/tree/main?recursive=true")
-        entries = [(f["path"], int(f.get("size") or 0)) for f in data if f["type"] == "file"]
-        base = f"https://huggingface.co/{quoted}/resolve/main/"
-    else:
-        raise ValueError(f"未知下载源：{source}")
-    if keep is None:
-        keep = lambda p: not _SKIP.search(p)  # noqa: E731
-    return [RemoteFile(p, s, base + urllib.parse.quote(p)) for p, s in entries if keep(p)]
-
-
-def is_complete(model_dir: Path) -> bool:
-    return (model_dir / COMPLETE_MARKER).exists()
 
 
 def download(job: Job, source: str, repo: str, model_dir: Path, wetext_dir: Path) -> None:
@@ -74,30 +33,6 @@ def download(job: Job, source: str, repo: str, model_dir: Path, wetext_dir: Path
     job.progress(1, "下载完成")
 
 
-def ensure_files(job: Job, model_dir: Path, names: list[str]) -> None:
-    """补下载 model_dir 中缺少的 names（例如推理下载时按 _SKIP 跳过、训练才需要的文件）。
-
-    下载源与仓库取自 COMPLETE_MARKER；模型不是由 Kanade 下载的（没有标记）时抛出 FileNotFoundError。
-    补下的文件不写回标记中的文件清单，标记只描述推理所需的集合。
-    """
-    missing = [n for n in names if not (model_dir / n).is_file()]
-    if not missing:
-        return
-    try:
-        meta = json.loads((model_dir / COMPLETE_MARKER).read_text(encoding="utf-8"))
-        source, repo = meta["source"], meta["repo"]
-    except (OSError, KeyError, ValueError) as exc:
-        raise FileNotFoundError(f"{model_dir} 缺少 {', '.join(missing)}，且无法确定下载源，请手动放入") from exc
-    files = list_files(source, repo, lambda p: p in missing)
-    if len(files) != len(missing):
-        raise FileNotFoundError(f"{repo} 中找不到 {', '.join(missing)}")
-    for f in files:
-        def report(n: int, total: int, f=f) -> None:
-            job.progress(job.fraction, f"下载训练所需的 {f.path}（{n / 1e6:.0f} / {total / 1e6:.0f} MB）")
-
-        fetch(f.url, model_dir / f.path, report, f.size)
-
-
 def ensure_wetext(job: Job, wetext_dir: Path) -> None:
     """下载 wetext 的中英文 TN 资源（约数 MB）；已完整时直接返回。"""
     if is_complete(wetext_dir):
@@ -106,27 +41,7 @@ def ensure_wetext(job: Job, wetext_dir: Path) -> None:
 
 
 def fetch_repo(job: Job, source: str, repo: str, model_dir: Path, keep: Callable[[str], bool] | None, label: str = "") -> None:
-    """下载 repo 中 keep 选中的文件到 model_dir，完成后写入 COMPLETE_MARKER。"""
-    job.progress(0, f"获取{label or '模型'}文件列表")
-    files = list_files(source, repo, keep)
-    if not files:
-        raise IOError(f"{repo} 中没有需要下载的文件")
-    total = sum(f.size for f in files) or 1
-    done = 0
-    model_dir.mkdir(parents=True, exist_ok=True)
-
-    for f in files:
-        dst = model_dir / f.path
-        if dst.exists() and f.size and dst.stat().st_size != f.size:
-            dst.unlink()  # 大小不符的旧文件（例如上游版本更新）重新下载
-        if dst.exists():
-            done += f.size
-            continue
-
-        def report(n: int, _total: int, f=f) -> None:
-            job.progress(min((done + n) / total, 0.999), f"下载{label} {f.path}（{(done + n) / 1e9:.2f} / {total / 1e9:.2f} GB）")
-
-        fetch(f.url, dst, report, f.size)
-        done += f.size
-
-    (model_dir / COMPLETE_MARKER).write_text(json.dumps({"source": source, "repo": repo, "files": [f.path for f in files]}, ensure_ascii=False))
+    """下载 repo 中 keep 选中的文件到 model_dir，完成后写入 COMPLETE_MARKER；keep 为空时按 _SKIP 排除推理用不到的文件。"""
+    if keep is None:
+        keep = lambda p: not _SKIP.search(p)  # noqa: E731
+    hub.fetch_repo(job, source, repo, model_dir, keep, label)

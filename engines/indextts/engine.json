@@ -1,0 +1,13 @@
+{
+  "name": "indextts",
+  "title": "IndexTTS 语音生成",
+  "description": "IndexTTS-2.5：零样本音色克隆，音色与情绪分开控制（按文字推断情绪），可调语速。模型使用 bilibili 模型使用协议，商用需另行授权。",
+  "python": "3.11",
+  "module": "kanade_indextts",
+  "tasks": [
+    "indextts.download",
+    "indextts.cross_lingual",
+    "indextts.instruct",
+    "indextts.doctor"
+  ]
+}

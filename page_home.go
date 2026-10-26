@@ -21,7 +21,7 @@ type homeEntry struct {
 }
 
 var homeEntries = []homeEntry{
-	{"cantus", "语音生成", "CosyVoice 克隆音色朗读文本，或微调自己的说话人", iconCantus, func(a *app) { a.current = "cantus" }},
+	{"cantus", "语音生成", "克隆音色或用文字设计音色朗读文本（CosyVoice、Qwen3-TTS、VoxCPM、IndexTTS），或微调自己的说话人", iconCantus, func(a *app) { a.current = "cantus" }},
 	{"cover", "一键翻唱", "整首歌或干声 → RVC 转换 → 自动混音", iconTimbre, func(a *app) { a.current, a.timbre.tab = "timbre", timbreTabCover }},
 	{"stems", "分轨", "伴奏 / 干声分离、去和声、去混响、降噪", iconStems, func(a *app) { a.current = "stems" }},
 	{"score", "音乐分析", "调号、拍号、BPM、和弦谱与情绪", iconScore, func(a *app) { a.current = "score" }},

@@ -59,6 +59,10 @@ type cantusState struct {
 	sampling    cantus.Sampling
 	samplingTop float64 // ui.NumberInput 只编辑 float64，提交时转为整数
 	samplingWin float64
+	// optNum / optBool 是专业模式中各引擎专有参数（cantus.Option）的当前值，键为「引擎.参数」，首次显示时按推荐值创建；
+	// 控件直接绑定这些指针，因此创建后不再替换。
+	optNum  map[string]*float64
+	optBool map[string]*bool
 
 	// SFT 训练。sftMode 为 modeSmart 时一键完成准备与训练（缺文本用 cantus.SFTSmartASR 转写，层数按显存）。
 	sftMode                      int
@@ -101,7 +105,8 @@ func newCantusState() cantusState {
 		sftDevRatio: 0.05, sftScope: cantus.SFTLLMScopes[0].Title, style: styleNone,
 		sampling: cantus.DefaultSampling, samplingTop: float64(cantus.DefaultSampling.TopK),
 		samplingWin: float64(cantus.DefaultSampling.WinSize), seed: 1986, pauseScale: 1,
-		reqs: map[string]cantus.Request{}, manifests: map[string]string{}}
+		reqs: map[string]cantus.Request{}, manifests: map[string]string{},
+		optNum: map[string]*float64{}, optBool: map[string]*bool{}}
 }
 
 func (s *cantusState) model() cantus.Model {
@@ -138,7 +143,7 @@ func (s *cantusState) speaker() *cantus.Speaker {
 
 // cantusPage 是 CosyVoice 语音生成页：模型管理、各推理模式的输入、结果预览与音色库。
 func (a *app) cantusPage(c *ui.Context, tk *fluent.Tokens) {
-	pageHeader(c, "语音生成", "Cantus · CosyVoice：零样本克隆、跨语种复刻、预训练音色、自然语言控制与声音转换。")
+	pageHeader(c, "语音生成", "Cantus · CosyVoice、Qwen3-TTS、VoxCPM、IndexTTS：音色克隆、文字设计音色、预设音色、风格与情绪控制。")
 	if a.backendUnavailable(c, tk) {
 		return
 	}
@@ -202,7 +207,7 @@ func (a *app) cantusModelCard(c *ui.Context, tk *fluent.Tokens) {
 				ui.Text(c, "下载失败："+dl.Err).FontSize(12).TextColor(t.Danger).Selectable()
 			}
 		}
-		ui.Text(c, "模型保存在 "+cantus.Root(l)).FontSize(12).TextColor(t.TextMuted).Selectable()
+		ui.Text(c, "模型保存在 "+filepath.Dir(m.Dir(l))).FontSize(12).TextColor(t.TextMuted).Selectable()
 	})
 }
 
@@ -225,7 +230,7 @@ func (a *app) downloadModel(m cantus.Model) {
 	if s.source == sourceTitles[1] {
 		src = cantus.SourceHuggingFace
 	}
-	id, err := a.be.cond.Submit(cantus.Engine, cantus.Engine+".download", cantus.DownloadParams(a.be.layout, m, src))
+	id, err := a.be.cond.Submit(m.Engine(), m.Engine()+".download", cantus.DownloadParams(a.be.layout, m, src))
 	if err != nil {
 		s.err = err.Error()
 		return
@@ -238,7 +243,7 @@ func (a *app) cantusInputCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
 	s := &a.cantus
 	m := s.model()
 	return card(c, tk, "合成", func() {
-		modeSwitch(c, "synth-mode", &s.synthMode, "只需选音色、填文本；按是否有参考文本与风格自动选择克隆方式。")
+		modeSwitch(c, "synth-mode", &s.synthMode, "只需选音色、填文本；按是否有参考文本与风格自动选择克隆方式，参数使用各模型的推荐值。")
 		if s.synthMode == modeSmart {
 			a.cantusSmartInput(c, tk, m)
 		} else {
@@ -258,15 +263,18 @@ func (a *app) cantusInputCard(c *ui.Context, tk *fluent.Tokens) ui.Element {
 func (a *app) cantusSmartInput(c *ui.Context, tk *fluent.Tokens, m cantus.Model) {
 	t := c.Theme()
 	s := &a.cantus
-	if m.Supports(cantus.ModeSFT) || m.Family == cantus.FamilyV1Instruct {
+	switch {
+	case m.Supports(cantus.ModeSFT) || m.Family == cantus.FamilyV1Instruct:
 		spks := m.SpeakerList()
 		if !slices.Contains(spks, s.spkID) {
 			s.spkID = spks[0]
 		}
 		if len(spks) > 1 {
-			ui.Select(c, &s.spkID, spks).Label("预训练音色").Width(200)
+			ui.Select(c, &s.spkID, spks).Label(m.ModeTitle(cantus.ModeSFT)).Width(200)
 		}
-	} else {
+	case s.mode() == cantus.ModeDesign:
+		a.cantusDesignInput(c)
+	default:
 		a.cantusVoice(c, tk, cantus.ModeZeroShot)
 	}
 	if m.Supports(cantus.ModeInstruct) {
@@ -279,16 +287,41 @@ func (a *app) cantusSmartInput(c *ui.Context, tk *fluent.Tokens, m cantus.Model)
 		}
 		ui.Select(c, &s.style, styles).Label("风格").Width(300)
 	}
-	ui.Text(c, "当前将使用："+cantus.ModeTitle[s.mode()]+"。"+smartHint(s.mode())).FontSize(12).TextColor(t.TextMuted)
+	ui.Text(c, "当前将使用："+m.ModeTitle(s.mode())+"。"+smartHint(m, s.mode())).FontSize(12).TextColor(t.TextMuted)
+}
+
+// cantusDesignInput 是音色设计的描述输入与示例。
+func (a *app) cantusDesignInput(c *ui.Context) {
+	s := &a.cantus
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.TextInput(c, &s.instruct).Label("音色描述").Placeholder("例如：年轻女性，声音温柔甜美，语速适中").Grow(1)
+		a.presetSelect(c, "示例描述…", cantus.DesignPresets)
+	})
+}
+
+// presetSelect 是「常用指令」下拉框：选中一项后填入 instruct。first 是不选择时的提示项。
+func (a *app) presetSelect(c *ui.Context, first string, presets []string) {
+	s := &a.cantus
+	options := append([]string{first}, presets...)
+	if !slices.Contains(options, s.preset) {
+		s.preset = first
+	}
+	if ui.Select(c, &s.preset, options).Label("常用").Width(220).Changed() && s.preset != first {
+		s.instruct = s.preset
+	}
 }
 
 // smartHint 说明智能模式为何选了该模式，以及怎样切换到效果更好的模式。
-func smartHint(mode cantus.Mode) string {
-	switch mode {
-	case cantus.ModeCrossLingual:
+func smartHint(m cantus.Model, mode cantus.Mode) string {
+	switch {
+	case mode == cantus.ModeCrossLingual && m.Supports(cantus.ModeZeroShot):
 		return "填写参考音频说的话后会改用零样本克隆，同语种时音色更像。"
-	case cantus.ModeZeroShot:
-		return "参考音频与目标文本语种不同时，清空参考文本可改用跨语种复刻。"
+	case mode == cantus.ModeZeroShot && m.Supports(cantus.ModeCrossLingual):
+		return "参考音频与目标文本语种不同时，清空参考文本可改用" + m.ModeTitle(cantus.ModeCrossLingual) + "。"
+	case mode == cantus.ModeDesign:
+		return "每段按描述重新生成音色，段与段之间可能略有差异；满意的音色可另存后用音色克隆复用。"
+	}
+	switch mode {
 	case cantus.ModeInstruct:
 		return "按所选风格朗读。"
 	}
@@ -302,7 +335,7 @@ func (a *app) cantusProInput(c *ui.Context, tk *fluent.Tokens, m cantus.Model) {
 	modes := m.Modes()
 	labels := make([]string, len(modes))
 	for i, md := range modes {
-		labels[i] = cantus.ModeTitle[md]
+		labels[i] = m.ModeTitle(md)
 	}
 	s.modeIdx = min(s.modeIdx, len(modes)-1)
 	if ui.Segmented(c, &s.modeIdx, labels...).Label("推理模式").Changed() {
@@ -317,10 +350,15 @@ func (a *app) cantusProInput(c *ui.Context, tk *fluent.Tokens, m cantus.Model) {
 		if !slices.Contains(spks, s.spkID) {
 			s.spkID = spks[0]
 		}
-		ui.Select(c, &s.spkID, spks).Label("预训练音色").Width(200)
-		if m.Family == cantus.FamilyV3SFT {
+		ui.Select(c, &s.spkID, spks).Label(m.ModeTitle(cantus.ModeSFT)).Width(200)
+		switch m.Family {
+		case cantus.FamilyV3SFT:
 			ui.TextInput(c, &s.instruct).Label("风格引导（可选）").Placeholder("例如：请非常开心地说一句话。留空则只用音色本身")
+		case cantus.FamilyQwenCustom:
+			ui.TextInput(c, &s.instruct).Label("风格指令（可选）").Placeholder("例如：用特别开心的语气说。留空则按音色默认风格朗读")
 		}
+	} else if mode == cantus.ModeDesign {
+		a.cantusDesignInput(c)
 	} else {
 		a.cantusVoice(c, tk, mode)
 	}
@@ -328,15 +366,16 @@ func (a *app) cantusProInput(c *ui.Context, tk *fluent.Tokens, m cantus.Model) {
 		a.audioPicker(c, "源音频", &s.sourceWav, directAudioExts)
 	}
 	if mode == cantus.ModeInstruct {
+		label, hint, presets := "指令", "例如：请用四川话表达。", cantus.InstructPresets
+		switch m.Family {
+		case cantus.FamilyVoxCPM2:
+			label, hint, presets = "风格描述", "例如：稍快，开心", cantus.StylePresets
+		case cantus.FamilyIndexTTS:
+			label, hint, presets = "情绪描述", "例如：非常开心地说", cantus.EmotionPresets
+		}
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.TextInput(c, &s.instruct).Label("指令").Placeholder("例如：请用四川话表达。").Grow(1)
-			presets := append([]string{"常用指令…"}, cantus.InstructPresets...)
-			if s.preset == "" {
-				s.preset = presets[0]
-			}
-			if ui.Select(c, &s.preset, presets).Label("常用指令").Width(220).Changed() && s.preset != presets[0] {
-				s.instruct = s.preset
-			}
+			ui.TextInput(c, &s.instruct).Label(label).Placeholder(hint).Grow(1)
+			a.presetSelect(c, "常用…", presets)
 		})
 	}
 }
@@ -346,14 +385,19 @@ func (a *app) cantusProTuning(c *ui.Context) {
 	t := c.Theme()
 	s := &a.cantus
 	mode := s.mode()
-	ui.Row(c).Gap(16).AlignItems(ui.Center).Children(func() {
-		ui.Text(c, "语速").FontSize(12)
-		ui.Slider(c, &s.speed, cantus.MinSpeed, cantus.MaxSpeed).Label("语速").Width(200)
-		ui.Textf(c, "%.2f×", s.speed).FontSize(12).Font("monospace").Width(48)
-		if mode != cantus.ModeVC {
-			ui.Checkbox(c, &s.textFrontend, "文本归一化（数字、符号读法）")
-		}
-	})
+	m := s.model()
+	if m.HasSpeed() || m.HasTuning() {
+		ui.Row(c).Gap(16).AlignItems(ui.Center).Children(func() {
+			if m.HasSpeed() {
+				ui.Text(c, "语速").FontSize(12)
+				ui.Slider(c, &s.speed, cantus.MinSpeed, cantus.MaxSpeed).Label("语速").Width(200)
+				ui.Textf(c, "%.2f×", s.speed).FontSize(12).Font("monospace").Width(48)
+			}
+			if mode != cantus.ModeVC && m.HasTuning() {
+				ui.Checkbox(c, &s.textFrontend, "文本归一化（数字、符号读法）")
+			}
+		})
+	}
 	if mode == cantus.ModeVC {
 		return
 	}
@@ -369,11 +413,14 @@ func (a *app) cantusProTuning(c *ui.Context) {
 		if s.seedFixed {
 			ui.Field(c, "种子", func() { ui.NumberInput(c, &s.seed, 0, 2147483647, 1).Width(140) })
 		}
-		ui.Checkbox(c, &s.samplingOn, "自定义采样参数")
+		if m.HasTuning() {
+			ui.Checkbox(c, &s.samplingOn, "自定义采样参数")
+		}
 	})
 	ui.Text(c, "不固定种子时，微调模型默认用种子 1986，其他模型每次随机；固定后同样的输入得到同样的结果，便于对比参数。").
 		FontSize(12).TextColor(t.TextMuted)
-	if !s.samplingOn {
+	a.cantusOptions(c, m, mode)
+	if !s.samplingOn || !m.HasTuning() {
 		return
 	}
 	ui.Row(c).Gap(12).AlignItems(ui.End).Children(func() {
@@ -392,12 +439,105 @@ func (a *app) cantusProTuning(c *ui.Context) {
 		FontSize(12).TextColor(t.TextMuted)
 }
 
+// cantusOptions 显示模型在当前模式下的引擎专有参数（Qwen3-TTS、VoxCPM、IndexTTS），初值为推荐值；鼠标悬停显示说明。
+func (a *app) cantusOptions(c *ui.Context, m cantus.Model, mode cantus.Mode) {
+	t := c.Theme()
+	s := &a.cantus
+	opts := m.Options(mode)
+	if len(opts) == 0 {
+		return
+	}
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, "模型参数").FontSize(12).FontWeight(600)
+		ui.Text(c, "初始为推荐值，智能模式始终使用推荐值。").FontSize(12).TextColor(t.TextMuted).Grow(1)
+		if ui.Button(c, "恢复推荐值").Clicked() {
+			for _, o := range opts {
+				s.resetOption(m, o)
+			}
+		}
+	})
+	ui.Row(c).Wrap().Gap(12).AlignItems(ui.End).Children(func() {
+		for _, o := range opts {
+			if o.Bool {
+				ui.Checkbox(c.Key("opt-"+o.Key), s.boolOption(m, o), o.Label).Tooltip(o.Hint)
+				continue
+			}
+			ui.Field(c.Key("opt-"+o.Key), o.Label, func() {
+				ui.NumberInput(c, s.numOption(m, o), o.Min, o.Max, o.Step).Width(110)
+			}).Tooltip(o.Hint)
+		}
+	})
+}
+
+func optionKey(m cantus.Model, o cantus.Option) string { return m.Engine() + "." + o.Key }
+
+// numOption / boolOption 返回参数值的指针，没有时按推荐值创建。
+func (s *cantusState) numOption(m cantus.Model, o cantus.Option) *float64 {
+	k := optionKey(m, o)
+	if s.optNum[k] == nil {
+		v := o.Default
+		s.optNum[k] = &v
+	}
+	return s.optNum[k]
+}
+
+func (s *cantusState) boolOption(m cantus.Model, o cantus.Option) *bool {
+	k := optionKey(m, o)
+	if s.optBool[k] == nil {
+		v := o.Default != 0
+		s.optBool[k] = &v
+	}
+	return s.optBool[k]
+}
+
+func (s *cantusState) resetOption(m cantus.Model, o cantus.Option) {
+	if o.Bool {
+		*s.boolOption(m, o) = o.Default != 0
+	} else {
+		*s.numOption(m, o) = o.Default
+	}
+}
+
+// optionValues 返回专业模式下当前模型、模式的参数值（提交给 cantus.Request.Options）。
+func (s *cantusState) optionValues(m cantus.Model, mode cantus.Mode) map[string]float64 {
+	opts := m.Options(mode)
+	if len(opts) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(opts))
+	for _, o := range opts {
+		if o.Bool {
+			out[o.Key] = map[bool]float64{true: 1, false: 0}[*s.boolOption(m, o)]
+		} else {
+			out[o.Key] = *s.numOption(m, o)
+		}
+	}
+	return out
+}
+
 func (s *cantusState) setSampling(v cantus.Sampling) {
 	s.sampling, s.samplingTop, s.samplingWin = v, float64(v.TopK), float64(v.WinSize)
 }
 
-// modeHint 是各模式的一句用法说明，内容取自上游 WebUI 与 example.py。
+// modeHint 是各模式的一句用法说明，内容取自各上游的 WebUI、README 与 example.py。
 func modeHint(m cantus.Model, mode cantus.Mode) string {
+	if m.Engine() != cantus.Engine {
+		switch mode {
+		case cantus.ModeZeroShot:
+			return "上传参考音频并填写其文本，模型接着参考音频续写，音色最像（同语种效果最好）。"
+		case cantus.ModeCrossLingual:
+			return "只用参考音频的音色朗读，不需要参考文本，适合参考与目标语种不同的情况。"
+		case cantus.ModeSFT:
+			return "使用模型的预设音色朗读；可另加风格指令控制语气。"
+		case cantus.ModeDesign:
+			return "不需要参考音频：用文字描述性别、年龄、音色与语气，模型据此生成音色。"
+		case cantus.ModeInstruct:
+			if m.Family == cantus.FamilyIndexTTS {
+				return "音色取自参考音频，情绪按文字描述推断（高兴、愤怒、悲伤、害怕、惊讶、平静等）。"
+			}
+			return "音色取自参考音频，按风格描述控制语速、情绪与说话方式。"
+		}
+	}
 	switch mode {
 	case cantus.ModeZeroShot:
 		return "上传 3–30 秒参考音频并填写其文本，用该音色朗读目标文本（同语种效果最好）。"
@@ -597,10 +737,14 @@ func (a *app) submitCantus() {
 		r.Speaker = s.speaker()
 	}
 	if s.synthMode == modeSmart {
-		// 智能模式：语速 1×、文本归一化开、采样与种子用引擎默认；风格作为指令。
-		r.Speed, r.TextFrontend, r.Instruct = 1, true, ""
-		if r.Mode == cantus.ModeInstruct {
+		// 智能模式：语速 1×、文本归一化开、采样与种子用引擎默认；风格作为指令，音色设计保留描述。
+		r.Speed, r.TextFrontend = 1, true
+		switch r.Mode {
+		case cantus.ModeInstruct:
 			r.Instruct = s.style
+		case cantus.ModeDesign:
+		default:
+			r.Instruct = ""
 		}
 	} else {
 		if s.seedFixed {
@@ -612,6 +756,7 @@ func (a *app) submitCantus() {
 			sp.TopK, sp.WinSize = int(s.samplingTop), int(s.samplingWin)
 			r.Sampling = &sp
 		}
+		r.Options = s.optionValues(r.Model, r.Mode)
 	}
 	if s.synthMode == modePro {
 		r.PauseScale = s.pauseScale
@@ -621,7 +766,7 @@ func (a *app) submitCantus() {
 		s.err = err.Error()
 		return
 	}
-	id, err := a.be.cond.Submit(cantus.Engine, r.Task(), params)
+	id, err := a.be.cond.Submit(r.Model.Engine(), r.Task(), params)
 	if err != nil {
 		s.err = err.Error()
 		return
@@ -636,6 +781,8 @@ func cantusResultName(r cantus.Request) string {
 	switch {
 	case r.Speaker != nil:
 		voice = r.Speaker.Name
+	case r.Mode == cantus.ModeDesign:
+		voice = "设计音色"
 	case r.Mode != cantus.ModeSFT && r.PromptWav != "":
 		voice = strings.TrimSuffix(filepath.Base(r.PromptWav), filepath.Ext(r.PromptWav))
 	}
@@ -873,7 +1020,7 @@ func (a *app) regenerateSegment(audio, manifest string, index int) {
 	r.Regenerate = &cantus.Regenerate{Manifest: manifest, Index: index}
 	params, err := r.Params(a.be.layout)
 	if err == nil {
-		s.regenJob, err = a.be.cond.Submit(cantus.Engine, r.Task(), params)
+		s.regenJob, err = a.be.cond.Submit(r.Model.Engine(), r.Task(), params)
 	}
 	if err != nil {
 		s.err = err.Error()

@@ -20,18 +20,20 @@ type Request struct {
 	PromptText string
 	// SpkID 是预训练音色名，用于预训练音色模式与 CosyVoice 1 指令模型。
 	SpkID string
-	// Instruct 是自然语言指令，例如「请用四川话表达。」。
+	// Instruct 是自然语言指令，例如「请用四川话表达。」；音色设计模式下是音色描述。
 	Instruct string
 	// SourceWav 是声音转换的源音频。
 	SourceWav string
 	// Speed 是语速倍率，0 视为 1。
 	Speed float64
-	// TextFrontend 控制是否做文本归一化（数字、符号读法等）；关闭可复现上游演示或保留特殊标记。
+	// TextFrontend 控制是否做文本归一化（数字、符号读法等）；关闭可复现上游演示或保留特殊标记。只对 CosyVoice 生效。
 	TextFrontend bool
 	// Seed 非 nil 且非负时固定随机种子；nil 时微调模型用引擎默认种子，其他模型每次随机。
 	Seed *int
-	// Sampling 覆盖 LLM 采样参数；nil 时使用引擎默认（微调模型为保守采样，其他为模型自带）。
+	// Sampling 覆盖 LLM 采样参数；nil 时使用引擎默认（微调模型为保守采样，其他为模型自带）。只对 CosyVoice 生效。
 	Sampling *Sampling
+	// Options 是引擎专有参数（Option.Key → 值，开关为 0 / 1）；缺少的项取推荐值，智能模式留空即全部用推荐值。
+	Options map[string]float64
 	// PauseScale 是段间停顿的倍数（MinPause–MaxPause），0 视为 1。
 	PauseScale float64
 	// Regenerate 非 nil 时只重新生成此前结果中的一段（其余参数须与当时相同），见 Segments。
@@ -95,8 +97,8 @@ const (
 	MaxPause = 2.0
 )
 
-// Task 返回引擎任务名。
-func (r Request) Task() string { return Engine + "." + string(r.Mode) }
+// Task 返回引擎任务名（<引擎>.<模式>）。
+func (r Request) Task() string { return r.Model.Engine() + "." + string(r.Mode) }
 
 // Params 校验输入并返回引擎任务参数。错误信息面向用户。
 func (r Request) Params(l paths.Layout) (map[string]any, error) {
@@ -107,7 +109,7 @@ func (r Request) Params(l paths.Layout) (map[string]any, error) {
 		return nil, fmt.Errorf("请先下载模型 %s", r.Model.Title)
 	}
 	speed := r.Speed
-	if speed == 0 {
+	if speed == 0 || !r.Model.HasSpeed() {
 		speed = 1
 	}
 	if speed < MinSpeed || speed > MaxSpeed {
@@ -130,11 +132,19 @@ func (r Request) Params(l paths.Layout) (map[string]any, error) {
 	if r.Seed != nil {
 		p["seed"] = *r.Seed
 	}
-	if r.Sampling != nil {
+	if r.Sampling != nil && r.Model.HasTuning() {
 		if err := r.Sampling.validate(); err != nil {
 			return nil, err
 		}
 		p["sampling"] = map[string]any{"top_p": r.Sampling.TopP, "top_k": r.Sampling.TopK, "win_size": r.Sampling.WinSize, "tau_r": r.Sampling.TauR}
+	}
+
+	opts, err := r.options()
+	if err != nil {
+		return nil, err
+	}
+	if opts != nil {
+		p["options"] = opts
 	}
 
 	if r.Mode != ModeVC {
@@ -150,16 +160,23 @@ func (r Request) Params(l paths.Layout) (map[string]any, error) {
 			return nil, errors.New("请选择预训练音色")
 		}
 		p["spk_id"] = r.SpkID
-	} else if err := r.voice(l, p); err != nil {
-		return nil, err
+	} else if r.Mode != ModeDesign {
+		if err := r.voice(l, p); err != nil {
+			return nil, err
+		}
 	}
 
 	switch r.Mode {
 	case ModeSFT:
-		// 微调模型可选的风格引导（注入为 CosyVoice 3 的提示文本），为空时只注入结束标记。
-		if r.Model.Family == FamilyV3SFT && strings.TrimSpace(r.Instruct) != "" {
+		// 可选的风格引导：CosyVoice 3 微调模型注入为提示文本（为空时用训练时的 instruct），Qwen3-TTS 预设音色作为 instruct。
+		if (r.Model.Family == FamilyV3SFT || r.Model.Family == FamilyQwenCustom) && strings.TrimSpace(r.Instruct) != "" {
 			p["instruct"] = r.Instruct
 		}
+	case ModeDesign:
+		if strings.TrimSpace(r.Instruct) == "" {
+			return nil, errors.New("请用文字描述想要的音色")
+		}
+		p["instruct"] = r.Instruct
 	case ModeInstruct:
 		if strings.TrimSpace(r.Instruct) == "" {
 			return nil, errors.New("请填写指令")
@@ -196,7 +213,7 @@ func (r Request) voice(l paths.Layout, p map[string]any) error {
 	return nil
 }
 
-// DownloadParams 返回下载模型的任务参数（任务名 cosyvoice.download）。
+// DownloadParams 返回下载模型的任务参数（任务名 <引擎>.download）。
 func DownloadParams(l paths.Layout, m Model, s Source) map[string]any {
 	return map[string]any{"source": string(s), "repo": m.Repo(s), "model_dir": m.Dir(l)}
 }

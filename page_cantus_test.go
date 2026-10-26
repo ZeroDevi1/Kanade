@@ -138,3 +138,71 @@ func TestCantusSegments(t *testing.T) {
 		t.Errorf("regenerating row: %q", tt.Texts())
 	}
 }
+
+// 其他引擎：选择 Qwen3-TTS 音色设计模型时，智能模式只需音色描述与文本，任务提交给 qwentts 引擎；
+// 专业模式不显示该模型没有的语速与采样参数。
+func TestCantusVoiceDesign(t *testing.T) {
+	l := paths.New(t.TempDir())
+	var m cantus.Model
+	for _, x := range cantus.Models {
+		if x.Family == cantus.FamilyQwenDesign {
+			m = x
+			break
+		}
+	}
+	os.MkdirAll(m.Dir(l), 0o755)
+	os.WriteFile(filepath.Join(m.Dir(l), ".kanade-complete"), []byte("{}"), 0o644)
+	cond, err := conductor.New(l, engines.FS, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := newApp()
+	a.be, a.current = backend{layout: l, cond: cond}, "cantus"
+	a.cantus.modelTitle, a.cantus.text = m.Title, "目标文本"
+	tt := ui.NewTester(a.view, 1200, 1400)
+	if !tt.HasText("音色描述") || tt.HasText("音色来源") {
+		t.Fatalf("design input: %q", tt.Texts())
+	}
+	if err := tt.Click("生成"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if len(cond.Jobs()) != 0 || !tt.HasText("请用文字描述想要的音色") {
+		t.Fatalf("empty description: jobs %d texts %q", len(cond.Jobs()), tt.Texts())
+	}
+	a.cantus.instruct = "年轻女性，声音温柔"
+	tt.Frame()
+	if err := tt.Click("生成"); err != nil {
+		t.Fatal(err)
+	}
+	jobs := cond.Jobs()
+	if len(jobs) != 1 || jobs[0].Engine != "qwentts" || jobs[0].Task != "qwentts.voice_design" || jobs[0].Params["instruct"] != "年轻女性，声音温柔" {
+		t.Fatalf("jobs %+v err %q", jobs, a.cantus.err)
+	}
+	if opts, _ := jobs[0].Params["options"].(map[string]any); opts["temperature"] != 0.9 || opts["top_k"] != 50 {
+		t.Errorf("smart options %v", jobs[0].Params["options"])
+	}
+	cond.Cancel(jobs[0].ID)
+	a.cantus.synthMode = modePro
+	tt.Frame()
+	if tt.HasText("语速") || tt.HasText("自定义采样参数") || !tt.HasText("固定随机种子") || !tt.HasText("重复惩罚") {
+		t.Errorf("pro tuning: %q", tt.Texts())
+	}
+	// 专业模式修改的参数随任务提交；「恢复推荐值」改回推荐值。
+	*a.cantus.optNum["qwentts.temperature"] = 0.5
+	if err := tt.Click("生成"); err != nil {
+		t.Fatal(err)
+	}
+	jobs = cond.Jobs()
+	if opts, _ := jobs[len(jobs)-1].Params["options"].(map[string]any); len(jobs) != 2 || opts["temperature"] != 0.5 {
+		t.Fatalf("pro options: jobs %d %v err %q", len(jobs), jobs[len(jobs)-1].Params["options"], a.cantus.err)
+	}
+	cond.Cancel(jobs[1].ID)
+	tt.Frame()
+	if err := tt.Click("恢复推荐值"); err != nil {
+		t.Fatal(err)
+	}
+	if v := *a.cantus.optNum["qwentts.temperature"]; v != 0.9 {
+		t.Errorf("reset temperature %v", v)
+	}
+}

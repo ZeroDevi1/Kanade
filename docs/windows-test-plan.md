@@ -321,6 +321,50 @@ Oculink 一般是 PCIe 4.0 ×4（约 7.9 GB/s，台式机 ×16 插槽的四分�
   （混音中其他乐器会落在同一频率上）。
 - [ ] Windows：放大查看中拖动滑块与力度条的流畅度；导出的 MIDI 在 DAW 中踏板与力度是否生效。
 
+## 18. 2026-10-26：CosyVoice 3 SFT 推理提示与训练一致
+
+微调音色（预训练音色模式）在风格引导留空时，提示由 `<|endofprompt|>` 改为训练时的 instruct
+（默认 `You are a helpful assistant.<|endofprompt|>`；新组装的模型写在 kanade-sft.json 的 instruct，旧模型按默认值）。
+填了风格引导时按 CosyVoice 3 指令格式加同一系统提示；已含 `<|endofprompt|>` 的引导原样使用，可借此复现旧行为做对照。
+
+- [x] 提示取值（macOS，替身前端）：旧 kanade-sft.json → 默认系统提示；带 instruct 字段 → 该字段；有引导 → 系统提示 + 引导；
+  含标记的引导原样使用。
+- [ ] Windows A/B（炫狗 SFT 模型，CUDA）：同一段 1000 字以上、含长句的文本，随机种子保持默认 1986，其余参数不变，各生成一次：
+  - A（新默认）：风格引导留空；
+  - B（旧行为）：风格引导填 `<|endofprompt|>`。
+  记录两次的总时长、「时长异常」段数与重试次数（结果中的分段列表 / segments.json），盲听比较噪声与吞字、重复；
+  有差异时再换 2 个种子各跑一次，确认不是单次采样的偶然结果。
+- [ ] 风格引导（如「请非常开心地说一句话。」）加上系统提示后，引导是否仍生效、是否把提示内容念出来。
+
+## 19. 2026-10-26：语音生成接入 Qwen3-TTS、VoxCPM、IndexTTS
+
+三个新引擎（engines/qwentts、engines/voxcpm、engines/indextts），模型出现在语音生成页的模型列表中，按引擎各自下载到
+`<数据根目录>/models/<引擎>/<模型>`；音色库与 CosyVoice 共用。长文本分段、时长检查与重试、停顿拼接、单段重新生成
+移到 SDK（engines/sdk/src/kanade_engine/longtext.py），四个引擎共用；仓库下载移到 kanade_engine/hub.py。
+
+| 模型 | 模式 | 备注 |
+|---|---|---|
+| Qwen3-TTS 1.7B / 0.6B Base | 零样本克隆、音频克隆（只用说话人向量） | 无语速参数；每段上限按字数估计时长 3 倍 + 10 秒 |
+| Qwen3-TTS 1.7B VoiceDesign | 音色设计（文字描述） | 每段按描述重新生成音色，段间可能略有差异 |
+| Qwen3-TTS 1.7B / 0.6B CustomVoice | 预设音色（9 个）+ 可选风格指令 | |
+| VoxCPM2 | 零样本克隆（续写 + 参考音色）、音频克隆、风格控制（括号描述）、音色设计 | 48 kHz；不启用降噪、不用 torch.compile |
+| VoxCPM 1.5 | 零样本克隆 | 轻量中英文 |
+| IndexTTS-2.5 | 音频克隆、情绪控制（文字推断情绪，强度 0.6） | 可调语速；附属模型 w2v-bert-2.0、CAMPPlus、BigVGAN 随下载任务一起下载；bilibili 模型使用协议，商用需授权 |
+
+- [x] macOS：三个引擎 `uv lock` / `uv sync`、worker 握手（任务列表与 engine.json 一致）；SDK longtext 用替身模型检查
+  分段、拖长重试与单段重新生成；CosyVoice 改用 SDK longtext 后的切句与采样率不变。
+- [x] Go：请求组装（任务名与模型目录按引擎、无语速 / 采样参数的模型不提交这些参数、音色设计不需要参考音频）与界面测试。
+- [ ] 首次使用时 Conductor `uv sync` 三个新引擎（IndexTTS 从 GitHub 拉取上游源码，国内网络可能需要代理）。
+- [ ] 各模型从 ModelScope 与 Hugging Face 各下载一次；IndexTTS-2.5 选 ModelScope 时 BigVGAN 仍走 Hugging Face（镜像设置生效）。
+- [ ] 用炫狗的参考音色与同一篇 1000 字以上的文本，分别用 CosyVoice 3、Qwen3-TTS 1.7B Base、VoxCPM2、IndexTTS-2.5 合成：
+  记录总耗时、显存峰值、「时长异常」段数与重试次数，盲听比较音色相似度、噪声与吞字。
+- [ ] Qwen3-TTS 音色设计 / 预设音色 + 风格指令、VoxCPM2 音色设计与风格控制、IndexTTS 情绪控制各试一段，确认描述生效、不会把描述念出来。
+- [ ] 取消：三个新引擎在段与段之间生效（段内不能中断，最长等当前一段合成完），部分结果可播放。
+- 参数：智能模式一律用推荐值；专业模式的「模型参数」逐项显示各引擎可调的参数（Qwen3-TTS 的 talker / subtalker 采样，
+  VoxCPM 的 CFG、扩散步数、文本归一化与失控重试，IndexTTS 的采样、束搜索、重复惩罚、文本归一化与情绪强度），
+  推荐值与引擎 tasks.py 的默认值一致（internal/cantus/options.go）。
+- [ ] 专业模式各改一两个参数（如 VoxCPM 扩散步数 10 → 25、IndexTTS 束搜索 3 → 1），确认生效（耗时、听感变化）且超出范围时提示。
+
 ## macOS 冒烟已覆盖
 
 - 四个引擎在 macOS 上的 uv 锁定与安装、hello 握手、环境检查（MPS / CPU）。

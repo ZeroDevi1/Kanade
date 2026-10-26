@@ -1,0 +1,44 @@
+[project]
+name = "kanade-qwentts"
+version = "0.1.0"
+description = "Kanade 的 Qwen3-TTS 推理引擎（Cantus）：音色克隆、音色设计、预设音色"
+requires-python = "==3.12.*"
+dependencies = [
+    "kanade-engine-sdk",
+    # qwen-tts 0.1.1 锁定 transformers 4.57.3、accelerate 1.12.0，未锁定 torch；与 IndexTTS / VoxCPM 引擎统一用 2.8.0
+    # （cu128 构建支持 RTX 20 至 RTX 50，torchaudio 2.8 仍保留 soundfile 后端的 load）。
+    "qwen-tts==0.1.1",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "numpy",
+    "soundfile",
+]
+
+[tool.uv]
+# 只为实际发布的两个平台解析：Windows x64（CUDA 推理）与 macOS arm64（界面开发与 CPU / MPS 冒烟测试）。
+environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+# qwen-tts 无条件依赖 gradio（只有其 Web 演示 qwen_tts/cli/demo.py 使用），推理路径不导入；用永不成立的标记排除，
+# 省去约 200 MB 的 Web 依赖。
+override-dependencies = ["gradio; sys_platform == 'never'"]
+
+[tool.uv.sources]
+# editable：SDK 版本号不变时 uv sync 不会重装非 editable 的 path 依赖，改为直接引用释放出的源码。
+kanade-engine-sdk = { path = "../sdk", editable = true }
+# Windows 用 PyTorch 官方 CUDA 12.8 构建（要求驱动 570 及以上）；macOS 用 PyPI 的 CPU/MPS 构建。
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32'" }]
+torchaudio = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kanade_qwentts"]

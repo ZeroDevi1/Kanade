@@ -1,0 +1,15 @@
+{
+  "name": "qwentts",
+  "title": "Qwen3-TTS 语音生成",
+  "description": "Qwen3-TTS：3 秒音色克隆、用文字描述设计音色、预设音色（含方言），10 种语言。",
+  "python": "3.12",
+  "module": "kanade_qwentts",
+  "tasks": [
+    "qwentts.download",
+    "qwentts.zero_shot",
+    "qwentts.cross_lingual",
+    "qwentts.voice_design",
+    "qwentts.sft",
+    "qwentts.doctor"
+  ]
+}

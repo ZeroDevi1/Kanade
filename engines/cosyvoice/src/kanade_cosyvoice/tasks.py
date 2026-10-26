@@ -1,7 +1,7 @@
 """CosyVoice 推理任务处理函数。
 
 worker 同一时间只持有一个已加载的模型（显存约 2–4 GB）；切换模型时先释放旧模型。
-推理以非流式方式逐段执行：分段、逐段检查与重试、按标点停顿拼接、保存各段音频见 longtext.py。各模式只提供
+推理以非流式方式逐段执行：分段、逐段检查与重试、按标点停顿拼接、保存各段音频见 kanade_engine.longtext。各模式只提供
 「一段已归一化的文本 → 上游推理」的函数（模式所需的前缀按段加上）。取消在句子内部也能生效：LLM 逐 token 采样时
 检查取消并返回结束 token（见 configure_sampling），当前句随即结束，已合成的部分作为部分结果输出。
 
@@ -16,10 +16,9 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from kanade_engine import Cancelled, Job
+from kanade_engine import Cancelled, Job, longtext
 
 from . import download as dl
-from . import longtext
 
 # 各模型版本支持的模式，与 Go 端 internal/cantus/models.go 保持一致。
 # 依据上游 example.py 中各版本演示的接口：v1 基础模型无指令能力，SFT / Instruct 是单独的模型。
@@ -182,22 +181,22 @@ def speaker(job: Job, model, fam: str, params: dict) -> tuple[str, str, str]:
 # ---------- 推理与输出 ----------
 
 def synthesize(job: Job, model, text: str, text_frontend: bool, generate: Callable[[str], Iterable[dict]]) -> None:
-    """长文本合成（longtext.py）：generate(段落文本) 返回该段的上游推理生成器。带 regenerate 参数时只重做一段。"""
-    p = job.params
-    speed = float(p.get("speed") or 1.0)
-    seed = p.get("seed")
-    fixed = int(seed) if seed is not None and int(seed) >= 0 else None
-    regen = p.get("regenerate")
-    if regen:
-        longtext.regenerate(job, model, Path(regen["manifest"]), int(regen["index"]), generate, speed, fixed)
-        return
-    if not text.strip():
-        raise ValueError("文本为空")
-    pause = float(p.get("pause_scale") or 1.0)
-    if not 0.2 <= pause <= 3:
-        raise ValueError("停顿倍数须在 0.2–3 之间")
-    segs = longtext.plan(model, text, text_frontend)
-    longtext.synthesize(job, model, segs, generate, speed, pause, fixed)
+    """长文本合成（kanade_engine.longtext）：generate(段落文本) 返回该段的上游推理生成器。带 regenerate 参数时只重做一段。
+
+    可归一化时用上游 text_normalize 切句（含数字、符号读法）；关闭归一化或含 <|…|> 标记时按标点切句，保留标记。
+    """
+    import torch
+
+    def split(line: str) -> list[str]:
+        if text_frontend and not ("<|" in line and "|>" in line):
+            return model.frontend.text_normalize(line, split=True, text_frontend=True)
+        return longtext.split_punct(line)
+
+    def wave(seg: str):
+        chunks = [out["tts_speech"] for out in generate(seg)]
+        return torch.cat(chunks, dim=1).squeeze(0).cpu().float().numpy() if chunks else None
+
+    longtext.run(job, text, model.sample_rate, wave, split)
 
 
 def write_output(job: Job, model, chunks: list) -> None:
@@ -302,18 +301,25 @@ def sft(job: Job) -> None:
         raise ValueError(f"预训练音色不存在：{spk_id}，可用：{'、'.join(model.list_available_spks())}")
     text = p.get("text") or ""
     if fam == "v3-sft":
-        prompt = _sft_v3_prompt(model, p.get("instruct") or "", tf)
+        prompt = _sft_v3_prompt(model, Path(p["model_dir"]), p.get("instruct") or "", tf)
         synthesize(job, model, text, tf, lambda seg: _sft_v3(model, seg, spk_id, prompt, speed))
         return
     synthesize(job, model, text, tf, lambda seg: model.inference_sft(seg, spk_id, stream=False, speed=speed, text_frontend=False))
 
 
-def _sft_v3_prompt(model, guide: str, tf: bool):
+def _sft_v3_prompt(model, model_dir: Path, guide: str, tf: bool):
     """CosyVoice 3 SFT 的提示 token：LLM 要求 <|endofprompt|> 出现在提示或正文中，上游 inference_sft 不提供提示，
-    因此注入 prompt_text（默认只有标记本身，减少提示内容泄露到语音；guide 可写情绪 / 风格引导）。"""
-    prompt = guide.strip()
-    if END not in prompt:
-        prompt += END
+    因此注入 prompt_text。
+
+    训练时每条数据的 instruct 位于正文之前（上游 llm.py 的 prepare_lm_input_target），推理时 prompt_text 占据同一位置，
+    两者不一致时 LLM 的条件偏离训练分布，长句更容易拖长或失控。因此 guide 为空时使用训练时的 instruct
+    （kanade-sft.json 的 instruct；此前组装的模型没有该字段，按 sft.INSTRUCT_DEFAULT 即系统提示 + 标记）；
+    guide 可写情绪 / 风格引导，按 CosyVoice 3 指令格式加上同一系统提示。"""
+    if guide.strip():
+        prompt = instruct_text_for("v3", guide)
+    else:
+        meta = json.loads((model_dir / "kanade-sft.json").read_text(encoding="utf-8"))
+        prompt = meta.get("instruct") or f"{V3_SYSTEM}{END}"
     prompt_norm = model.frontend.text_normalize(prompt, split=False, text_frontend=tf)
     return model.frontend._extract_text_token(prompt_norm)
 

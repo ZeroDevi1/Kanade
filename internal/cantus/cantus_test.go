@@ -134,3 +134,105 @@ func TestTextEstimate(t *testing.T) {
 		t.Errorf("speed 2: %v", s)
 	}
 }
+
+// 其他引擎的模型：任务名与模型目录取自所属引擎；没有的调节项（语速、采样）不提交；音色设计不需要参考音频。
+func TestOtherEngines(t *testing.T) {
+	l := paths.New(t.TempDir())
+	base, design, custom := model("Qwen3-TTS-12Hz-1.7B-Base"), model("Qwen3-TTS-12Hz-1.7B-VoiceDesign"), model("Qwen3-TTS-12Hz-1.7B-CustomVoice")
+	vox, index := model("VoxCPM2"), model("IndexTTS-2.5")
+	for _, m := range []Model{base, design, custom, vox, index} {
+		installFake(t, l, m)
+	}
+	if got, want := base.Dir(l), filepath.Join(l.Models, "qwentts", base.Key); got != want {
+		t.Errorf("dir %s, want %s", got, want)
+	}
+
+	cases := []struct {
+		r    Request
+		task string
+		want string // 错误片段；空表示应成功
+	}{
+		{Request{Model: base, Mode: ModeZeroShot, Text: "x", PromptWav: "p.wav"}, "", "参考音频对应的文本"},
+		{Request{Model: base, Mode: ModeCrossLingual, Text: "x", PromptWav: "p.wav", Speed: 1.5,
+			Sampling: &Sampling{TopP: 0.5, TopK: 5, WinSize: 10, TauR: 0.1}}, "qwentts.cross_lingual", ""},
+		{Request{Model: design, Mode: ModeDesign, Text: "x"}, "", "描述"},
+		{Request{Model: design, Mode: ModeDesign, Text: "x", Instruct: "温柔的女声"}, "qwentts.voice_design", ""},
+		{Request{Model: custom, Mode: ModeSFT, Text: "x", SpkID: "Vivian", Instruct: "开心地说"}, "qwentts.sft", ""},
+		{Request{Model: vox, Mode: ModeInstruct, Text: "x", PromptWav: "p.wav", Instruct: "稍快"}, "voxcpm.instruct", ""},
+		{Request{Model: index, Mode: ModeZeroShot, Text: "x", PromptWav: "p.wav", PromptText: "t"}, "", "不支持"},
+		{Request{Model: index, Mode: ModeCrossLingual, Text: "x", PromptWav: "p.wav", Speed: 1.5}, "indextts.cross_lingual", ""},
+	}
+	for _, c := range cases {
+		p, err := c.r.Params(l)
+		switch {
+		case c.want != "":
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Errorf("%s/%s: err %v, want %q", c.r.Model.Key, c.r.Mode, err, c.want)
+			}
+			continue
+		case err != nil:
+			t.Errorf("%s/%s: unexpected %v", c.r.Model.Key, c.r.Mode, err)
+			continue
+		}
+		if c.r.Task() != c.task || p["model_dir"] != c.r.Model.Dir(l) {
+			t.Errorf("%s/%s: task %s params %v", c.r.Model.Key, c.r.Mode, c.r.Task(), p)
+		}
+		if _, ok := p["sampling"]; ok {
+			t.Errorf("%s: sampling sent to %s", c.r.Model.Key, c.r.Model.Engine())
+		}
+		if wantSpeed := map[bool]float64{true: c.r.Speed, false: 1}[c.r.Model.HasSpeed() && c.r.Speed != 0]; p["speed"] != wantSpeed {
+			t.Errorf("%s: speed %v, want %v", c.r.Model.Key, p["speed"], wantSpeed)
+		}
+		if c.r.Mode == ModeDesign {
+			if _, ok := p["prompt_wav"]; ok || p["instruct"] != "温柔的女声" {
+				t.Errorf("design params %v", p)
+			}
+		}
+	}
+
+	if got := index.ModeTitle(ModeInstruct); got != "情绪控制" {
+		t.Errorf("index instruct title %q", got)
+	}
+	if got := model("Fun-CosyVoice3-0.5B").ModeTitle(ModeCrossLingual); got != "跨语种复刻" {
+		t.Errorf("cosyvoice title %q", got)
+	}
+	if SmartMode(design, false, false) != ModeDesign || SmartMode(custom, false, true) != ModeSFT || SmartMode(vox, true, false) != ModeZeroShot {
+		t.Error("smart mode for other engines")
+	}
+}
+
+// 引擎专有参数：缺省取推荐值（智能模式），整数取整、开关转为布尔，超出范围报错；只提交当前模式适用的项。
+func TestOptions(t *testing.T) {
+	l := paths.New(t.TempDir())
+	index, vox, v3 := model("IndexTTS-2.5"), model("VoxCPM2"), model("Fun-CosyVoice3-0.5B")
+	for _, m := range []Model{index, vox, v3} {
+		installFake(t, l, m)
+	}
+	p, err := (Request{Model: index, Mode: ModeCrossLingual, Text: "x", PromptWav: "p.wav"}).Params(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := p["options"].(map[string]any)
+	if opts["top_k"] != 30 || opts["repetition_penalty"] != 10.0 || opts["text_normalization"] != true {
+		t.Errorf("defaults %v", opts)
+	}
+	if _, ok := opts["emo_alpha"]; ok {
+		t.Error("emo_alpha sent outside 情绪控制")
+	}
+	p, err = (Request{Model: index, Mode: ModeInstruct, Text: "x", PromptWav: "p.wav", Instruct: "开心",
+		Options: map[string]float64{"emo_alpha": 0.3, "num_beams": 1.6, "text_normalization": 0}}).Params(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts = p["options"].(map[string]any)
+	if opts["emo_alpha"] != 0.3 || opts["num_beams"] != 2 || opts["text_normalization"] != false {
+		t.Errorf("custom %v", opts)
+	}
+	if _, err := (Request{Model: vox, Mode: ModeCrossLingual, Text: "x", PromptWav: "p.wav",
+		Options: map[string]float64{"cfg_value": 9}}).Params(l); err == nil || !strings.Contains(err.Error(), "CFG 强度") {
+		t.Errorf("out of range: %v", err)
+	}
+	if p, _ := (Request{Model: v3, Mode: ModeCrossLingual, Text: "x", PromptWav: "p.wav"}).Params(l); p["options"] != nil {
+		t.Errorf("cosyvoice options %v", p["options"])
+	}
+}
