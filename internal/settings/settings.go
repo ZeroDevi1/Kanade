@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"kanade/internal/s3sync"
 )
 
 // Settings 是持久化的用户设置。零值表示全部使用默认值。
@@ -25,6 +27,8 @@ type Settings struct {
 	HFToken string `json:"hfToken,omitempty"`
 	// KaraokeMic 是 K 歌跟唱所用录音设备的名称（mic.Devices），空串为系统默认。
 	KaraokeMic string `json:"karaokeMic,omitempty"`
+	// S3 是音乐分析记录云端同步所用的 S3 兼容存储；未配置时为零值。Secret Key 以明文保存在设置文件中。
+	S3 s3sync.Config `json:"s3,omitzero"`
 }
 
 // MirrorCN 表示使用国内镜像。

@@ -32,6 +32,7 @@ type settingsState struct {
 	mirrorSaved  bool
 	// doctor 是各引擎环境检查任务的 ID。
 	doctor map[string]string
+	s3     s3State
 }
 
 var engineStateLabel = map[conductor.EngineState]string{
@@ -43,7 +44,7 @@ var engineStateLabel = map[conductor.EngineState]string{
 }
 
 func (a *app) settingsPage(c *ui.Context, tk *fluent.Tokens) {
-	pageHeader(c, "设置", "数据根目录、uv 与推理引擎环境。")
+	pageHeader(c, "设置", "数据根目录、uv、推理引擎环境与云端同步。")
 	if a.backendUnavailable(c, tk) {
 		return
 	}
@@ -55,6 +56,7 @@ func (a *app) settingsPage(c *ui.Context, tk *fluent.Tokens) {
 			}
 		})
 	}, func() ui.Element { return a.mirrorCard(c, tk) })
+	cardRow(c, cardMinWidth, func() ui.Element { return a.s3Card(c, tk) })
 	a.doctorCard(c, tk)
 }
 

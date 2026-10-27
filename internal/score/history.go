@@ -7,6 +7,7 @@ import (
 	"io"
 	"maps"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -241,3 +242,26 @@ func (r *Run) Delete() error {
 	}
 	return os.RemoveAll(dir)
 }
+
+// SyncInclude 返回云端同步时本地文件 rel（相对 root、以 / 分隔）的筛选：只同步含 record.json 的记录目录中的文件，
+// 不同步分离出的分轨——分轨体积大，且按原曲路径复用，换一台机器通常用不上，需要时重新分离。
+// 筛选基于调用时读到的记录，之后新增的记录要到下次调用才计入。
+func SyncInclude(root string) func(rel string) bool {
+	stems := map[string]bool{}
+	dirs := map[string]bool{}
+	for dir, rec := range readRecords(root) {
+		name := filepath.Base(dir)
+		dirs[name] = true
+		for _, f := range rec.Stems {
+			stems[name+"/"+f] = true
+		}
+	}
+	return func(rel string) bool {
+		dir, _, ok := strings.Cut(rel, "/")
+		return ok && dirs[dir] && !stems[rel]
+	}
+}
+
+// IsRecordFile 报告 rel 是否是记录目录的描述文件 record.json。同步时最后传输它：
+// LoadHistory 只认含 record.json 的目录，它出现时同目录的其他文件已经完整。
+func IsRecordFile(rel string) bool { return path.Base(rel) == recordFile }

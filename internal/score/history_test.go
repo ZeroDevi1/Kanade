@@ -136,3 +136,30 @@ func TestRunWithoutHistory(t *testing.T) {
 		t.Fatalf("state %+v", st)
 	}
 }
+
+func TestSyncInclude(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "20260101-120000-歌")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rec := `{"version":1,"files":{"analysis":"analysis.json"},"stems":{"melody":"x_vocals_karaoke.wav"}}`
+	if err := os.WriteFile(filepath.Join(dir, recordFile), []byte(rec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inc := SyncInclude(root)
+	for rel, want := range map[string]bool{
+		"20260101-120000-歌/analysis.json":        true,
+		"20260101-120000-歌/record.json":          true,
+		"20260101-120000-歌/x_vocals_karaoke.wav": false, // 分轨
+		"20260101-130000-未完成/analysis.json":      false, // 没有 record.json
+		"loose.json": false,
+	} {
+		if inc(rel) != want {
+			t.Errorf("SyncInclude(%q) != %v", rel, want)
+		}
+	}
+	if !IsRecordFile("a/record.json") || IsRecordFile("a/analysis.json") {
+		t.Error("IsRecordFile")
+	}
+}
