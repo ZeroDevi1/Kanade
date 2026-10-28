@@ -47,7 +47,9 @@ def regularize(beats: np.ndarray) -> np.ndarray:
         gap = b - out[-1]
         if gap > GAP_RATIO * ibi:
             n = int(round(gap / ibi))
-            out.extend(out[-1] + gap * k / n for k in range(1, n))
+            # 起点须先取出：生成器会在 extend 过程中惰性读取 out[-1]，补拍逐个累加后越过 b，拍点失去单调。
+            start = out[-1]
+            out.extend([start + gap * k / n for k in range(1, n)])
         out.append(b)
     return np.asarray(out)
 
