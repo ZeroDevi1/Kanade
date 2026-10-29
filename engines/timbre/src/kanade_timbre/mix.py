@@ -6,6 +6,7 @@
         role 为 vocal（主唱）、harmony（和声）、inst（伴奏）或 other（原样相加）。
         ref 是对齐响度用的参考轨：转换后的主唱 / 和声给出原曲对应分轨，演唱段 RMS 对齐到参考；
         没有 ref 时按智能推荐（见 _recommended_db）。gain_db 是在推荐电平之上的偏移。
+    widen:  {enabled, width, delay_ms, detune_cents} 和声加宽（见 widen），在对齐响度之前处理
     reverb: {enabled, rt60, predelay_ms, wet_db}   对 vocal / harmony 做混响发送，wet_db 为湿声相对干声的电平
     master: {peak_db, mp3}                         成品整体增益到峰值 peak_db（默认 −1 dBFS），24 bit WAV，可选再导出 MP3
     name:   输出文件名（不含扩展名）
@@ -46,6 +47,14 @@ REVERB_DEFAULT = {"enabled": True, "rt60": 1.6, "predelay_ms": 25.0, "wet_db": -
 HARMONY_EXTRA_WET_DB = 3.0
 REVERB_LOWPASS_HZ = 6000.0
 MASTER_PEAK_DB = -1.0
+
+# 和声加宽默认值：左右宽度 0.8、平均晚于主唱 12 ms、音高摆动 ±6 cent。
+# 同一模型转换出的和声与主唱音色、节奏几乎一致，叠在中间听起来像主唱变厚而不像合唱；
+# 让左右声道各自错位（时间与音高都轻微不同）是人工双轨（ADT）的常见做法。12 ms 在哈斯效应范围内，
+# 听感上不会是"晚了"；±6 cent 在常见的 5～15 cent 双轨失谐范围内，再大会像跑调。均为经验值。
+WIDEN_DEFAULT = {"enabled": True, "width": 0.8, "delay_ms": 12.0, "detune_cents": 6.0}
+# 左右两路延迟调制的 LFO 频率（Hz）：取不成整数比的两个慢速值，两路的错位不会周期性地重新对齐。
+WIDEN_LFO_HZ = (0.45, 0.61)
 
 
 def _stereo(x: np.ndarray) -> np.ndarray:
@@ -126,6 +135,28 @@ def add_reverb(dry: np.ndarray, sr: int, ir: np.ndarray, wet_db: float) -> np.nd
     return out
 
 
+def widen(x: np.ndarray, sr: int, width: float, delay_ms: float, detune_cents: float) -> np.ndarray:
+    """立体声 x 的加宽版本：左右声道各过一条慢速调制的延迟线，再按 width 缩放侧声道。
+
+    延迟线 d(t) = delay + depth·(1 + sin(2πft + φ))，平均延迟 delay + depth。延迟变化率 d'(t) 带来的
+    音高偏移为 1 − d'(t)，峰值 2πf·depth，由此按 detune_cents 反推 depth；延迟有界，所以不会累积漂移。
+    左右用不同的 f 与 φ，两侧波形不再相同，原有的左右响度比例（推理的 pan 模式套回的声像）随声道保留。
+    width 为侧声道（L−R）/2 的倍数：1 保持两路各自错位，0 为单声道。输出比输入长出最大延迟。
+    """
+    n = len(x)
+    base = delay_ms / 1000 * sr
+    depths = [(2 ** (detune_cents / 1200) - 1) / (2 * np.pi * f) * sr for f in WIDEN_LFO_HZ]  # 采样数
+    out_n = n + int(np.ceil(base + 2 * max(depths))) + 1
+    t, tout = np.arange(n, dtype=np.float64), np.arange(out_n, dtype=np.float64)
+    y = np.zeros((out_n, 2), dtype=np.float32)
+    for ch, (f, depth, phase) in enumerate(zip(WIDEN_LFO_HZ, depths, (0.0, np.pi / 2))):
+        d = base + depth * (1 + np.sin(2 * np.pi * f * tout / sr + phase))
+        # 分数延迟用线性插值读取 x[n − d(n)]；超出原信号的位置取 0。
+        y[:, ch] = np.interp(tout - d, t, x[:, ch], left=0.0, right=0.0)
+    mid, side = (y[:, 0] + y[:, 1]) / 2, (y[:, 0] - y[:, 1]) / 2 * np.float32(width)
+    return np.stack([mid + side, mid - side], axis=1)
+
+
 def _recommended_db(role: str, x: np.ndarray, sr: int, levels: dict[str, float], placed: dict[str, np.ndarray]) -> float | None:
     """没有参考轨时 x 的目标电平（dBFS）。levels / placed 是已定电平的各角色的演唱段电平与音频。
 
@@ -168,6 +199,14 @@ def run_mix(job: Job) -> None:
         return soxr.resample(x, rate, sr).astype(np.float32) if rate != sr else x
 
     tracks = [load(d, r) for d, r in raw]
+
+    # 加宽放在对齐响度之前，让对齐量按加宽后的和声计算。
+    wd = dict(WIDEN_DEFAULT, **(p.get("widen") or {}))
+    if wd.get("enabled"):
+        for i, t in enumerate(specs):
+            if t.get("role") == "harmony":
+                tracks[i] = widen(tracks[i], sr, float(wd["width"]), float(wd["delay_ms"]), float(wd["detune_cents"]))
+                job.check_cancelled()
 
     # 2. 响度：伴奏先定（保持原电平），再定主唱、和声。有参考轨时对齐参考在演唱段的 RMS。
     job.progress(0.2, "对齐响度")
@@ -241,7 +280,7 @@ def run_mix(job: Job) -> None:
         export_mp3(out, mp3)
         job.artifact(mp3, "audio")
     info = {"sample_rate": sr, "master_gain_db": round(master_gain, 2), "peak_dbfs": peak_db,
-            "reverb": rv if rv.get("enabled") else None, "tracks": report}
+            "reverb": rv if rv.get("enabled") else None, "widen": wd if wd.get("enabled") else None, "tracks": report}
     rep = out.with_suffix(".json")
     rep.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     job.artifact(rep, "mix-report")

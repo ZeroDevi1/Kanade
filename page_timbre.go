@@ -432,14 +432,14 @@ func (a *app) timbreCover(c *ui.Context, tk *fluent.Tokens) {
 	})
 }
 
-// coverMixParams 显示混音参数：智能模式只有人声音量与 MP3；专业模式有分轨模型、和声处理、各轨偏移与混响。
+// coverMixParams 显示混音参数：智能模式只有人声音量与 MP3；专业模式有分轨模型、和声处理、各轨偏移、混响与和声加宽。
 func (a *app) coverMixParams(c *ui.Context) {
 	t := c.Theme()
 	s := &a.timbre
 	m := &s.mix
 	ui.Text(c, "混音").FontWeight(600)
 	if s.inferMode == modeSmart {
-		ui.Text(c, "主唱与和声自动对齐原曲的演唱段响度，加人声混响，成品峰值 −1 dBFS、24 bit。").FontSize(12).TextColor(t.TextMuted)
+		ui.Text(c, "主唱与和声自动对齐原曲的演唱段响度，加人声混响，和声左右加宽，成品峰值 −1 dBFS、24 bit。").FontSize(12).TextColor(t.TextMuted)
 		labeledSlider(c, "人声音量", &m.VocalGainDB, -6, 6, "%+.1f dB")
 		ui.Checkbox(c, &m.MP3, "同时导出 MP3")
 		return
@@ -471,6 +471,12 @@ func (a *app) coverMixParams(c *ui.Context) {
 		labeledSlider(c, "混响时间", &m.RT60, timbre.MinRT60, timbre.MaxRT60, "%.2f s")
 		labeledSlider(c, "预延迟", &m.PreDelayMS, 0, timbre.MaxPreDelayMS, "%.0f ms")
 		ui.Text(c, "和声的湿声比主唱多 3 dB，让和声退到主唱后面。").FontSize(12).TextColor(t.TextMuted)
+	}
+	ui.Checkbox(c, &m.Widen, "和声加宽（左右声道各自轻微错位，与主唱分开）")
+	if m.Widen {
+		labeledSlider(c, "宽度", &m.Width, 0, 1, "%.2f")
+		labeledSlider(c, "错后", &m.WidenDelayMS, 0, timbre.MaxWidenDelayMS, "%.0f ms")
+		labeledSlider(c, "音高摆动", &m.DetuneCents, 0, timbre.MaxDetuneCents, "±%.0f cent")
 	}
 }
 
