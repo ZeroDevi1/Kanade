@@ -56,8 +56,9 @@ def subprocess_env() -> dict[str, str]:
 
 @dataclass(frozen=True)
 class Asset:
-    remote: str  # Resources/ 下的相对路径
+    remote: str  # base 下的相对路径
     local: str  # ROOT 下的相对路径
+    base: str = _HF  # 默认为 Applio 的 Resources/
 
 
 # 推理必需：contentvec 特征提取器；按 f0 方法另需对应预测器（crepe 的权重随 torchcrepe 包提供）。
@@ -91,4 +92,4 @@ def ensure(job: Job, assets: list[Asset], lo: float, hi: float) -> None:
             frac = (i + (have / total if total else 0)) / len(missing)
             job.progress(lo + (hi - lo) * frac, f"下载 {Path(a.remote).name}：{have / 1e6:.0f}" + (f" / {total / 1e6:.0f} MB" if total else " MB"))
 
-        fetch(f"{_HF}/{a.remote}", ROOT / a.local, report)
+        fetch(f"{a.base}/{a.remote}", ROOT / a.local, report)
