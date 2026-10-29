@@ -35,5 +35,7 @@ def main() -> None:
         "timbre.prepare": train.run_prepare,
         "timbre.infer": infer.run_infer,
         "timbre.train": train.run_train,
+        "timbre.bwe_preview": train.run_bwe_preview,
         "timbre.mix": mix.run_mix,
     })
+

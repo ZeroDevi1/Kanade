@@ -93,6 +93,11 @@ type timbreState struct {
 	trainCheckpoint  bool
 	trainSkipPre     bool
 	trainSkipExtract bool
+	trainBWE         string // trainBWETitles 之一，智能与专业模式共用
+	trainBWECutoff   float64
+	bwePreviewCount  float64
+	bwePreviewJob    string
+	bwePreviewOut    resultSet
 	trainJob         string
 	trainScanned     string // 已为其刷新过模型列表的训练任务
 
@@ -107,6 +112,7 @@ func newTimbreState() timbreState {
 	s := timbreState{modelsStale: true, normalize: true, stereo: timbre.StereoModes[1].Title,
 		content: timbre.ContentKinds[0].Title, shift: timbre.VoiceShifts[0].Title,
 		harmonyMode: timbre.HarmonyModes[0], stemChoice: coverStemChoices[0], mix: timbre.DefaultMix(),
+		trainBWE: trainBWETitles[0], trainBWECutoff: 8000, bwePreviewCount: 3,
 		trainRate: "48000", trainEpochs: 200, trainBatch: 4, trainSaveEvery: 10, trainF0: "rmvpe",
 		trainCut: timbre.CutModes[0], trainChunk: 3, trainOverlap: 0.3, trainNorm: timbre.Normalizations[0],
 		trainIndex: timbre.IndexAlgorithms[0], trainCacheGPU: trainCacheTitles[0], trainPrecision: timbre.Precisions[0]}
@@ -592,11 +598,51 @@ func (a *app) timbreTrain(c *ui.Context, tk *fluent.Tokens) {
 				ui.Textf(c, "已有同名模型（%d 轮）：将从上次的检查点续训。", m.Epoch).FontSize(12).TextColor(t.Warning)
 			}
 		}
+		ui.Select(c, &s.trainBWE, trainBWETitles).Label("训练带宽扩展（BWE）").Width(280)
+		ui.Text(c, "可选生成高频，不是真实恢复；可能产生伪影。源文件保持不变，建议先试听后训练。").FontSize(12).TextColor(t.TextMuted)
+		if s.bweMode() == "manual" {
+			ui.Field(c, "截止频率（Hz）", func() { ui.NumberInput(c, &s.trainBWECutoff, 2000, 14999, 100).Width(140) })
+		}
 		if s.trainMode == modePro {
 			a.timbreTrainPro(c)
 		}
+		_, previewActive := a.jobStatusPeek(s.bwePreviewJob)
+		_, trainActive := a.jobStatusPeek(s.trainJob)
+		ui.Row(c).Gap(12).AlignItems(ui.End).Children(func() {
+			ui.Field(c, "试听数量（最多 5 段）", func() { ui.NumberInput(c, &s.bwePreviewCount, 1, 5, 1).Width(130) })
+			if ui.Button(c, "生成 BWE 试听（不训练）").Disabled(previewActive || trainActive || s.bweMode() == "off").Clicked() {
+				params, err := s.bwePreviewRequest().Params()
+				if err == nil {
+					s.bwePreviewJob, err = a.be.cond.Submit(timbre.Engine, "timbre.bwe_preview", params)
+					if err == nil {
+						s.bwePreviewOut.preview.reset()
+						s.bwePreviewOut.items, s.bwePreviewOut.err = nil, ""
+					}
+				}
+				s.err = errText(err)
+			}
+		})
+		preview, _ := a.jobStatus(c, s.bwePreviewJob)
+		if preview.State == conductor.JobDone {
+			for _, path := range preview.Artifacts {
+				if strings.EqualFold(filepath.Ext(path), ".wav") {
+					name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+					title := "BWE 试听 · " + name
+					if strings.HasPrefix(name, "original-") {
+						title = "原始试听 · " + strings.TrimPrefix(name, "original-")
+					}
+					if strings.HasPrefix(name, "enhanced-") {
+						title = "生成高频试听 · " + strings.TrimPrefix(name, "enhanced-")
+					}
+					s.bwePreviewOut.add(a, path, title, name, false)
+				}
+			}
+		}
+		if s.bwePreviewJob != "" {
+			s.bwePreviewOut.show(c, tk, a, "试听音频会显示在这里；不会开始模型训练。")
+		}
 		_, active := a.jobStatusPeek(s.trainJob)
-		if ui.PrimaryButton(c, "开始训练").Disabled(active).AlignSelf(ui.Start).Clicked() {
+		if ui.PrimaryButton(c, "开始训练").Disabled(active || previewActive).AlignSelf(ui.Start).Clicked() {
 			params, err := s.trainRequest().Params()
 			if err == nil {
 				s.trainJob, err = a.be.cond.Submit(timbre.Engine, "timbre.train", params)
@@ -613,6 +659,19 @@ func (a *app) timbreTrain(c *ui.Context, tk *fluent.Tokens) {
 		}
 		ui.Text(c, "训练目录："+filepath.Join(timbre.Root(a.be.layout), "logs")).FontSize(12).TextColor(t.TextMuted).Selectable()
 	})
+}
+
+// trainBWETitles 与 timbre.BWEModes 一一对应，零值默认关闭。
+var trainBWETitles = []string{"关闭（默认）", "自动检测带宽并生成高频", "手动截止频率并生成高频"}
+
+func (s *timbreState) bweMode() string {
+	return timbre.BWEModes[max(0, slices.Index(trainBWETitles, s.trainBWE))]
+}
+
+func (s *timbreState) bwePreviewRequest() timbre.BWEPreviewRequest {
+	r := s.trainRequest()
+	return timbre.BWEPreviewRequest{Dataset: r.Dataset, List: r.List, BWEMode: r.BWEMode,
+		BWECutoffHz: r.BWECutoffHz, PreviewCount: int(s.bwePreviewCount)}
 }
 
 // trainCacheTitles 是「数据缓存到显存」的选项，与 timbre.CacheGPUModes 一一对应。
@@ -660,7 +719,11 @@ func (a *app) timbreTrainPro(c *ui.Context) {
 
 // trainRequest 按当前模式组装训练参数：智能模式的采样率、轮数、batch 与保存间隔为 0（引擎自动选择）。
 func (s *timbreState) trainRequest() timbre.TrainRequest {
-	r := timbre.TrainRequest{Name: s.trainName, Dataset: s.trainDataset, F0: "rmvpe"}
+	r := timbre.TrainRequest{Name: s.trainName, Dataset: s.trainDataset, F0: "rmvpe",
+		BWEMode: s.bweMode(), BWECutoffHz: s.trainBWECutoff}
+	if s.trainSummary != nil {
+		r.List = s.trainSummary.List
+	}
 	if s.trainMode == modeSmart {
 		return r
 	}

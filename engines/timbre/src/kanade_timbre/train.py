@@ -36,7 +36,7 @@ from pathlib import Path
 
 from kanade_engine import Cancelled, Job, annotations
 
-from . import gpu, runtime
+from . import bwe, gpu, runtime, training_data
 
 SAMPLE_RATES = (32000, 40000, 48000)
 CUT_MODES = ("Automatic", "Simple", "Skip")
@@ -54,6 +54,11 @@ VRAM_FULL_MARGIN_MB = 300
 # 大部分显存，缓存过多反而触发共享内存回退；余量由训练中的显存监视核对。
 CACHE_GPU_FRACTION = 0.10
 _NAME = re.compile(r"^[\w\-一-鿿]+$")
+
+
+def run_bwe_preview(job: Job) -> None:
+    """Bounded original/enhanced audition; never starts model training."""
+    training_data.preview(job, run_script)
 
 
 def run_prepare(job: Job) -> None:
@@ -178,6 +183,7 @@ def run_train(job: Job) -> None:
     exp_dir.mkdir(parents=True, exist_ok=True)
     meta_path = exp_dir / TRAIN_META
     meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+    bwe_options = training_data.options(p)
     f0 = p.get("f0_method") or "rmvpe"
     cores = int(p.get("cpu_cores") or min(os.cpu_count() or 4, 8))
     cut = p.get("cut_mode") or "Automatic"
@@ -195,13 +201,30 @@ def run_train(job: Job) -> None:
     overlap = float(p.get("overlap_len") if p.get("overlap_len") is not None else 0.3)
     vendor = runtime.VENDOR / "rvc" / "train"
 
-    # 数据集先整理（白名单），自动参数要按实际使用的音频估计。
+    # Validate source identity before any staging or cache mutation, including resume.
+    files = training_data.selected_files(dataset, Path(p["list"]) if p.get("list") else None)
     src = dataset
+    items = []
+    if bwe_options["mode"] != "off":
+        job.progress(0.0, "检测训练音频带宽")
+        items = training_data.make_plan(files, exp_dir / "_dataset_bwe", bwe_options)
+        runtime.ensure(job, bwe.assets({i.model for i in items if i.model}), 0.0, 0.01)
+    auto_sr = 48000 if any(i.model for i in items) else training_data.source_sample_rate(files)
+    sr = int(p.get("sample_rate") or 0) or int(meta.get("sample_rate") or 0) or auto_sr
+    preprocessing = {"sample_rate": sr, "f0_method": f0, "cut_mode": cut, "normalization": norm,
+                     "chunk_len": chunk, "overlap_len": overlap, "process_effects": bool(p.get("process_effects", False))}
+    signature, data_details = training_data.fingerprint(files, bwe_options, preprocessing, items)
+    training_data.guard_resume(exp_dir, meta, signature, bool(p.get("skip_preprocess")), bool(p.get("skip_extract")))
     if not p.get("skip_preprocess"):
-        list_path = Path(p["list"]) if p.get("list") else None
-        src = stage_dataset(job, dataset, list_path, exp_dir)
-
-    sr = int(p.get("sample_rate") or 0) or int(meta.get("sample_rate") or 0) or (auto_sample_rate(src) if src.is_dir() else 40000)
+        if items:
+            training_data.process(job, items, exp_dir / "bwe-plan.json", run_script, 0.01, 0.025)
+            src = exp_dir / "_dataset_bwe"
+        else:
+            src = training_data.stage_selected(files, exp_dir / "_dataset_input")
+    elif items:
+        src = exp_dir / "_dataset_bwe"
+        if not src.is_dir() or any(not Path(i.out).is_file() for i in items):
+            raise ValueError("补全缓存缺失，请重新预处理和提取特征")
     if sr not in SAMPLE_RATES:
         raise ValueError(f"采样率须为 {SAMPLE_RATES} 之一")
     if meta.get("sample_rate") and int(meta["sample_rate"]) != sr:
@@ -221,8 +244,13 @@ def run_train(job: Job) -> None:
     resume = f"，从第 {trained} 轮续训" if trained else ""
     job.progress(0.0, f"采样率 {sr} Hz · {epochs} 轮 · batch {batch} · 每 {save_every} 轮保存{resume}")
 
-    runtime.ensure(job, runtime.EMBEDDER + runtime.PREDICTORS.get(f0, []) + runtime.pretrained(sr), 0.0, 0.03)
+    runtime.ensure(job, runtime.EMBEDDER + runtime.PREDICTORS.get(f0, []) + runtime.pretrained(sr), 0.025, 0.03)
 
+    if not p.get("skip_extract"):
+        # Vendor extraction skips existing filenames, so a rerun must invalidate all features.
+        meta["data_ready"] = False
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        training_data.clear_prepared(exp_dir, preprocess=not p.get("skip_preprocess"))
     if not p.get("skip_preprocess"):
         # 切片默认沿用 Applio：自动切分、3 秒片段、0.3 秒重叠，不做额外音频效果与响度归一化。
         run_script(job, [str(vendor / "preprocess" / "preprocess.py"), str(exp_dir), str(src), str(sr), str(cores),
@@ -234,6 +262,10 @@ def run_train(job: Job) -> None:
         run_script(job, [str(vendor / "extract" / "extract.py"), str(exp_dir), f0, str(cores), gpus, str(sr),
                          "contentvec", "None", "2"], 0.08, 0.20, "提取音高与特征")
     check_extracted(exp_dir)
+    # Only mark inputs reusable after BOTH preprocessing and feature extraction succeed.
+    meta.update({"data_fingerprint": signature, "data_pipeline": data_details, "data_ready": True,
+                 "bwe_summary": bwe.summary(items) if items else "高频补全关闭"})
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     pg, pd = runtime.pretrained_paths(sr)
     status0 = gpu.query()
@@ -356,8 +388,11 @@ def check_extracted(exp_dir: Path) -> None:
     if not sliced:
         raise RuntimeError("预处理没有产生切片，请检查数据集音频")
     missing = sliced - extracted
+    for folder in ("f0", "f0_voiced"):
+        available = {f.name.removesuffix(".wav.npy") for f in (exp_dir / folder).glob("*.wav.npy")}
+        missing |= sliced - available
     if missing:
-        raise RuntimeError(f"特征提取不完整：{len(missing)}/{len(sliced)} 个切片缺少特征，详见引擎日志 timbre.log")
+        raise RuntimeError(f"特征或音高提取不完整：{len(missing)}/{len(sliced)} 个切片缺少文件，详见引擎日志 timbre.log")
 
 
 def latest_weights(exp_dir: Path, name: str) -> Path | None:
@@ -432,3 +467,4 @@ class TrainMonitor:
             if st.util >= 50 and (st.gen < 3 or st.width < 4):
                 parts.append(f"PCIe 链路只有 {st.link()}：检查 Oculink 线缆与 BIOS 中该接口的 PCIe 代数设置")
         return " · ".join(parts)
+
