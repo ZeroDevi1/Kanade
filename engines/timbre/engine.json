@@ -9,9 +9,11 @@
     "timbre.infer",
     "timbre.train",
     "timbre.mix",
-    "timbre.doctor"
+    "timbre.doctor",
+    "timbre.bwe_preview"
   ],
   "fresh_tasks": [
-    "timbre.train"
+    "timbre.train",
+    "timbre.bwe_preview"
   ]
 }

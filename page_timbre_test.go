@@ -10,6 +10,7 @@ import (
 
 	"kanade/engines"
 	"kanade/internal/conductor"
+	"kanade/internal/dataset"
 	"kanade/internal/paths"
 	"kanade/internal/timbre"
 )
@@ -126,5 +127,65 @@ func TestUniquePath(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(dst); string(b) != "data" {
 		t.Errorf("copied %q", b)
+	}
+}
+
+// BWE remains opt-in in both modes, with identical dataset/list settings for audition.
+func TestTimbreBWERequests(t *testing.T) {
+	s := newTimbreState()
+	if r := s.trainRequest(); r.BWEMode != "off" {
+		t.Fatalf("BWE enabled by default: %+v", r)
+	}
+	s.trainName, s.trainDataset = "bwe", t.TempDir()
+	s.trainSummary = &dataset.Summary{List: "selected.list"}
+	s.trainBWE, s.trainBWECutoff = trainBWETitles[2], 7500
+	for _, mode := range []int{modeSmart, modePro} {
+		s.trainMode = mode
+		r := s.trainRequest()
+		if r.BWEMode != "manual" || r.BWECutoffHz != 7500 {
+			t.Fatalf("mode %d: %+v", mode, r)
+		}
+		preview := s.bwePreviewRequest()
+		if preview.Dataset != r.Dataset || preview.List != r.List || preview.BWEMode != r.BWEMode || preview.BWECutoffHz != r.BWECutoffHz || preview.PreviewCount != 3 {
+			t.Fatalf("preview %+v, train %+v", preview, r)
+		}
+	}
+}
+
+func TestTimbreBWEVisibleInBothModes(t *testing.T) {
+	_, _, tt := newTimbreTestApp(t)
+	if err := tt.Click("训练"); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"智能", "专业"} {
+		if err := tt.Click(mode); err != nil {
+			t.Fatal(err)
+		}
+		for _, label := range []string{"训练带宽扩展（BWE）", "生成 BWE 试听（不训练）"} {
+			if !tt.HasText(label) {
+				t.Errorf("%s missing %s", mode, label)
+			}
+		}
+	}
+}
+
+// Audition is a separate bounded task and does not require a model name.
+func TestTimbreBWEPreviewSubmission(t *testing.T) {
+	a, cond, tt := newTimbreTestApp(t)
+	if err := tt.Click("训练"); err != nil {
+		t.Fatal(err)
+	}
+	a.timbre.trainDataset = t.TempDir()
+	a.timbre.trainBWE = trainBWETitles[1]
+	tt.Frame()
+	if err := tt.Click("生成 BWE 试听（不训练）"); err != nil {
+		t.Fatal(err)
+	}
+	jobs := cond.Jobs()
+	if len(jobs) != 1 || jobs[0].Task != "timbre.bwe_preview" || jobs[0].Params["preview_count"] != 3 || jobs[0].Params["bwe_mode"] != "auto" {
+		t.Fatalf("jobs %+v, err %q", jobs, a.timbre.err)
+	}
+	if a.timbre.trainJob != "" || a.timbre.bwePreviewJob == "" {
+		t.Fatal("preview reused training job")
 	}
 }

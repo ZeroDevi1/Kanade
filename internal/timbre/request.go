@@ -3,6 +3,7 @@ package timbre
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 )
@@ -124,14 +125,16 @@ func (r InferRequest) Params() (map[string]any, error) {
 // TrainRequest 是一次训练的输入。参数含义与默认值见 VoiceLab docs/workflows/rvc（v2 + 48k + f0）。
 // SampleRate、Epochs、BatchSize、SaveEvery 为 0 表示由引擎自动选择（智能模式，规则见引擎 train.py 的 auto_*）。
 type TrainRequest struct {
-	Name       string
-	Dataset    string
-	List       string // 为空时按同名规则自动查找
-	SampleRate int
-	F0         string
-	Epochs     int
-	BatchSize  int
-	SaveEvery  int
+	BWEMode     string  // off（默认）、auto 或 manual：生成高频，并非恢复原始信息
+	BWECutoffHz float64 // manual 时为 2000–14999 Hz
+	Name        string
+	Dataset     string
+	List        string // 为空时按同名规则自动查找
+	SampleRate  int
+	F0          string
+	Epochs      int
+	BatchSize   int
+	SaveEvery   int
 	// SkipPreprocess / SkipExtract 用于续训：已完成的阶段不再重复。
 	SkipPreprocess, SkipExtract bool
 
@@ -162,8 +165,61 @@ var (
 	Precisions = []string{"fp16", "bf16", "fp32"}
 )
 
+// BWEModes 是训练和独立试听共用的带宽扩展选项；默认关闭且不覆盖源文件。
+var BWEModes = []string{"off", "auto", "manual"}
+
+func bweParams(mode string, cutoff float64) (map[string]any, error) {
+	if mode == "" {
+		mode = "off"
+	}
+	if !contains(BWEModes, mode) {
+		return nil, fmt.Errorf("无效的带宽扩展模式 %q", mode)
+	}
+	p := map[string]any{"bwe_mode": mode}
+	if mode == "manual" {
+		if math.IsNaN(cutoff) || math.IsInf(cutoff, 0) || cutoff < 2000 || cutoff > 14999 {
+			return nil, errors.New("带宽扩展截止频率须在 2000–14999 Hz 之间")
+		}
+		p["bwe_cutoff_hz"] = cutoff
+	}
+	return p, nil
+}
+
+// BWEPreviewRequest 只生成有限数量的试听文件，不训练模型、不修改源数据。
+type BWEPreviewRequest struct {
+	Dataset, List, BWEMode string
+	BWECutoffHz            float64
+	PreviewCount           int // 0 使用默认 3，最多 5 段
+}
+
+func (r BWEPreviewRequest) Params() (map[string]any, error) {
+	p, err := bweParams(r.BWEMode, r.BWECutoffHz)
+	if err != nil {
+		return nil, err
+	}
+	if p["bwe_mode"] == "off" {
+		return nil, errors.New("请先启用带宽扩展再试听")
+	}
+	if st, err := os.Stat(r.Dataset); err != nil || !st.IsDir() {
+		return nil, errors.New("请选择存在的数据集目录")
+	}
+	count := r.PreviewCount
+	if count == 0 {
+		count = 3
+	}
+	if count < 1 || count > 5 {
+		return nil, errors.New("试听数量须为 1–5 段")
+	}
+	p["dataset_dir"], p["list"], p["preview_count"] = r.Dataset, r.List, count
+	return p, nil
+}
+
 // Params 校验输入并返回 timbre.train 的任务参数。
 func (r TrainRequest) Params() (map[string]any, error) {
+	bwe, err := bweParams(r.BWEMode, r.BWECutoffHz)
+	if err != nil {
+		return nil, err
+	}
 	if !ValidName(strings.TrimSpace(r.Name)) {
 		return nil, errors.New("模型名只能包含字母、数字、中文、下划线与连字符")
 	}
@@ -202,6 +258,9 @@ func (r TrainRequest) Params() (map[string]any, error) {
 		"skip_preprocess": r.SkipPreprocess, "skip_extract": r.SkipExtract,
 		"cache_gpu":     map[string]any{"": "auto", "auto": "auto", "on": true, "off": false}[r.CacheGPU],
 		"checkpointing": r.Checkpointing,
+	}
+	for k, v := range bwe {
+		p[k] = v
 	}
 	if r.Precision != "" {
 		p["precision"] = r.Precision

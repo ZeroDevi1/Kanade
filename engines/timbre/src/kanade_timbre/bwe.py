@@ -15,6 +15,7 @@ AP-BWE（https://github.com/yxlu-0102/AP-BWE，代码与权重均为 MIT）是�
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import sys
@@ -42,6 +43,7 @@ CROSSOVER_HZ = 300
 CHUNK = 30 * HR_RATE
 CONTEXT = HR_RATE // 2
 MANIFEST = "kanade-bwe.json"
+ALGORITHM_VERSION = "ap-bwe-crossover-v2"
 _HF = "https://huggingface.co/rsxdalv/AP-BWE/resolve/main/weights"
 
 
@@ -174,9 +176,13 @@ def plan(files: list[Path], out_dir: Path) -> list[Item]:
         if weight.any() else 0.0
     items, used = [], set()
     for f, s in zip(files, specs):
-        # 输出统一为 .wav；不同扩展名的同名文件（a.wav 与 a.mp3）用扩展名区分。
-        out = f.stem if f.stem not in used else f"{f.stem}_{f.suffix[1:]}"
-        used.add(out)
+        # Reserve the actual output stem, including suffix collisions (a.wav / a.mp3 / a_mp3.wav).
+        out = f.stem
+        suffix = 1
+        while out.casefold() in used:
+            out = f"{f.stem}_{suffix}"
+            suffix += 1
+        used.add(out.casefold())
         bw = min(cutoff, s.nyquist) if s is not None else 0.0
         model = choose_model(bw) if s is not None and has_cutoff(s, bw) else ""
         st = f.stat()
@@ -189,7 +195,7 @@ def summary(items: list[Item]) -> str:
     """进度与 kanade-train.json 中显示的一句话说明。"""
     done = [i for i in items if i.model]
     if not done:
-        return "数据集为宽带音频，不需要补全高频"
+        return "未发现需要补全的可读音频（无法读取的条目保持原样；不代表都为宽带）"
     bws = sorted(i.bandwidth for i in done)
     models = sorted({i.model for i in done})
     return f"{len(done)}/{len(items)} 条音频有效带宽约 {bws[len(bws) // 2] / 1000:.1f} kHz，用 AP-BWE {'、'.join(models)} 补全到 24 kHz"
@@ -304,12 +310,30 @@ def extend(gen: _Generator, x48: np.ndarray, bandwidth: float) -> np.ndarray:
     return out * (0.999 / peak) if peak > 0.999 else out
 
 
+def file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def model_signatures(models_dir: Path, models: set[str]) -> dict:
+    return {m: {f: file_hash(models_dir / m / f)
+                for f in ("config.json", f"g_{m}.safetensors")} for m in sorted(models)}
+
+
+def cache_signature(it: Item, models: dict) -> dict:
+    return {"item": {k: v for k, v in asdict(it).items() if k != "out"},
+            "source_sha256": file_hash(Path(it.src)), "algorithm": ALGORITHM_VERSION,
+            "model": models.get(it.model)}
+
+
 def _link(src: Path, dst: Path) -> None:
-    dst.unlink(missing_ok=True)
-    try:
-        os.link(src, dst)
-    except OSError:
-        shutil.copy2(src, dst)
+    # Outputs must not share an inode with source audio: downstream tools may edit them.
+    if src.resolve() == dst.resolve():
+        raise ValueError("补全输出不能覆盖原始音频")
+    shutil.copy2(src, dst)
 
 
 def run(plan_path: Path, models_dir: Path) -> None:
@@ -324,21 +348,27 @@ def run(plan_path: Path, models_dir: Path) -> None:
     manifest_path = out_dir / MANIFEST
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
     keep = {Path(i.out).name for i in items} | {MANIFEST}
-    for f in out_dir.iterdir():
-        if f.name not in keep:
+    if any(Path(i.src).resolve() == Path(i.out).resolve() for i in items):
+        raise ValueError("补全输出不能覆盖原始音频")
+    # Remove only prior managed outputs; never delete unrelated user files.
+    for name in set(manifest) - keep:
+        f = out_dir / name
+        if f.parent == out_dir and f.is_file():
             f.unlink()
+    signatures = model_signatures(models_dir, {i.model for i in items if i.model})
     device = _device()
     print(f"bwe device={device}", flush=True)
     gens: dict[str, _Generator] = {}
     for n, it in enumerate(items, 1):
         out = Path(it.out)
         key = Path(it.out).name
-        sig = {k: v for k, v in asdict(it).items() if k != "out"}
+        sig = cache_signature(it, signatures)
         if manifest.get(key) == sig and out.is_file():
             print(f"bwe {n}/{len(items)} cached", flush=True)
             continue
+        temporary = out.with_name(out.name + ".tmp")
         if not it.model:
-            _link(Path(it.src), out)
+            _link(Path(it.src), temporary)
         else:
             if it.model not in gens:
                 d = models_dir / it.model
@@ -346,12 +376,17 @@ def run(plan_path: Path, models_dir: Path) -> None:
                 gens[it.model] = _Generator(d / f"g_{it.model}.safetensors", cfg, device)
             x, sr = _read_mono(Path(it.src))
             x48 = soxr.resample(x, sr, HR_RATE) if sr != HR_RATE else x
-            sf.write(str(out), extend(gens[it.model], x48.astype(np.float32), it.bandwidth), HR_RATE, "PCM_16")
+            sf.write(str(temporary), extend(gens[it.model], x48.astype(np.float32), it.bandwidth),
+                     HR_RATE, subtype="PCM_16", format="WAV")
+        temporary.replace(out)
         manifest[key] = sig
         print(f"bwe {n}/{len(items)} {Path(it.src).name}", flush=True)
     manifest = {k: v for k, v in manifest.items() if k in keep}
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
+    temp_manifest = manifest_path.with_suffix(".tmp")
+    temp_manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
+    temp_manifest.replace(manifest_path)
 
 
 if __name__ == "__main__":
     run(Path(sys.argv[1]), Path(sys.argv[2]))
+

@@ -22,6 +22,8 @@ dependencies = [
     "torchfcpe==0.0.4",
     "einops==0.8.2",
     "transformers==5.13.1",
+    # AP-BWE loads safetensors directly (also a transformers dependency).
+    "safetensors",
     "matplotlib==3.11.0",
     "tensorboard==2.21.0",
     "onnx==1.23.1",
@@ -59,3 +61,4 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kanade_timbre"]
+
