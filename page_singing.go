@@ -12,6 +12,9 @@ import (
 
 // singingState is independent of RVC: lyric editing synthesizes new vocals.
 type singingState struct {
+	selectedBackend     string
+	soulx               soulxSingingState
+	vevo2               vevo2SingingState
 	request             singing.Request
 	job, doctorJob, err string
 	results             resultSet
@@ -39,7 +42,7 @@ func singingRuntimeMatches(j conductor.Job, r singing.Request) bool {
 // submitSinging also guards programmatic/repeated clicks while a task is queued.
 func (a *app) submitSinging(doctor bool) {
 	s := &a.singing
-	if a.be.cond == nil || a.singingActive() {
+	if a.be.cond == nil || a.singingAnyActive() {
 		return
 	}
 	r := s.request
@@ -58,8 +61,17 @@ func (a *app) submitSinging(doctor bool) {
 }
 
 func (a *app) singingPage(c *ui.Context, tk *fluent.Tokens) {
-	pageHeader(c, "歌声改词", "YingMusic-Singer-Plus · 用新歌词重唱参考旋律；不同于仅替换音色的 RVC。")
+	pageHeader(c, "歌声改词", "选择歌词编辑模型重唱参考旋律；不同于仅替换音色的 RVC。")
 	if a.backendUnavailable(c, tk) {
+		return
+	}
+	a.singingModelSelector(c)
+	switch a.singing.selectedBackend {
+	case "soulx":
+		a.soulxSingingPage(c, tk)
+		return
+	case "vevo2":
+		a.vevo2SingingPage(c, tk)
 		return
 	}
 	s := &a.singing

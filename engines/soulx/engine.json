@@ -1,0 +1,1 @@
+{"name":"soulx","title":"SoulX-Singer SVS","description":"按校准后的音素/时长/MIDI或F0元数据重唱新词（非SVC）；独立本地环境，不下载权重。","python":"3.12","module":"kanade_soulx","tasks":["soulx.edit","soulx.doctor"]}

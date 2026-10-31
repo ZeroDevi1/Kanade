@@ -1,0 +1,19 @@
+version = 1
+revision = 5
+requires-python = ">=3.10"
+
+[[package]]
+name = "kanade-engine-sdk"
+version = "0.1.0"
+source = { editable = "../sdk" }
+
+[[package]]
+name = "kanade-soulx"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "kanade-engine-sdk" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "kanade-engine-sdk", editable = "../sdk" }]

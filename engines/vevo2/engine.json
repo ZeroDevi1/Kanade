@@ -1,0 +1,8 @@
+{
+  "name": "vevo2",
+  "title": "Vevo2 AR + FM 歌声改词",
+  "description": "使用原唱韵律与新歌词生成歌声；独立本地环境，权重 CC-BY-NC-ND 4.0，不自动下载。",
+  "python": "3.12",
+  "module": "kanade_vevo2",
+  "tasks": ["vevo2.edit", "vevo2.doctor"]
+}
