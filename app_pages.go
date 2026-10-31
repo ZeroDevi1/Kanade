@@ -40,6 +40,8 @@ func (a *app) pageColumn(c *ui.Context, tk *fluent.Tokens, maxW float32) {
 			a.cantusPage(c, tk)
 		case "timbre":
 			a.timbrePage(c, tk)
+		case "singing":
+			a.singingPage(c, tk)
 		case "stems":
 			a.stemsPage(c, tk)
 		case "score":

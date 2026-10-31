@@ -28,6 +28,7 @@ var (
 		{"home", "主页", iconHome},
 		{"cantus", "语音生成", iconCantus},
 		{"timbre", "音色转换", iconTimbre},
+		{"singing", "歌声改词", iconCantus},
 		{"stems", "分轨", iconStems},
 		{"score", "音乐分析", iconScore},
 		{"inspire", "灵感", iconInspire},

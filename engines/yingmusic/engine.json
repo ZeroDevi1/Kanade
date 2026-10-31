@@ -1,0 +1,8 @@
+{
+  "name": "yingmusic",
+  "title": "YingMusic 歌声改词",
+  "description": "保留旋律引导生成新歌词；使用独立、预先配置的 YingMusic-Singer-Plus 环境，不自动下载模型。",
+  "python": "3.12",
+  "module": "kanade_yingmusic",
+  "tasks": ["yingmusic.edit", "yingmusic.doctor"]
+}

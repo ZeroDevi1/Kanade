@@ -34,6 +34,7 @@ type app struct {
 	lab      labState
 	settings settingsState
 	cantus   cantusState
+	singing  singingState
 	stems    stemsState
 	timbre   timbreState
 	score    scoreState

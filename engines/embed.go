@@ -16,4 +16,5 @@ import "embed"
 //go:embed qwentts/engine.json qwentts/pyproject.toml qwentts/uv.lock all:qwentts/src
 //go:embed voxcpm/engine.json voxcpm/pyproject.toml voxcpm/uv.lock all:voxcpm/src
 //go:embed indextts/engine.json indextts/pyproject.toml indextts/uv.lock all:indextts/src
+//go:embed yingmusic/engine.json yingmusic/pyproject.toml yingmusic/uv.lock all:yingmusic/src
 var FS embed.FS
